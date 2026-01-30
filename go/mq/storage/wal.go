@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -26,8 +28,8 @@ type Op struct {
 type WALStorage struct {
 	baseDir string
 	mu      sync.Mutex
-	files   map[string]*os.File
-	writers map[string]*bufio.Writer
+	files   map[string]*os.File      // current open file per topic (current segment)
+	writers map[string]*bufio.Writer // current writer per topic
 
 	flushInterval    time.Duration
 	compactInterval  time.Duration
@@ -37,9 +39,9 @@ type WALStorage struct {
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 
-	// compaction coordination
-	compacting bool
-	cond       *sync.Cond
+	// compaction coordination (per-topic)
+	topicCompacting map[string]bool
+	topicCond       map[string]*sync.Cond
 
 	// per-topic counters to trigger compaction earlier (in-memory)
 	bytesSinceCompact map[string]int64
@@ -67,8 +69,9 @@ func NewWALStorage(baseDir string, params ...time.Duration) *WALStorage {
 		compactThreshold:  threshold,
 		quit:              make(chan struct{}),
 		bytesSinceCompact: make(map[string]int64),
+		topicCompacting:   make(map[string]bool),
+		topicCond:         make(map[string]*sync.Cond),
 	}
-	w.cond = sync.NewCond(&w.mu)
 	w.wg.Add(2)
 	go w.flusher()
 	go w.compactor()
@@ -84,10 +87,113 @@ func (w *WALStorage) walPath(topic string) string {
 
 // ensureTopicLocked must be called with w.mu held (or from a context where we will hold it).
 func (w *WALStorage) ensureTopicLocked(topic string) error {
+	// caller must hold w.mu
 	if _, ok := w.writers[topic]; ok {
 		return nil
 	}
-	p := w.walPath(topic)
+	// ensure per-topic cond exists
+	if _, ok := w.topicCond[topic]; !ok {
+		w.topicCond[topic] = sync.NewCond(&w.mu)
+	}
+
+	topicDir := filepath.Join(w.baseDir, topic)
+	if err := os.MkdirAll(topicDir, 0o755); err != nil {
+		return err
+	}
+	// find the highest segment number
+	entries, err := os.ReadDir(topicDir)
+	if err != nil {
+		return err
+	}
+	maxSeg := int64(0)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if filepath.Ext(name) != ".wal" {
+			continue
+		}
+		base := name[:len(name)-len(".wal")]
+		if n, err := strconv.ParseInt(base, 10, 10); err == nil {
+			if n > maxSeg {
+				maxSeg = n
+			}
+		}
+	}
+	if maxSeg == 0 {
+		maxSeg = 1
+	}
+	p := filepath.Join(topicDir, fmt.Sprintf("%08d.wal", maxSeg))
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	w.files[topic] = f
+	w.writers[topic] = bufio.NewWriterSize(f, 64*1024)
+	// initialize counter if absent
+	if _, ok := w.bytesSinceCompact[topic]; !ok {
+		w.bytesSinceCompact[topic] = 0
+	}
+	return nil
+}
+
+// helper: list segments for a topic in order
+func (w *WALStorage) listTopicSegments(topic string) ([]string, error) {
+	topicDir := filepath.Join(w.baseDir, topic)
+	entries, err := os.ReadDir(topicDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	segs := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if filepath.Ext(name) != ".wal" {
+			continue
+		}
+		segs = append(segs, filepath.Join(topicDir, name))
+	}
+	sort.Strings(segs)
+	return segs, nil
+}
+
+// helper: rotate current segment for a topic (close current and open a new numbered segment)
+func (w *WALStorage) rotateSegment(topic string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.ensureTopicLocked(topic); err != nil {
+		return err
+	}
+	// determine next segment number by scanning current files
+	segs, err := w.listTopicSegments(topic)
+	if err != nil {
+		return err
+	}
+	next := int64(1)
+	if len(segs) > 0 {
+		// parse last segment filename to get number
+		last := filepath.Base(segs[len(segs)-1])
+		base := last[:len(last)-len(".wal")]
+		if n, err := strconv.ParseInt(base, 10, 10); err == nil {
+			next = n + 1
+		}
+	}
+	// close current
+	if f, ok := w.files[topic]; ok {
+		_ = w.writers[topic].Flush()
+		_ = f.Sync()
+		_ = f.Close()
+		delete(w.files, topic)
+		delete(w.writers, topic)
+	}
+	// open next segment
+	p := filepath.Join(w.baseDir, topic, fmt.Sprintf("%08d.wal", next))
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
@@ -98,7 +204,7 @@ func (w *WALStorage) ensureTopicLocked(topic string) error {
 	return nil
 }
 
-// writeOp writes an Op as a length-prefixed gob record. It waits if compaction is in progress.
+// writeOp now waits per-topic compacting flag instead of global
 func (w *WALStorage) writeOp(topic string, op Op) error {
 	// encode op to buffer (no locks while encoding)
 	var buf bytes.Buffer
@@ -109,16 +215,19 @@ func (w *WALStorage) writeOp(topic string, op Op) error {
 	payload := buf.Bytes()
 	recordLen := int64(len(payload) + 8) // length prefix + payload
 
-	// write length-prefixed to buffered writer
 	w.mu.Lock()
-	for w.compacting {
-		w.cond.Wait()
+	// ensure topic state
+	if _, ok := w.topicCond[topic]; !ok {
+		w.topicCond[topic] = sync.NewCond(&w.mu)
+	}
+	for w.topicCompacting[topic] {
+		w.topicCond[topic].Wait()
 	}
 	if err := w.ensureTopicLocked(topic); err != nil {
 		w.mu.Unlock()
 		return err
 	}
-	// write length (uint64 big-endian)
+	// write length prefix
 	var lenBuf [8]byte
 	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(payload)))
 	if _, err := w.writers[topic].Write(lenBuf[:]); err != nil {
@@ -129,17 +238,15 @@ func (w *WALStorage) writeOp(topic string, op Op) error {
 		w.mu.Unlock()
 		return err
 	}
-	// update in-memory counter
 	w.bytesSinceCompact[topic] += recordLen
-	shouldCompact := w.bytesSinceCompact[topic] >= w.compactThreshold
-	if shouldCompact {
+	shouldRotate := w.bytesSinceCompact[topic] >= w.compactThreshold
+	if shouldRotate {
 		w.bytesSinceCompact[topic] = 0
 	}
 	w.mu.Unlock()
 
-	if shouldCompact {
-		// trigger compaction async
-		go func() { _ = w.Compact(topic) }()
+	if shouldRotate {
+		_ = w.rotateSegment(topic)
 	}
 	return nil
 }
@@ -307,35 +414,145 @@ func (w *WALStorage) flusher() {
 	}
 }
 
+// compactor periodically checks topic directories and triggers compaction when threshold exceeded.
+func (w *WALStorage) compactor() {
+	defer w.wg.Done()
+	t := time.NewTicker(w.compactInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			// list topic directories under baseDir
+			entries, err := os.ReadDir(w.baseDir)
+			if err != nil {
+				continue
+			}
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				topic := e.Name()
+				segs, err := w.listTopicSegments(topic)
+				if err != nil {
+					continue
+				}
+				if len(segs) <= 1 {
+					continue
+				}
+				// compute total size of old segments (exclude last/current)
+				var total int64
+				for _, s := range segs[:len(segs)-1] {
+					if info, err := os.Stat(s); err == nil {
+						total += info.Size()
+					}
+				}
+				if total >= w.compactThreshold {
+					// trigger compaction asynchronously
+					go func(tpc string) { _ = w.Compact(tpc) }(topic)
+				}
+			}
+		case <-w.quit:
+			return
+		}
+	}
+}
+
 // Compact rewrites the WAL for the given topic into binary ENQ records only for live messages.
 func (w *WALStorage) Compact(topic string) error {
+	// mark topic as compacting
 	w.mu.Lock()
-	if w.compacting {
+	if w.topicCompacting[topic] {
 		w.mu.Unlock()
 		return nil
 	}
-	w.compacting = true
+	w.topicCompacting[topic] = true
+	if _, ok := w.topicCond[topic]; !ok {
+		w.topicCond[topic] = sync.NewCond(&w.mu)
+	}
 	w.mu.Unlock()
 
 	defer func() {
 		w.mu.Lock()
-		w.compacting = false
-		w.cond.Broadcast()
+		w.topicCompacting[topic] = false
+		w.topicCond[topic].Broadcast()
 		w.mu.Unlock()
 	}()
 
-	msgs, err := w.Load(topic)
+	// list segments
+	segs, err := w.listTopicSegments(topic)
 	if err != nil {
 		return err
 	}
+	if len(segs) <= 1 {
+		// nothing to compact (only current or no segments)
+		return nil
+	}
+	// compact all segments except the last (current)
+	toCompact := segs[:len(segs)-1]
 
-	tmp := w.walPath(topic) + ".tmp"
+	// streaming two-pass: first collect ack set across toCompact
+	acked := make(map[int64]struct{})
+	order := make([]int64, 0)
+	msgs := make(map[int64]Message)
+	for _, path := range toCompact {
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		for {
+			var lenBuf [8]byte
+			if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					break
+				}
+				f.Close()
+				return err
+			}
+			n := binary.BigEndian.Uint64(lenBuf[:])
+			if n == 0 {
+				continue
+			}
+			payload := make([]byte, n)
+			if _, err := io.ReadFull(f, payload); err != nil {
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					break
+				}
+				f.Close()
+				return err
+			}
+			var op Op
+			if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&op); err != nil {
+				continue
+			}
+			switch op.Type {
+			case "ENQ":
+				if _, seen := msgs[op.ID]; !seen {
+					order = append(order, op.ID)
+				}
+				msgs[op.ID] = op.Msg
+			case "ACK":
+				acked[op.ID] = struct{}{}
+				delete(msgs, op.ID)
+			}
+		}
+		f.Close()
+	}
+
+	// write compacted tmp file containing only live ENQ records from toCompact in original order
+	tmp := filepath.Join(w.baseDir, topic, ".compact.tmp")
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
 	}
-	for _, m := range msgs {
-		op := Op{Type: "ENQ", ID: m.ID, Msg: m}
+	for _, id := range order {
+		if _, isAcked := acked[id]; isAcked {
+			continue
+		}
+		m, ok := msgs[id]
+		if !ok {
+			continue
+		}
+		op := Op{Type: "ENQ", ID: id, Msg: m}
 		var buf bytes.Buffer
 		if err := gob.NewEncoder(&buf).Encode(op); err != nil {
 			f.Close()
@@ -362,6 +579,19 @@ func (w *WALStorage) Compact(topic string) error {
 	}
 	f.Close()
 
+	// replace the first compacted segment file with tmp, and remove other compacted segments
+	first := toCompact[0]
+	if err := os.Rename(tmp, first); err != nil {
+		// cleanup tmp on failure
+		os.Remove(tmp)
+		return err
+	}
+	// remove the rest of compacted segment files (skip first since replaced)
+	for i := 1; i < len(toCompact); i++ {
+		_ = os.Remove(toCompact[i])
+	}
+
+	// reopen writer for topic (close current and reopen to refresh state)
 	w.mu.Lock()
 	if oldf, ok := w.files[topic]; ok {
 		_ = w.writers[topic].Flush()
@@ -370,57 +600,11 @@ func (w *WALStorage) Compact(topic string) error {
 		delete(w.files, topic)
 		delete(w.writers, topic)
 	}
-	w.mu.Unlock()
-
-	p := w.walPath(topic)
-	if err := os.Rename(tmp, p); err != nil {
-		return fmt.Errorf("compact rename: %w", err)
-	}
-
-	w.mu.Lock()
-	newf, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err == nil {
-		w.files[topic] = newf
-		w.writers[topic] = bufio.NewWriterSize(newf, 64*1024)
-	}
+	// ensure reopen (this will open the current segment file)
+	_ = w.ensureTopicLocked(topic)
 	w.mu.Unlock()
 
 	return nil
-}
-
-// compactor periodically checks WAL files and triggers compaction when size threshold exceeded.
-func (w *WALStorage) compactor() {
-	defer w.wg.Done()
-	t := time.NewTicker(w.compactInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-t.C:
-			entries, err := os.ReadDir(w.baseDir)
-			if err != nil {
-				continue
-			}
-			for _, e := range entries {
-				if e.IsDir() {
-					continue
-				}
-				name := e.Name()
-				if filepath.Ext(name) != ".wal" {
-					continue
-				}
-				info, err := e.Info()
-				if err != nil {
-					continue
-				}
-				if info.Size() >= w.compactThreshold {
-					topic := name[:len(name)-len(".wal")]
-					_ = w.Compact(topic) // fire and forget
-				}
-			}
-		case <-w.quit:
-			return
-		}
-	}
 }
 
 // Close stops background goroutines and closes files. Safe to call multiple times.
