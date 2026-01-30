@@ -1,2 +1,3 @@
 .DS_Store
 /go/example/testdata
+/go/example/benchdata

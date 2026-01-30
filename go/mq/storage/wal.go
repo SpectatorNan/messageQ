@@ -2,9 +2,8 @@ package storage
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/binary"
-	"encoding/gob"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -15,16 +14,27 @@ import (
 	"time"
 )
 
-// Op represents an operation recorded in the WAL (binary/gob encoded).
-type Op struct {
-	Type string // "ENQ" or "ACK"
-	ID   int64
-	Msg  Message
+// LogType defines record type in WAL
+type LogType byte
+
+const (
+	LogProduce LogType = 1
+	LogAck     LogType = 2
+	LogNack    LogType = 3
+	LogRetry   LogType = 4
+	LogDLQ     LogType = 5
+)
+
+// LogEntry is the JSON payload stored for each record (topic included for portability)
+type LogEntry struct {
+	Type  LogType `json:"type"`
+	Topic string  `json:"topic"`
+	Msg   Message `json:"msg"`
 }
 
-// WALStorage implements a write-ahead log with buffered writes, periodic flush, and background compaction.
-// It stores length-prefixed gob-encoded Op records for compact and fast binary IO.
-// It is safe for concurrent use.
+// WALStorage implements a segmented write-ahead log using a simple binary record format:
+// [4-byte big-endian uint32 payloadLen][1-byte type][payload JSON bytes]
+// It supports per-topic segments, rotation and compaction.
 type WALStorage struct {
 	baseDir string
 	mu      sync.Mutex
@@ -43,7 +53,7 @@ type WALStorage struct {
 	topicCompacting map[string]bool
 	topicCond       map[string]*sync.Cond
 
-	// per-topic counters to trigger compaction earlier (in-memory)
+	// per-topic counters to trigger rotation/compaction earlier (in-memory)
 	bytesSinceCompact map[string]int64
 }
 
@@ -75,32 +85,26 @@ func NewWALStorage(baseDir string, params ...time.Duration) *WALStorage {
 	w.wg.Add(2)
 	go w.flusher()
 	go w.compactor()
-	// register gob types
-	gob.Register(Op{})
-	gob.Register(Message{})
 	return w
 }
 
-func (w *WALStorage) walPath(topic string) string {
-	return filepath.Join(w.baseDir, topic+".wal")
+func (w *WALStorage) walDir(topic string) string {
+	return filepath.Join(w.baseDir, topic)
 }
 
 // ensureTopicLocked must be called with w.mu held (or from a context where we will hold it).
+// It opens or creates the current highest-numbered segment in topic directory.
 func (w *WALStorage) ensureTopicLocked(topic string) error {
-	// caller must hold w.mu
 	if _, ok := w.writers[topic]; ok {
 		return nil
 	}
-	// ensure per-topic cond exists
 	if _, ok := w.topicCond[topic]; !ok {
 		w.topicCond[topic] = sync.NewCond(&w.mu)
 	}
-
-	topicDir := filepath.Join(w.baseDir, topic)
+	topicDir := w.walDir(topic)
 	if err := os.MkdirAll(topicDir, 0o755); err != nil {
 		return err
 	}
-	// find the highest segment number
 	entries, err := os.ReadDir(topicDir)
 	if err != nil {
 		return err
@@ -131,17 +135,15 @@ func (w *WALStorage) ensureTopicLocked(topic string) error {
 	}
 	w.files[topic] = f
 	w.writers[topic] = bufio.NewWriterSize(f, 64*1024)
-	// initialize counter if absent
 	if _, ok := w.bytesSinceCompact[topic]; !ok {
 		w.bytesSinceCompact[topic] = 0
 	}
 	return nil
 }
 
-// helper: list segments for a topic in order
+// listTopicSegments returns absolute paths of segment files sorted by name
 func (w *WALStorage) listTopicSegments(topic string) ([]string, error) {
-	topicDir := filepath.Join(w.baseDir, topic)
-	entries, err := os.ReadDir(topicDir)
+	entries, err := os.ReadDir(w.walDir(topic))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -157,34 +159,31 @@ func (w *WALStorage) listTopicSegments(topic string) ([]string, error) {
 		if filepath.Ext(name) != ".wal" {
 			continue
 		}
-		segs = append(segs, filepath.Join(topicDir, name))
+		segs = append(segs, filepath.Join(w.walDir(topic), name))
 	}
 	sort.Strings(segs)
 	return segs, nil
 }
 
-// helper: rotate current segment for a topic (close current and open a new numbered segment)
+// rotateSegment closes current segment and opens a new numbered one
 func (w *WALStorage) rotateSegment(topic string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if err := w.ensureTopicLocked(topic); err != nil {
 		return err
 	}
-	// determine next segment number by scanning current files
 	segs, err := w.listTopicSegments(topic)
 	if err != nil {
 		return err
 	}
 	next := int64(1)
 	if len(segs) > 0 {
-		// parse last segment filename to get number
 		last := filepath.Base(segs[len(segs)-1])
 		base := last[:len(last)-len(".wal")]
 		if n, err := strconv.ParseInt(base, 10, 10); err == nil {
 			next = n + 1
 		}
 	}
-	// close current
 	if f, ok := w.files[topic]; ok {
 		_ = w.writers[topic].Flush()
 		_ = f.Sync()
@@ -192,8 +191,7 @@ func (w *WALStorage) rotateSegment(topic string) error {
 		delete(w.files, topic)
 		delete(w.writers, topic)
 	}
-	// open next segment
-	p := filepath.Join(w.baseDir, topic, fmt.Sprintf("%08d.wal", next))
+	p := filepath.Join(w.walDir(topic), fmt.Sprintf("%08d.wal", next))
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
@@ -204,19 +202,16 @@ func (w *WALStorage) rotateSegment(topic string) error {
 	return nil
 }
 
-// writeOp now waits per-topic compacting flag instead of global
-func (w *WALStorage) writeOp(topic string, op Op) error {
-	// encode op to buffer (no locks while encoding)
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-	if err := enc.Encode(op); err != nil {
+// writeRecord writes a [len(uint32)][type byte][payload JSON] record to topic's current segment
+func (w *WALStorage) writeRecord(topic string, typ LogType, payload interface{}) error {
+	data, err := json.Marshal(payload)
+	if err != nil {
 		return err
 	}
-	payload := buf.Bytes()
-	recordLen := int64(len(payload) + 8) // length prefix + payload
+	payloadLen := uint32(len(data))
+	recordLen := int64(4 + 1 + len(data))
 
 	w.mu.Lock()
-	// ensure topic state
 	if _, ok := w.topicCond[topic]; !ok {
 		w.topicCond[topic] = sync.NewCond(&w.mu)
 	}
@@ -227,14 +222,17 @@ func (w *WALStorage) writeOp(topic string, op Op) error {
 		w.mu.Unlock()
 		return err
 	}
-	// write length prefix
-	var lenBuf [8]byte
-	binary.BigEndian.PutUint64(lenBuf[:], uint64(len(payload)))
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], payloadLen)
 	if _, err := w.writers[topic].Write(lenBuf[:]); err != nil {
 		w.mu.Unlock()
 		return err
 	}
-	if _, err := w.writers[topic].Write(payload); err != nil {
+	if _, err := w.writers[topic].Write([]byte{byte(typ)}); err != nil {
+		w.mu.Unlock()
+		return err
+	}
+	if _, err := w.writers[topic].Write(data); err != nil {
 		w.mu.Unlock()
 		return err
 	}
@@ -251,16 +249,16 @@ func (w *WALStorage) writeOp(topic string, op Op) error {
 	return nil
 }
 
-// Append writes an ENQ operation for the message to the WAL (buffered binary).
+// Append writes an ENQ operation for the message to the WAL (buffered binary JSON).
 func (w *WALStorage) Append(topic string, msg Message) error {
-	op := Op{Type: "ENQ", Msg: msg, ID: msg.ID}
-	return w.writeOp(topic, op)
+	entry := LogEntry{Type: LogProduce, Topic: topic, Msg: msg}
+	return w.writeRecord(topic, LogProduce, entry)
 }
 
-// Ack appends an ACK operation for the message id (buffered binary).
+// Ack appends an ACK operation for the message id (buffered binary JSON).
 func (w *WALStorage) Ack(topic string, id int64) error {
-	op := Op{Type: "ACK", ID: id}
-	return w.writeOp(topic, op)
+	entry := LogEntry{Type: LogAck, Topic: topic, Msg: Message{ID: id}}
+	return w.writeRecord(topic, LogAck, entry)
 }
 
 // AppendSync writes and then flushes+fsyncs the topic so the write is durable when the call returns.
@@ -326,65 +324,80 @@ func (w *WALStorage) flushTopicLocked(topic string) error {
 	return f.Sync()
 }
 
-// Load replays the binary WAL and returns the list of messages that have been ENQ'd and not ACK'd, in enqueue order.
-// It flushes the topic buffer before reading.
+// Load replays all segment files for topic and returns the list of messages that have been ENQ'd and not ACK'd, in enqueue order.
 func (w *WALStorage) Load(topic string) ([]Message, error) {
+	// flush topic first
 	if err := w.FlushTopic(topic); err != nil {
 		return nil, err
 	}
-	p := w.walPath(topic)
-	f, err := os.Open(p)
+	segs, err := w.listTopicSegments(topic)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return []Message{}, nil
-		}
 		return nil, err
 	}
-	defer f.Close()
-
 	msgs := make(map[int64]Message)
 	order := make([]int64, 0)
 	acked := make(map[int64]struct{})
 
-	for {
-		// read length
-		var lenBuf [8]byte
-		if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
-			}
+	for _, seg := range segs {
+		f, err := os.Open(seg)
+		if err != nil {
 			return nil, err
 		}
-		n := binary.BigEndian.Uint64(lenBuf[:])
-		if n == 0 {
-			continue
-		}
-		if n > (1 << 31) { // sanity cap to avoid huge allocations from corrupted data
-			return nil, fmt.Errorf("record length too large: %d", n)
-		}
-		payload := make([]byte, n)
-		if _, err := io.ReadFull(f, payload); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
+		for {
+			var lenBuf [4]byte
+			if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					break
+				}
+				f.Close()
+				return nil, err
 			}
-			return nil, err
-		}
-		var op Op
-		dec := gob.NewDecoder(bytes.NewReader(payload))
-		if err := dec.Decode(&op); err != nil {
-			// skip malformed
-			continue
-		}
-		switch op.Type {
-		case "ENQ":
-			if _, seen := msgs[op.ID]; !seen {
-				order = append(order, op.ID)
+			n := binary.BigEndian.Uint32(lenBuf[:])
+			if n == 0 {
+				continue
 			}
-			msgs[op.ID] = op.Msg
-		case "ACK":
-			acked[op.ID] = struct{}{}
-			delete(msgs, op.ID)
+			// read type byte
+			var tbuf [1]byte
+			if _, err := io.ReadFull(f, tbuf[:]); err != nil {
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					break
+				}
+				f.Close()
+				return nil, err
+			}
+			typ := LogType(tbuf[0])
+			payload := make([]byte, n)
+			if _, err := io.ReadFull(f, payload); err != nil {
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					break
+				}
+				f.Close()
+				return nil, err
+			}
+			switch typ {
+			case LogProduce:
+				var entry LogEntry
+				if err := json.Unmarshal(payload, &entry); err != nil {
+					continue
+				}
+				m := entry.Msg
+				if _, seen := msgs[m.ID]; !seen {
+					order = append(order, m.ID)
+				}
+				msgs[m.ID] = m
+			case LogAck:
+				var entry LogEntry
+				if err := json.Unmarshal(payload, &entry); err != nil {
+					continue
+				}
+				m := entry.Msg
+				acked[m.ID] = struct{}{}
+				delete(msgs, m.ID)
+			default:
+				// ignore other types for now
+			}
 		}
+		f.Close()
 	}
 
 	res := make([]Message, 0, len(order))
@@ -422,7 +435,6 @@ func (w *WALStorage) compactor() {
 	for {
 		select {
 		case <-t.C:
-			// list topic directories under baseDir
 			entries, err := os.ReadDir(w.baseDir)
 			if err != nil {
 				continue
@@ -439,7 +451,6 @@ func (w *WALStorage) compactor() {
 				if len(segs) <= 1 {
 					continue
 				}
-				// compute total size of old segments (exclude last/current)
 				var total int64
 				for _, s := range segs[:len(segs)-1] {
 					if info, err := os.Stat(s); err == nil {
@@ -447,7 +458,6 @@ func (w *WALStorage) compactor() {
 					}
 				}
 				if total >= w.compactThreshold {
-					// trigger compaction asynchronously
 					go func(tpc string) { _ = w.Compact(tpc) }(topic)
 				}
 			}
@@ -457,9 +467,8 @@ func (w *WALStorage) compactor() {
 	}
 }
 
-// Compact rewrites the WAL for the given topic into binary ENQ records only for live messages.
+// Compact rewrites the earliest compactable segments for the topic into a single compacted segment file.
 func (w *WALStorage) Compact(topic string) error {
-	// mark topic as compacting
 	w.mu.Lock()
 	if w.topicCompacting[topic] {
 		w.mu.Unlock()
@@ -478,19 +487,15 @@ func (w *WALStorage) Compact(topic string) error {
 		w.mu.Unlock()
 	}()
 
-	// list segments
 	segs, err := w.listTopicSegments(topic)
 	if err != nil {
 		return err
 	}
 	if len(segs) <= 1 {
-		// nothing to compact (only current or no segments)
 		return nil
 	}
-	// compact all segments except the last (current)
 	toCompact := segs[:len(segs)-1]
 
-	// streaming two-pass: first collect ack set across toCompact
 	acked := make(map[int64]struct{})
 	order := make([]int64, 0)
 	msgs := make(map[int64]Message)
@@ -500,7 +505,7 @@ func (w *WALStorage) Compact(topic string) error {
 			return err
 		}
 		for {
-			var lenBuf [8]byte
+			var lenBuf [4]byte
 			if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
 				if err == io.EOF || err == io.ErrUnexpectedEOF {
 					break
@@ -508,10 +513,19 @@ func (w *WALStorage) Compact(topic string) error {
 				f.Close()
 				return err
 			}
-			n := binary.BigEndian.Uint64(lenBuf[:])
+			n := binary.BigEndian.Uint32(lenBuf[:])
 			if n == 0 {
 				continue
 			}
+			var tbuf [1]byte
+			if _, err := io.ReadFull(f, tbuf[:]); err != nil {
+				if err == io.EOF || err == io.ErrUnexpectedEOF {
+					break
+				}
+				f.Close()
+				return err
+			}
+			typ := LogType(tbuf[0])
 			payload := make([]byte, n)
 			if _, err := io.ReadFull(f, payload); err != nil {
 				if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -520,26 +534,31 @@ func (w *WALStorage) Compact(topic string) error {
 				f.Close()
 				return err
 			}
-			var op Op
-			if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&op); err != nil {
-				continue
-			}
-			switch op.Type {
-			case "ENQ":
-				if _, seen := msgs[op.ID]; !seen {
-					order = append(order, op.ID)
+			switch typ {
+			case LogProduce:
+				var entry LogEntry
+				if err := json.Unmarshal(payload, &entry); err != nil {
+					continue
 				}
-				msgs[op.ID] = op.Msg
-			case "ACK":
-				acked[op.ID] = struct{}{}
-				delete(msgs, op.ID)
+				m := entry.Msg
+				if _, seen := msgs[m.ID]; !seen {
+					order = append(order, m.ID)
+				}
+				msgs[m.ID] = m
+			case LogAck:
+				var entry LogEntry
+				if err := json.Unmarshal(payload, &entry); err != nil {
+					continue
+				}
+				m := entry.Msg
+				acked[m.ID] = struct{}{}
+				delete(msgs, m.ID)
 			}
 		}
 		f.Close()
 	}
 
-	// write compacted tmp file containing only live ENQ records from toCompact in original order
-	tmp := filepath.Join(w.baseDir, topic, ".compact.tmp")
+	tmp := filepath.Join(w.walDir(topic), ".compact.tmp")
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
@@ -552,21 +571,20 @@ func (w *WALStorage) Compact(topic string) error {
 		if !ok {
 			continue
 		}
-		op := Op{Type: "ENQ", ID: id, Msg: m}
-		var buf bytes.Buffer
-		if err := gob.NewEncoder(&buf).Encode(op); err != nil {
-			f.Close()
-			os.Remove(tmp)
-			return err
-		}
-		var lenBuf [8]byte
-		binary.BigEndian.PutUint64(lenBuf[:], uint64(buf.Len()))
+		data, _ := json.Marshal(m)
+		var lenBuf [4]byte
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
 		if _, err := f.Write(lenBuf[:]); err != nil {
 			f.Close()
 			os.Remove(tmp)
 			return err
 		}
-		if _, err := f.Write(buf.Bytes()); err != nil {
+		if _, err := f.Write([]byte{byte(LogProduce)}); err != nil {
+			f.Close()
+			os.Remove(tmp)
+			return err
+		}
+		if _, err := f.Write(data); err != nil {
 			f.Close()
 			os.Remove(tmp)
 			return err
@@ -579,19 +597,15 @@ func (w *WALStorage) Compact(topic string) error {
 	}
 	f.Close()
 
-	// replace the first compacted segment file with tmp, and remove other compacted segments
 	first := toCompact[0]
 	if err := os.Rename(tmp, first); err != nil {
-		// cleanup tmp on failure
 		os.Remove(tmp)
 		return err
 	}
-	// remove the rest of compacted segment files (skip first since replaced)
 	for i := 1; i < len(toCompact); i++ {
 		_ = os.Remove(toCompact[i])
 	}
 
-	// reopen writer for topic (close current and reopen to refresh state)
 	w.mu.Lock()
 	if oldf, ok := w.files[topic]; ok {
 		_ = w.writers[topic].Flush()
@@ -600,11 +614,17 @@ func (w *WALStorage) Compact(topic string) error {
 		delete(w.files, topic)
 		delete(w.writers, topic)
 	}
-	// ensure reopen (this will open the current segment file)
 	_ = w.ensureTopicLocked(topic)
 	w.mu.Unlock()
 
 	return nil
+}
+
+// SetCompactThreshold sets the byte threshold to trigger segment rotation/compaction.
+func (w *WALStorage) SetCompactThreshold(n int64) {
+	w.mu.Lock()
+	w.compactThreshold = n
+	w.mu.Unlock()
 }
 
 // Close stops background goroutines and closes files. Safe to call multiple times.
