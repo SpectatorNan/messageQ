@@ -4,6 +4,8 @@ import (
 	"log"
 	"sync"
 	"time"
+
+	"messageQ/mq/storage"
 )
 
 type Queue struct {
@@ -15,6 +17,10 @@ type Queue struct {
 
 	ackTimeout time.Duration
 	maxRetry   int
+
+	store storage.Storage
+	// topic name used when persisting
+	topic string
 }
 
 func NewQueue() *Queue {
@@ -25,6 +31,41 @@ func NewQueue() *Queue {
 		maxRetry:   3,
 	}
 	q.cond = sync.NewCond(&q.mu)
+	go q.reclaimLoop()
+	return q
+}
+
+func NewQueueWithStorage(store storage.Storage, topic string) *Queue {
+	q := &Queue{
+		data:       make([]Message, 0),
+		inflight:   make(map[int64]InflightMsg),
+		ackTimeout: 10 * time.Second,
+		maxRetry:   3,
+		store:      store,
+		topic:      topic,
+	}
+	q.cond = sync.NewCond(&q.mu)
+	// load persisted messages into data
+	if store != nil {
+		msgs, err := store.Load(topic)
+		if err != nil {
+			log.Println("storage load error:", err)
+		} else {
+			// convert storage.Message to queue.Message
+			for _, sm := range msgs {
+				qm := Message{
+					ID:        sm.ID,
+					Body:      sm.Body,
+					Retry:     sm.Retry,
+					Timestamp: sm.Timestamp,
+				}
+				q.data = append(q.data, qm)
+				if sm.ID > q.nextID {
+					q.nextID = sm.ID
+				}
+			}
+		}
+	}
 	go q.reclaimLoop()
 	return q
 }
@@ -41,6 +82,16 @@ func (q *Queue) Enqueue(body string) Message {
 	}
 
 	q.data = append(q.data, msg)
+	if q.store != nil {
+		// convert to storage.Message
+		sm := storage.Message{
+			ID:        msg.ID,
+			Body:      msg.Body,
+			Retry:     msg.Retry,
+			Timestamp: msg.Timestamp,
+		}
+		_ = q.store.Append(q.topic, sm)
+	}
 	q.cond.Signal()
 	return msg
 }
@@ -70,6 +121,9 @@ func (q *Queue) Ack(id int64) bool {
 
 	if _, ok := q.inflight[id]; ok {
 		delete(q.inflight, id)
+		if q.store != nil {
+			_ = q.store.Ack(q.topic, id)
+		}
 		return true
 	}
 	return false

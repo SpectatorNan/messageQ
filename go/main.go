@@ -3,15 +3,20 @@ package main
 import (
 	"fmt"
 	"log"
-	"net/http"
 
 	"messageQ/mq/api"
+	"messageQ/mq/broker"
+	"messageQ/mq/storage"
 )
 
 func main() {
-	http.HandleFunc("/produce", api.ProduceHandler)
-	http.HandleFunc("/consume", api.ConsumeHandler)
+	// enable WAL-based persistence under ./data
+	store := storage.NewWALStorage("./data")
+	defer store.Close()
+	b := broker.NewBrokerWithStorage(store)
 
-	fmt.Println("MQ listening on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	r := api.NewRouter(b)
+
+	fmt.Println("MQ listening on :8080 (gin + WAL)")
+	log.Fatal(r.Run(":8080"))
 }
