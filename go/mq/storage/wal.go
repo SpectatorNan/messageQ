@@ -196,9 +196,16 @@ func (w *WALStorage) rotateSegment(topic string) error {
 	if err != nil {
 		return err
 	}
+	// ensure the new file is synced so that directory entry is visible
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
 	w.files[topic] = f
 	w.writers[topic] = bufio.NewWriterSize(f, 64*1024)
 	w.bytesSinceCompact[topic] = 0
+	// ensure directory metadata is persisted
+	_ = syncDir(w.walDir(topic))
 	return nil
 }
 
@@ -602,9 +609,13 @@ func (w *WALStorage) Compact(topic string) error {
 		os.Remove(tmp)
 		return err
 	}
+	// ensure directory metadata persisted after rename
+	_ = syncDir(w.walDir(topic))
 	for i := 1; i < len(toCompact); i++ {
 		_ = os.Remove(toCompact[i])
 	}
+	// sync dir again after removals
+	_ = syncDir(w.walDir(topic))
 
 	w.mu.Lock()
 	if oldf, ok := w.files[topic]; ok {
@@ -618,6 +629,17 @@ func (w *WALStorage) Compact(topic string) error {
 	w.mu.Unlock()
 
 	return nil
+}
+
+// syncDir performs an fsync on the directory containing path to ensure rename visibility.
+func syncDir(dirPath string) error {
+	// open the directory and sync it
+	d, err := os.Open(dirPath)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // SetCompactThreshold sets the byte threshold to trigger segment rotation/compaction.
