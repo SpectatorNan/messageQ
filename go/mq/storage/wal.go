@@ -3,8 +3,9 @@ package storage
 import (
 	"bufio"
 	"encoding/binary"
-	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -25,15 +26,94 @@ const (
 	LogDLQ     LogType = 5
 )
 
-// LogEntry is the JSON payload stored for each record (topic included for portability)
-type LogEntry struct {
-	Type  LogType `json:"type"`
-	Topic string  `json:"topic"`
-	Msg   Message `json:"msg"`
+var errBadCRC = errors.New("bad crc")
+var errCorruptRecord = errors.New("corrupt record")
+
+const (
+	minRecordSize = 4 + 1 + 8 + 2 + 8 + 4 // crc + type + id + retry + ts + bodyLen
+	maxRecordSize = 64 * 1024 * 1024      // safety cap
+)
+
+// buildRecordBytes returns the full record bytes: [totalSize][crc][type][id][retry][ts][bodyLen][body]
+func buildRecordBytes(typ LogType, msg Message) ([]byte, int64, error) {
+	body := []byte(msg.Body)
+	if typ != LogProduce {
+		body = nil
+	}
+	ts := msg.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	crc := uint32(0)
+	if len(body) > 0 {
+		crc = crc32.ChecksumIEEE(body)
+	}
+	totalSize := uint32(4 + 1 + 8 + 2 + 8 + 4 + len(body))
+	buf := make([]byte, 4+totalSize)
+	binary.BigEndian.PutUint32(buf[0:4], totalSize)
+	off := 4
+	binary.BigEndian.PutUint32(buf[off:off+4], crc)
+	off += 4
+	buf[off] = byte(typ)
+	off += 1
+	binary.BigEndian.PutUint64(buf[off:off+8], uint64(msg.ID))
+	off += 8
+	binary.BigEndian.PutUint16(buf[off:off+2], uint16(msg.Retry))
+	off += 2
+	binary.BigEndian.PutUint64(buf[off:off+8], uint64(ts.UnixNano()))
+	off += 8
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(body)))
+	off += 4
+	copy(buf[off:], body)
+	return buf, int64(len(buf)), nil
+}
+
+// readRecord reads a single record from r; returns ok=false on EOF
+func readRecord(r io.Reader) (LogType, Message, bool, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return 0, Message{}, false, nil
+		}
+		return 0, Message{}, false, err
+	}
+	total := binary.BigEndian.Uint32(lenBuf[:])
+	if total < minRecordSize || total > maxRecordSize {
+		return 0, Message{}, false, fmt.Errorf("invalid record size: %d", total)
+	}
+	payload := make([]byte, total)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return 0, Message{}, false, nil
+		}
+		return 0, Message{}, false, err
+	}
+	off := 0
+	crc := binary.BigEndian.Uint32(payload[off : off+4])
+	off += 4
+	typ := LogType(payload[off])
+	off += 1
+	msgID := int64(binary.BigEndian.Uint64(payload[off : off+8]))
+	off += 8
+	retry := int(binary.BigEndian.Uint16(payload[off : off+2]))
+	off += 2
+	ts := int64(binary.BigEndian.Uint64(payload[off : off+8]))
+	off += 8
+	bodyLen := int(binary.BigEndian.Uint32(payload[off : off+4]))
+	off += 4
+	if bodyLen < 0 || off+bodyLen > len(payload) {
+		return typ, Message{ID: msgID, Retry: retry, Timestamp: time.Unix(0, ts)}, true, errCorruptRecord
+	}
+	body := payload[off : off+bodyLen]
+	if bodyLen > 0 && crc32.ChecksumIEEE(body) != crc {
+		return typ, Message{ID: msgID, Retry: retry, Timestamp: time.Unix(0, ts)}, true, errBadCRC
+	}
+	msg := Message{ID: msgID, Retry: retry, Timestamp: time.Unix(0, ts), Body: string(body)}
+	return typ, msg, true, nil
 }
 
 // WALStorage implements a segmented write-ahead log using a simple binary record format:
-// [4-byte big-endian uint32 payloadLen][1-byte type][payload JSON bytes]
+// [4-byte totalSize][4-byte bodyCRC][1-byte type][8-byte id][2-byte retry][8-byte ts][4-byte bodyLen][body]
 // It supports per-topic segments, rotation and compaction.
 type WALStorage struct {
 	baseDir string
@@ -209,14 +289,12 @@ func (w *WALStorage) rotateSegment(topic string) error {
 	return nil
 }
 
-// writeRecord writes a [len(uint32)][type byte][payload JSON] record to topic's current segment
-func (w *WALStorage) writeRecord(topic string, typ LogType, payload interface{}) error {
-	data, err := json.Marshal(payload)
+// writeRecord writes a binary record to topic's current segment.
+func (w *WALStorage) writeRecord(topic string, typ LogType, msg Message) error {
+	rec, recLen, err := buildRecordBytes(typ, msg)
 	if err != nil {
 		return err
 	}
-	payloadLen := uint32(len(data))
-	recordLen := int64(4 + 1 + len(data))
 
 	w.mu.Lock()
 	if _, ok := w.topicCond[topic]; !ok {
@@ -229,21 +307,11 @@ func (w *WALStorage) writeRecord(topic string, typ LogType, payload interface{})
 		w.mu.Unlock()
 		return err
 	}
-	var lenBuf [4]byte
-	binary.BigEndian.PutUint32(lenBuf[:], payloadLen)
-	if _, err := w.writers[topic].Write(lenBuf[:]); err != nil {
+	if _, err := w.writers[topic].Write(rec); err != nil {
 		w.mu.Unlock()
 		return err
 	}
-	if _, err := w.writers[topic].Write([]byte{byte(typ)}); err != nil {
-		w.mu.Unlock()
-		return err
-	}
-	if _, err := w.writers[topic].Write(data); err != nil {
-		w.mu.Unlock()
-		return err
-	}
-	w.bytesSinceCompact[topic] += recordLen
+	w.bytesSinceCompact[topic] += recLen
 	shouldRotate := w.bytesSinceCompact[topic] >= w.compactThreshold
 	if shouldRotate {
 		w.bytesSinceCompact[topic] = 0
@@ -256,16 +324,14 @@ func (w *WALStorage) writeRecord(topic string, typ LogType, payload interface{})
 	return nil
 }
 
-// Append writes an ENQ operation for the message to the WAL (buffered binary JSON).
+// Append writes an ENQ operation for the message to the WAL (binary + CRC).
 func (w *WALStorage) Append(topic string, msg Message) error {
-	entry := LogEntry{Type: LogProduce, Topic: topic, Msg: msg}
-	return w.writeRecord(topic, LogProduce, entry)
+	return w.writeRecord(topic, LogProduce, msg)
 }
 
-// Ack appends an ACK operation for the message id (buffered binary JSON).
+// Ack appends an ACK operation for the message id (binary + CRC, body empty).
 func (w *WALStorage) Ack(topic string, id int64) error {
-	entry := LogEntry{Type: LogAck, Topic: topic, Msg: Message{ID: id}}
-	return w.writeRecord(topic, LogAck, entry)
+	return w.writeRecord(topic, LogAck, Message{ID: id})
 }
 
 // AppendSync writes and then flushes+fsyncs the topic so the write is durable when the call returns.
@@ -351,55 +417,26 @@ func (w *WALStorage) Load(topic string) ([]Message, error) {
 			return nil, err
 		}
 		for {
-			var lenBuf [4]byte
-			if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
-				if err == io.EOF || err == io.ErrUnexpectedEOF {
-					break
+			typ, msg, ok, err := readRecord(f)
+			if err != nil {
+				if errors.Is(err, errBadCRC) || errors.Is(err, errCorruptRecord) {
+					continue
 				}
 				f.Close()
 				return nil, err
 			}
-			n := binary.BigEndian.Uint32(lenBuf[:])
-			if n == 0 {
-				continue
-			}
-			// read type byte
-			var tbuf [1]byte
-			if _, err := io.ReadFull(f, tbuf[:]); err != nil {
-				if err == io.EOF || err == io.ErrUnexpectedEOF {
-					break
-				}
-				f.Close()
-				return nil, err
-			}
-			typ := LogType(tbuf[0])
-			payload := make([]byte, n)
-			if _, err := io.ReadFull(f, payload); err != nil {
-				if err == io.EOF || err == io.ErrUnexpectedEOF {
-					break
-				}
-				f.Close()
-				return nil, err
+			if !ok {
+				break
 			}
 			switch typ {
 			case LogProduce:
-				var entry LogEntry
-				if err := json.Unmarshal(payload, &entry); err != nil {
-					continue
+				if _, seen := msgs[msg.ID]; !seen {
+					order = append(order, msg.ID)
 				}
-				m := entry.Msg
-				if _, seen := msgs[m.ID]; !seen {
-					order = append(order, m.ID)
-				}
-				msgs[m.ID] = m
+				msgs[msg.ID] = msg
 			case LogAck:
-				var entry LogEntry
-				if err := json.Unmarshal(payload, &entry); err != nil {
-					continue
-				}
-				m := entry.Msg
-				acked[m.ID] = struct{}{}
-				delete(msgs, m.ID)
+				acked[msg.ID] = struct{}{}
+				delete(msgs, msg.ID)
 			default:
 				// ignore other types for now
 			}
@@ -512,54 +549,26 @@ func (w *WALStorage) Compact(topic string) error {
 			return err
 		}
 		for {
-			var lenBuf [4]byte
-			if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
-				if err == io.EOF || err == io.ErrUnexpectedEOF {
-					break
+			typ, msg, ok, err := readRecord(f)
+			if err != nil {
+				if errors.Is(err, errBadCRC) || errors.Is(err, errCorruptRecord) {
+					continue
 				}
 				f.Close()
 				return err
 			}
-			n := binary.BigEndian.Uint32(lenBuf[:])
-			if n == 0 {
-				continue
-			}
-			var tbuf [1]byte
-			if _, err := io.ReadFull(f, tbuf[:]); err != nil {
-				if err == io.EOF || err == io.ErrUnexpectedEOF {
-					break
-				}
-				f.Close()
-				return err
-			}
-			typ := LogType(tbuf[0])
-			payload := make([]byte, n)
-			if _, err := io.ReadFull(f, payload); err != nil {
-				if err == io.EOF || err == io.ErrUnexpectedEOF {
-					break
-				}
-				f.Close()
-				return err
+			if !ok {
+				break
 			}
 			switch typ {
 			case LogProduce:
-				var entry LogEntry
-				if err := json.Unmarshal(payload, &entry); err != nil {
-					continue
+				if _, seen := msgs[msg.ID]; !seen {
+					order = append(order, msg.ID)
 				}
-				m := entry.Msg
-				if _, seen := msgs[m.ID]; !seen {
-					order = append(order, m.ID)
-				}
-				msgs[m.ID] = m
+				msgs[msg.ID] = msg
 			case LogAck:
-				var entry LogEntry
-				if err := json.Unmarshal(payload, &entry); err != nil {
-					continue
-				}
-				m := entry.Msg
-				acked[m.ID] = struct{}{}
-				delete(msgs, m.ID)
+				acked[msg.ID] = struct{}{}
+				delete(msgs, msg.ID)
 			}
 		}
 		f.Close()
@@ -578,20 +587,13 @@ func (w *WALStorage) Compact(topic string) error {
 		if !ok {
 			continue
 		}
-		data, _ := json.Marshal(m)
-		var lenBuf [4]byte
-		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
-		if _, err := f.Write(lenBuf[:]); err != nil {
+		rec, _, err := buildRecordBytes(LogProduce, m)
+		if err != nil {
 			f.Close()
 			os.Remove(tmp)
 			return err
 		}
-		if _, err := f.Write([]byte{byte(LogProduce)}); err != nil {
-			f.Close()
-			os.Remove(tmp)
-			return err
-		}
-		if _, err := f.Write(data); err != nil {
+		if _, err := f.Write(rec); err != nil {
 			f.Close()
 			os.Remove(tmp)
 			return err

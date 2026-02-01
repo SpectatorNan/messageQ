@@ -142,10 +142,12 @@ func (q *Queue) Nack(id int64) bool {
 
 	im.Msg.Retry++
 	if im.Msg.Retry > q.maxRetry {
+		q.persistDLQ(im.Msg)
 		log.Println("DLQ:", im.Msg.ID)
 		return true
 	}
 
+	q.persistRetry(im.Msg)
 	q.data = append(q.data, im.Msg)
 	q.cond.Signal()
 	return true
@@ -161,13 +163,56 @@ func (q *Queue) reclaimLoop() {
 				delete(q.inflight, id)
 				im.Msg.Retry++
 				if im.Msg.Retry <= q.maxRetry {
+					q.persistRetry(im.Msg)
 					q.data = append(q.data, im.Msg)
 					q.cond.Signal()
 				} else {
+					q.persistDLQ(im.Msg)
 					log.Println("DLQ timeout:", id)
 				}
 			}
 		}
 		q.mu.Unlock()
+	}
+}
+
+func (q *Queue) persistRetry(msg Message) {
+	if q.store == nil {
+		return
+	}
+	sm := storage.Message{
+		ID:        msg.ID,
+		Body:      msg.Body,
+		Retry:     msg.Retry,
+		Timestamp: msg.Timestamp,
+	}
+	if err := q.store.Append(q.topic, sm); err != nil {
+		log.Println("storage retry append error:", err)
+	}
+}
+
+func (q *Queue) persistDLQ(msg Message) {
+	if q.store == nil {
+		return
+	}
+	topicDLQ := q.topic + ".dlq"
+	sm := storage.Message{
+		ID:        msg.ID,
+		Body:      msg.Body,
+		Retry:     msg.Retry,
+		Timestamp: msg.Timestamp,
+	}
+	if err := q.store.Append(topicDLQ, sm); err != nil {
+		log.Println("storage dlq append error:", err)
+	}
+	if f, ok := q.store.(interface{ FlushTopic(string) error }); ok {
+		_ = f.FlushTopic(topicDLQ)
+	}
+	// mark as acked in active topic so replay won't restore it
+	if err := q.store.Ack(q.topic, msg.ID); err != nil {
+		log.Println("storage dlq ack error:", err)
+	}
+	if f, ok := q.store.(interface{ FlushTopic(string) error }); ok {
+		_ = f.FlushTopic(q.topic)
 	}
 }

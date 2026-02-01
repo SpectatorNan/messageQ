@@ -2,13 +2,14 @@ package main
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"time"
 )
 
 type LogType byte
@@ -22,16 +23,10 @@ const (
 )
 
 type Message struct {
-	ID    int64  `json:"id"`
-	Body  string `json:"body"`
-	Retry int    `json:"retry"`
-	// Timestamp omitted for inspect simplicity
-}
-
-type LogEntry struct {
-	Type  LogType `json:"type"`
-	Topic string  `json:"topic"`
-	Msg   Message `json:"msg"`
+	ID        int64
+	Body      string
+	Retry     int
+	Timestamp time.Time
 }
 
 func listSegments(dir string, topic string) ([]string, error) {
@@ -87,16 +82,8 @@ func inspectSegment(path string, showPayload bool) error {
 			}
 			return err
 		}
-		n := binary.BigEndian.Uint32(lenBuf[:])
-		var tbuf [1]byte
-		if _, err := io.ReadFull(f, tbuf[:]); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break
-			}
-			return err
-		}
-		typ := LogType(tbuf[0])
-		payload := make([]byte, n)
+		total := binary.BigEndian.Uint32(lenBuf[:])
+		payload := make([]byte, total)
 		if _, err := io.ReadFull(f, payload); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				break
@@ -104,15 +91,29 @@ func inspectSegment(path string, showPayload bool) error {
 			return err
 		}
 		idx++
+		off := 0
+		crc := binary.BigEndian.Uint32(payload[off : off+4])
+		off += 4
+		typ := LogType(payload[off])
+		off += 1
+		msgID := int64(binary.BigEndian.Uint64(payload[off : off+8]))
+		off += 8
+		retry := int(binary.BigEndian.Uint16(payload[off : off+2]))
+		off += 2
+		ts := int64(binary.BigEndian.Uint64(payload[off : off+8]))
+		off += 8
+		bodyLen := int(binary.BigEndian.Uint32(payload[off : off+4]))
+		off += 4
+		if bodyLen < 0 || off+bodyLen > len(payload) {
+			fmt.Printf("  %d: %s invalid bodyLen=%d\n", idx, typName(typ), bodyLen)
+			continue
+		}
+		body := payload[off : off+bodyLen]
+		crcOK := (bodyLen == 0) || (crc32.ChecksumIEEE(body) == crc)
 		if showPayload {
-			var entry LogEntry
-			if err := json.Unmarshal(payload, &entry); err != nil {
-				fmt.Printf("  %d: %s id=? (malformed payload)\n", idx, typName(typ))
-				continue
-			}
-			fmt.Printf("  %d: %s id=%d body_len=%d\n", idx, typName(typ), entry.Msg.ID, len(entry.Msg.Body))
+			fmt.Printf("  %d: %s id=%d retry=%d ts=%s body_len=%d crc_ok=%v\n", idx, typName(typ), msgID, retry, time.Unix(0, ts).Format(time.RFC3339Nano), bodyLen, crcOK)
 		} else {
-			fmt.Printf("  %d: %s payload_len=%d\n", idx, typName(typ), n)
+			fmt.Printf("  %d: %s body_len=%d crc_ok=%v\n", idx, typName(typ), bodyLen, crcOK)
 		}
 	}
 	return nil

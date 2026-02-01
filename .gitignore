@@ -1,3 +1,4 @@
 .DS_Store
 /go/example/testdata
 /go/example/benchdata
+/go/example/dlqdata

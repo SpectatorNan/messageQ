@@ -2,8 +2,8 @@ package example
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +11,40 @@ import (
 
 	"messageQ/mq/storage"
 )
+
+// buildRecordBytes for tests (matches wal.go format)
+func buildRecordBytes(typ storage.LogType, msg storage.Message) []byte {
+	body := []byte(msg.Body)
+	if typ != storage.LogProduce {
+		body = nil
+	}
+	ts := msg.Timestamp
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	crc := uint32(0)
+	if len(body) > 0 {
+		crc = crc32.ChecksumIEEE(body)
+	}
+	totalSize := uint32(4 + 1 + 8 + 2 + 8 + 4 + len(body))
+	buf := make([]byte, 4+totalSize)
+	binary.BigEndian.PutUint32(buf[0:4], totalSize)
+	off := 4
+	binary.BigEndian.PutUint32(buf[off:off+4], crc)
+	off += 4
+	buf[off] = byte(typ)
+	off++
+	binary.BigEndian.PutUint64(buf[off:off+8], uint64(msg.ID))
+	off += 8
+	binary.BigEndian.PutUint16(buf[off:off+2], uint16(msg.Retry))
+	off += 2
+	binary.BigEndian.PutUint64(buf[off:off+8], uint64(ts.UnixNano()))
+	off += 8
+	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(body)))
+	off += 4
+	copy(buf[off:], body)
+	return buf
+}
 
 // TestPartialWriteIgnored simulates a partially-written record at the end of a segment
 // and verifies that Load ignores the incomplete record and returns only complete ones.
@@ -26,30 +60,20 @@ func TestPartialWriteIgnored(t *testing.T) {
 	}
 	defer f.Close()
 
-	// write one complete record (LogEntry JSON)
+	// write one complete record
 	m1 := storage.Message{ID: 1, Body: "hello", Retry: 0, Timestamp: time.Now()}
-	entry1 := storage.LogEntry{Type: storage.LogProduce, Topic: topic, Msg: m1}
-	b1, _ := json.Marshal(entry1)
-	var lenBuf [4]byte
-	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(b1)))
-	if _, err := f.Write(lenBuf[:]); err != nil {
-		t.Fatalf("write len: %v", err)
-	}
-	if _, err := f.Write([]byte{byte(storage.LogProduce)}); err != nil {
-		t.Fatalf("write type: %v", err)
-	}
-	if _, err := f.Write(b1); err != nil {
-		t.Fatalf("write payload: %v", err)
+	rec1 := buildRecordBytes(storage.LogProduce, m1)
+	if _, err := f.Write(rec1); err != nil {
+		t.Fatalf("write record: %v", err)
 	}
 
-	// write a partial record (length says 100 but only write 10 bytes)
+	// write a partial record (length says 100 but only write 10 bytes of payload)
+	var lenBuf [4]byte
 	binary.BigEndian.PutUint32(lenBuf[:], uint32(100))
 	if _, err := f.Write(lenBuf[:]); err != nil {
 		t.Fatalf("write partial len: %v", err)
 	}
-	if _, err := f.Write([]byte{byte(storage.LogProduce)}); err != nil {
-		t.Fatalf("write partial type: %v", err)
-	}
+	// write only a small part of the payload bytes
 	partial := []byte("partial123")
 	if _, err := f.Write(partial); err != nil {
 		t.Fatalf("write partial payload: %v", err)
@@ -84,18 +108,9 @@ func TestLeftoverTmpIgnored(t *testing.T) {
 			t.Fatalf("open seg %d: %v", si, err)
 		}
 		m := storage.Message{ID: int64(si), Body: "m", Retry: 0, Timestamp: time.Now()}
-		entry := storage.LogEntry{Type: storage.LogProduce, Topic: topic, Msg: m}
-		b, _ := json.Marshal(entry)
-		var lenBuf [4]byte
-		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(b)))
-		if _, err := f.Write(lenBuf[:]); err != nil {
-			t.Fatalf("write len: %v", err)
-		}
-		if _, err := f.Write([]byte{byte(storage.LogProduce)}); err != nil {
-			t.Fatalf("write type: %v", err)
-		}
-		if _, err := f.Write(b); err != nil {
-			t.Fatalf("write payload: %v", err)
+		rec := buildRecordBytes(storage.LogProduce, m)
+		if _, err := f.Write(rec); err != nil {
+			t.Fatalf("write record: %v", err)
 		}
 		f.Sync()
 		f.Close()
