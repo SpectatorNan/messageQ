@@ -17,23 +17,12 @@ import (
 	"github.com/google/uuid"
 )
 
-// LogType defines record type in WAL
-type LogType byte
-
-const (
-	LogProduce LogType = 1
-	LogAck     LogType = 2
-	LogNack    LogType = 3
-	LogRetry   LogType = 4
-	LogDLQ     LogType = 5
-)
-
 var errBadCRC = errors.New("bad crc")
 var errCorruptRecord = errors.New("corrupt record")
 
 const (
 	walMagic      = "MQW1"
-	walVersion    = uint16(1)
+	walVersion    = uint16(2)
 	walHeaderSize = 8
 )
 
@@ -42,7 +31,6 @@ func writeWALHeader(w io.Writer) error {
 	var hdr [walHeaderSize]byte
 	copy(hdr[0:4], []byte(walMagic))
 	binary.BigEndian.PutUint16(hdr[4:6], walVersion)
-	// hdr[6:8] reserved
 	_, err := w.Write(hdr[:])
 	return err
 }
@@ -67,16 +55,14 @@ func readWALHeader(r io.Reader) error {
 }
 
 const (
-	minRecordSize = 4 + 1 + 16 + 2 + 8 + 4 // crc + type + id(16) + retry + ts + bodyLen
+	minRecordSize = 4 + 16 + 2 + 8 + 2 + 4 // crc + id(16) + retry + ts + tagLen + bodyLen
 	maxRecordSize = 64 * 1024 * 1024       // safety cap
 )
 
-// buildRecordBytes returns the full record bytes: [totalSize][crc][type][id(16)][retry][ts][bodyLen][body]
-func buildRecordBytes(typ LogType, msg Message) ([]byte, int64, error) {
+// buildRecordBytes returns record bytes: [totalSize][crc][id(16)][retry][ts][tagLen][tag][bodyLen][body]
+func buildRecordBytes(msg Message) ([]byte, int64, error) {
 	body := []byte(msg.Body)
-	if typ != LogProduce {
-		body = nil
-	}
+	tag := []byte(msg.Tag)
 	ts := msg.Timestamp
 	if ts.IsZero() {
 		ts = time.Now()
@@ -90,21 +76,25 @@ func buildRecordBytes(typ LogType, msg Message) ([]byte, int64, error) {
 		return nil, 0, err
 	}
 	uidBytes := uid[:]
-
-	totalSize := uint32(4 + 1 + 16 + 2 + 8 + 4 + len(body))
+	if len(tag) > 0xFFFF {
+		return nil, 0, fmt.Errorf("tag too long")
+	}
+	totalSize := uint32(4 + 16 + 2 + 8 + 2 + len(tag) + 4 + len(body))
 	buf := make([]byte, 4+totalSize)
 	binary.BigEndian.PutUint32(buf[0:4], totalSize)
 	off := 4
 	binary.BigEndian.PutUint32(buf[off:off+4], crc)
 	off += 4
-	buf[off] = byte(typ)
-	off += 1
 	copy(buf[off:off+16], uidBytes)
 	off += 16
 	binary.BigEndian.PutUint16(buf[off:off+2], uint16(msg.Retry))
 	off += 2
 	binary.BigEndian.PutUint64(buf[off:off+8], uint64(ts.UnixNano()))
 	off += 8
+	binary.BigEndian.PutUint16(buf[off:off+2], uint16(len(tag)))
+	off += 2
+	copy(buf[off:off+len(tag)], tag)
+	off += len(tag)
 	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(body)))
 	off += 4
 	copy(buf[off:], body)
@@ -112,52 +102,57 @@ func buildRecordBytes(typ LogType, msg Message) ([]byte, int64, error) {
 }
 
 // readRecord reads a single record from r; returns ok=false on EOF
-func readRecord(r io.Reader) (LogType, Message, bool, error) {
+func readRecord(r io.Reader) (Message, bool, error) {
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return 0, Message{}, false, nil
+			return Message{}, false, nil
 		}
-		return 0, Message{}, false, err
+		return Message{}, false, err
 	}
 	total := binary.BigEndian.Uint32(lenBuf[:])
 	if total < minRecordSize || total > maxRecordSize {
-		return 0, Message{}, false, fmt.Errorf("invalid record size: %d", total)
+		return Message{}, false, fmt.Errorf("invalid record size: %d", total)
 	}
 	payload := make([]byte, total)
 	if _, err := io.ReadFull(r, payload); err != nil {
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
-			return 0, Message{}, false, nil
+			return Message{}, false, nil
 		}
-		return 0, Message{}, false, err
+		return Message{}, false, err
 	}
 	off := 0
 	crc := binary.BigEndian.Uint32(payload[off : off+4])
 	off += 4
-	typ := LogType(payload[off])
-	off += 1
 	idBytes := payload[off : off+16]
 	off += 16
 	uid, err := uuid.FromBytes(idBytes)
 	if err != nil {
-		return typ, Message{}, true, errCorruptRecord
+		return Message{}, true, errCorruptRecord
 	}
 	msgID := uid.String()
 	retry := int(binary.BigEndian.Uint16(payload[off : off+2]))
 	off += 2
 	ts := int64(binary.BigEndian.Uint64(payload[off : off+8]))
 	off += 8
+	tagLen := int(binary.BigEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if tagLen < 0 || off+tagLen > len(payload) {
+		return Message{ID: msgID, Retry: retry, Timestamp: time.Unix(0, ts)}, true, errCorruptRecord
+	}
+	tag := string(payload[off : off+tagLen])
+	off += tagLen
 	bodyLen := int(binary.BigEndian.Uint32(payload[off : off+4]))
 	off += 4
 	if bodyLen < 0 || off+bodyLen > len(payload) {
-		return typ, Message{ID: msgID, Retry: retry, Timestamp: time.Unix(0, ts)}, true, errCorruptRecord
+		return Message{ID: msgID, Retry: retry, Tag: tag, Timestamp: time.Unix(0, ts)}, true, errCorruptRecord
 	}
 	body := payload[off : off+bodyLen]
 	if bodyLen > 0 && crc32.ChecksumIEEE(body) != crc {
-		return typ, Message{ID: msgID, Retry: retry, Timestamp: time.Unix(0, ts)}, true, errBadCRC
+		return Message{ID: msgID, Retry: retry, Tag: tag, Timestamp: time.Unix(0, ts)}, true, errBadCRC
 	}
-	msg := Message{ID: msgID, Retry: retry, Timestamp: time.Unix(0, ts), Body: string(body)}
-	return typ, msg, true, nil
+	msg := Message{ID: msgID, Retry: retry, Tag: tag, Timestamp: time.Unix(0, ts), Body: string(body)}
+	return msg, true, nil
 }
 
 // WALStorage implements a segmented write-ahead log using a simple binary record format:
@@ -166,8 +161,14 @@ func readRecord(r io.Reader) (LogType, Message, bool, error) {
 type WALStorage struct {
 	baseDir string
 	mu      sync.Mutex
-	files   map[string]*os.File      // current open file per topic (current segment)
-	writers map[string]*bufio.Writer // current writer per topic
+	files   map[string]*os.File      // current open file per topic/queue (current segment)
+	writers map[string]*bufio.Writer // current writer per topic/queue
+
+	cqFiles   map[string]*os.File      // consumequeue files per topic/queue
+	cqWriters map[string]*bufio.Writer // consumequeue writers per topic/queue
+
+	segmentID  map[string]int64 // current segment id per topic/queue
+	segmentPos map[string]int64 // current write position per topic/queue
 
 	flushInterval    time.Duration
 	compactInterval  time.Duration
@@ -177,7 +178,7 @@ type WALStorage struct {
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 
-	// compaction coordination (per-topic)
+	// compaction coordination (per-topic/queue)
 	topicCompacting map[string]bool
 	topicCond       map[string]*sync.Cond
 
@@ -202,6 +203,10 @@ func NewWALStorage(baseDir string, params ...time.Duration) *WALStorage {
 		baseDir:           baseDir,
 		files:             make(map[string]*os.File),
 		writers:           make(map[string]*bufio.Writer),
+		cqFiles:           make(map[string]*os.File),
+		cqWriters:         make(map[string]*bufio.Writer),
+		segmentID:         make(map[string]int64),
+		segmentPos:        make(map[string]int64),
 		flushInterval:     fi,
 		compactInterval:   ci,
 		compactThreshold:  threshold,
@@ -230,6 +235,36 @@ func (w *WALStorage) commitLogDir(topic string, queueID int) string {
 	return filepath.Join(w.baseDir, "commitlog", topic, fmt.Sprintf("%d", queueID))
 }
 
+// consumeQueueDir returns the consumequeue directory for a topic/queue.
+func (w *WALStorage) consumeQueueDir(topic string, queueID int) string {
+	return filepath.Join(w.baseDir, "consumequeue", topic, fmt.Sprintf("%d", queueID))
+}
+
+// consumeQueueFile returns the consumequeue file path for a topic/queue.
+func (w *WALStorage) consumeQueueFile(topic string, queueID int) string {
+	return filepath.Join(w.consumeQueueDir(topic, queueID), "00000001.cq")
+}
+
+// ensureConsumeQueueLocked opens consumequeue file for topic/queue.
+func (w *WALStorage) ensureConsumeQueueLocked(topic string, queueID int) error {
+	key := queueKey(topic, queueID)
+	if _, ok := w.cqWriters[key]; ok {
+		return nil
+	}
+	cqDir := w.consumeQueueDir(topic, queueID)
+	if err := os.MkdirAll(cqDir, 0o755); err != nil {
+		return err
+	}
+	p := w.consumeQueueFile(topic, queueID)
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	w.cqFiles[key] = f
+	w.cqWriters[key] = bufio.NewWriterSize(f, 64*1024)
+	return nil
+}
+
 // ensureTopicLocked must be called with w.mu held (or from a context where we will hold it).
 // It opens or creates the current highest-numbered segment in topic/queue directory.
 func (w *WALStorage) ensureTopicLocked(topic string, queueID int) error {
@@ -244,8 +279,6 @@ func (w *WALStorage) ensureTopicLocked(topic string, queueID int) error {
 	if err := os.MkdirAll(commitDir, 0o755); err != nil {
 		return err
 	}
-	// create consumequeue dir for layout completeness (not used yet)
-	_ = os.MkdirAll(filepath.Join(w.baseDir, "consumequeue", topic, fmt.Sprintf("%d", queueID)), 0o755)
 	entries, err := os.ReadDir(commitDir)
 	if err != nil {
 		return err
@@ -275,20 +308,26 @@ func (w *WALStorage) ensureTopicLocked(topic string, queueID int) error {
 		return err
 	}
 	// write header if file is new/empty
-	if info, err := f.Stat(); err == nil && info.Size() == 0 {
-		if err := writeWALHeader(f); err != nil {
-			f.Close()
-			return err
+	if info, err := f.Stat(); err == nil {
+		if info.Size() == 0 {
+			if err := writeWALHeader(f); err != nil {
+				f.Close()
+				return err
+			}
+			_ = f.Sync()
+			_ = syncDir(commitDir)
+			w.segmentPos[key] = walHeaderSize
+		} else {
+			w.segmentPos[key] = info.Size()
 		}
-		_ = f.Sync()
-		_ = syncDir(commitDir)
 	}
+	w.segmentID[key] = maxSeg
 	w.files[key] = f
 	w.writers[key] = bufio.NewWriterSize(f, 64*1024)
 	if _, ok := w.bytesSinceCompact[key]; !ok {
 		w.bytesSinceCompact[key] = 0
 	}
-	return nil
+	return w.ensureConsumeQueueLocked(topic, queueID)
 }
 
 // listTopicSegments returns absolute paths of segment files sorted by name for a topic/queue.
@@ -357,6 +396,8 @@ func (w *WALStorage) rotateSegment(topic string, queueID int) error {
 		f.Close()
 		return err
 	}
+	w.segmentID[key] = next
+	w.segmentPos[key] = walHeaderSize
 	w.files[key] = f
 	w.writers[key] = bufio.NewWriterSize(f, 64*1024)
 	w.bytesSinceCompact[key] = 0
@@ -365,9 +406,9 @@ func (w *WALStorage) rotateSegment(topic string, queueID int) error {
 }
 
 // writeRecord writes a binary record to topic/queue's current segment.
-func (w *WALStorage) writeRecord(topic string, queueID int, typ LogType, msg Message) error {
+func (w *WALStorage) writeRecord(topic string, queueID int, msg Message) error {
 	key := queueKey(topic, queueID)
-	rec, recLen, err := buildRecordBytes(typ, msg)
+	rec, recLen, err := buildRecordBytes(msg)
 	if err != nil {
 		return err
 	}
@@ -383,15 +424,20 @@ func (w *WALStorage) writeRecord(topic string, queueID int, typ LogType, msg Mes
 		w.mu.Unlock()
 		return err
 	}
+	pos := w.segmentPos[key]
+	segID := w.segmentID[key]
 	if _, err := w.writers[key].Write(rec); err != nil {
 		w.mu.Unlock()
 		return err
 	}
+	w.segmentPos[key] = pos + recLen
 	w.bytesSinceCompact[key] += recLen
 	shouldRotate := w.bytesSinceCompact[key] >= w.compactThreshold
 	if shouldRotate {
 		w.bytesSinceCompact[key] = 0
 	}
+	// write consumequeue entry (tag hash included)
+	_ = w.writeConsumeQueueEntryLocked(topic, queueID, uint32(segID), uint64(pos), uint32(recLen), hashTag(msg.Tag))
 	w.mu.Unlock()
 
 	if shouldRotate {
@@ -400,14 +446,37 @@ func (w *WALStorage) writeRecord(topic string, queueID int, typ LogType, msg Mes
 	return nil
 }
 
-// Append writes an ENQ operation for the message to the WAL (binary + CRC).
-func (w *WALStorage) Append(topic string, queueID int, msg Message) error {
-	return w.writeRecord(topic, queueID, LogProduce, msg)
+// hashTag computes a tag hash for consumequeue filtering.
+func hashTag(tag string) uint32 {
+	if tag == "" {
+		return 0
+	}
+	return crc32.ChecksumIEEE([]byte(tag))
 }
 
-// Ack appends an ACK operation for the message id (binary + CRC, body empty).
+// writeConsumeQueueEntryLocked appends an index entry to consumequeue.
+func (w *WALStorage) writeConsumeQueueEntryLocked(topic string, queueID int, segID uint32, pos uint64, size uint32, tagHash uint32) error {
+	key := queueKey(topic, queueID)
+	if err := w.ensureConsumeQueueLocked(topic, queueID); err != nil {
+		return err
+	}
+	var buf [20]byte
+	binary.BigEndian.PutUint32(buf[0:4], segID)
+	binary.BigEndian.PutUint64(buf[4:12], pos)
+	binary.BigEndian.PutUint32(buf[12:16], size)
+	binary.BigEndian.PutUint32(buf[16:20], tagHash)
+	_, err := w.cqWriters[key].Write(buf[:])
+	return err
+}
+
+// Append writes an ENQ operation for the message to the WAL.
+func (w *WALStorage) Append(topic string, queueID int, msg Message) error {
+	return w.writeRecord(topic, queueID, msg)
+}
+
+// Ack is a no-op in commitlog-only mode (offsets handle consumption).
 func (w *WALStorage) Ack(topic string, queueID int, id string) error {
-	return w.writeRecord(topic, queueID, LogAck, Message{ID: id})
+	return nil
 }
 
 // AppendSync writes and then flushes+fsyncs the topic/queue so the write is durable when the call returns.
@@ -418,63 +487,12 @@ func (w *WALStorage) AppendSync(topic string, queueID int, msg Message) error {
 	return w.FlushTopic(topic, queueID)
 }
 
-// AckSync writes ACK and flushes to make it durable.
+// AckSync is a no-op in commitlog-only mode.
 func (w *WALStorage) AckSync(topic string, queueID int, id string) error {
-	if err := w.Ack(topic, queueID, id); err != nil {
-		return err
-	}
-	return w.FlushTopic(topic, queueID)
-}
-
-// FlushTopic flushes and fsyncs a single topic/queue's pending writes.
-func (w *WALStorage) FlushTopic(topic string, queueID int) error {
-	key := queueKey(topic, queueID)
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if err := w.ensureTopicLocked(topic, queueID); err != nil {
-		return err
-	}
-	wr := w.writers[key]
-	if wr != nil {
-		if err := wr.Flush(); err != nil {
-			return err
-		}
-	}
-	if f := w.files[key]; f != nil {
-		return f.Sync()
-	}
 	return nil
 }
 
-// Flush flushes all in-memory buffers and fsyncs files.
-func (w *WALStorage) Flush() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	for topic := range w.writers {
-		if err := w.flushTopicLocked(topic); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// internal helper assumes w.mu is held
-func (w *WALStorage) flushTopicLocked(topic string) error {
-	wr, ok := w.writers[topic]
-	if !ok {
-		return nil
-	}
-	if err := wr.Flush(); err != nil {
-		return err
-	}
-	f := w.files[topic]
-	if f == nil {
-		return nil
-	}
-	return f.Sync()
-}
-
-// Load replays all segment files for topic/queue and returns the list of messages that have been ENQ'd and not ACK'd, in enqueue order.
+// Load replays all segment files for topic/queue and returns the list of messages in enqueue order.
 func (w *WALStorage) Load(topic string, queueID int) ([]Message, error) {
 	if err := w.FlushTopic(topic, queueID); err != nil {
 		return nil, err
@@ -483,9 +501,7 @@ func (w *WALStorage) Load(topic string, queueID int) ([]Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	msgs := make(map[string]Message)
-	order := make([]string, 0)
-	acked := make(map[string]struct{})
+	msgs := make([]Message, 0)
 
 	for _, seg := range segs {
 		f, err := os.Open(seg)
@@ -505,7 +521,7 @@ func (w *WALStorage) Load(topic string, queueID int) ([]Message, error) {
 			return nil, err
 		}
 		for {
-			typ, msg, ok, err := readRecord(f)
+			msg, ok, err := readRecord(f)
 			if err != nil {
 				if errors.Is(err, errBadCRC) || errors.Is(err, errCorruptRecord) {
 					continue
@@ -516,32 +532,11 @@ func (w *WALStorage) Load(topic string, queueID int) ([]Message, error) {
 			if !ok {
 				break
 			}
-			switch typ {
-			case LogProduce:
-				if _, seen := msgs[msg.ID]; !seen {
-					order = append(order, msg.ID)
-				}
-				msgs[msg.ID] = msg
-			case LogAck:
-				acked[msg.ID] = struct{}{}
-				delete(msgs, msg.ID)
-			default:
-				// ignore other types for now
-			}
+			msgs = append(msgs, msg)
 		}
 		f.Close()
 	}
-
-	res := make([]Message, 0, len(order))
-	for _, id := range order {
-		if _, isAcked := acked[id]; isAcked {
-			continue
-		}
-		if m, ok := msgs[id]; ok {
-			res = append(res, m)
-		}
-	}
-	return res, nil
+	return msgs, nil
 }
 
 // Compact rewrites the earliest compactable segments for the topic/queue into a single compacted segment file.
@@ -574,9 +569,7 @@ func (w *WALStorage) Compact(topic string, queueID int) error {
 	}
 	toCompact := segs[:len(segs)-1]
 
-	acked := make(map[string]struct{})
-	order := make([]string, 0)
-	msgs := make(map[string]Message)
+	msgs := make([]Message, 0)
 	for _, path := range toCompact {
 		f, err := os.Open(path)
 		if err != nil {
@@ -595,7 +588,7 @@ func (w *WALStorage) Compact(topic string, queueID int) error {
 			return err
 		}
 		for {
-			typ, msg, ok, err := readRecord(f)
+			msg, ok, err := readRecord(f)
 			if err != nil {
 				if errors.Is(err, errBadCRC) || errors.Is(err, errCorruptRecord) {
 					continue
@@ -606,16 +599,7 @@ func (w *WALStorage) Compact(topic string, queueID int) error {
 			if !ok {
 				break
 			}
-			switch typ {
-			case LogProduce:
-				if _, seen := msgs[msg.ID]; !seen {
-					order = append(order, msg.ID)
-				}
-				msgs[msg.ID] = msg
-			case LogAck:
-				acked[msg.ID] = struct{}{}
-				delete(msgs, msg.ID)
-			}
+			msgs = append(msgs, msg)
 		}
 		f.Close()
 	}
@@ -626,72 +610,108 @@ func (w *WALStorage) Compact(topic string, queueID int) error {
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 	if err := writeWALHeader(f); err != nil {
-		f.Close()
-		os.Remove(tmp)
 		return err
 	}
-	for _, id := range order {
-		if _, isAcked := acked[id]; isAcked {
-			continue
-		}
-		m, ok := msgs[id]
-		if !ok {
-			continue
-		}
-		rec, _, err := buildRecordBytes(LogProduce, m)
+	for _, msg := range msgs {
+		rec, _, err := buildRecordBytes(msg)
 		if err != nil {
-			f.Close()
-			os.Remove(tmp)
 			return err
 		}
 		if _, err := f.Write(rec); err != nil {
-			f.Close()
-			os.Remove(tmp)
 			return err
 		}
 	}
 	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
 		return err
 	}
-	f.Close()
-
-	first := toCompact[0]
-	if err := os.Rename(tmp, first); err != nil {
-		os.Remove(tmp)
-		return err
-	}
+	_ = os.Rename(tmp, segs[len(segs)-1])
 	_ = syncDir(commitDir)
-	for i := 1; i < len(toCompact); i++ {
-		_ = os.Remove(toCompact[i])
-	}
-	_ = syncDir(commitDir)
-
-	w.mu.Lock()
-	if oldf, ok := w.files[key]; ok {
-		_ = w.writers[key].Flush()
-		_ = oldf.Sync()
-		_ = oldf.Close()
-		delete(w.files, key)
-		delete(w.writers, key)
-	}
-	_ = w.ensureTopicLocked(topic, queueID)
-	w.mu.Unlock()
-
 	return nil
 }
 
-// syncDir performs an fsync on the directory containing path to ensure rename visibility.
-func syncDir(dirPath string) error {
-	// open the directory and sync it
-	d, err := os.Open(dirPath)
-	if err != nil {
+// flushTopicLocked flushes and fsyncs a single topic/queue's pending writes.
+func (w *WALStorage) flushTopicLocked(key string) error {
+	if wr, ok := w.writers[key]; ok {
+		if err := wr.Flush(); err != nil {
+			return err
+		}
+	}
+	if f, ok := w.files[key]; ok {
+		if err := f.Sync(); err != nil {
+			return err
+		}
+	}
+	if cqw, ok := w.cqWriters[key]; ok {
+		if err := cqw.Flush(); err != nil {
+			return err
+		}
+	}
+	if cf, ok := w.cqFiles[key]; ok {
+		return cf.Sync()
+	}
+	return nil
+}
+
+// FlushTopic flushes and fsyncs a single topic/queue's pending writes.
+func (w *WALStorage) FlushTopic(topic string, queueID int) error {
+	key := queueKey(topic, queueID)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.ensureTopicLocked(topic, queueID); err != nil {
 		return err
 	}
-	defer d.Close()
-	return d.Sync()
+	return w.flushTopicLocked(key)
+}
+
+// Flush flushes all in-memory buffers and fsyncs files.
+func (w *WALStorage) Flush() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for key := range w.writers {
+		if err := w.flushTopicLocked(key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Close closes all open segments and waits for background flush/compact goroutines.
+func (w *WALStorage) Close() error {
+	var err error
+	w.closeOnce.Do(func() {
+		close(w.quit)
+		w.wg.Wait()
+		for _, f := range w.files {
+			_ = f.Close()
+		}
+		for _, w := range w.writers {
+			_ = w.Flush()
+		}
+		for _, f := range w.cqFiles {
+			_ = f.Close()
+		}
+		for _, w := range w.cqWriters {
+			_ = w.Flush()
+		}
+	})
+	return err
+}
+
+// Stats reports the current storage statistics.
+func (w *WALStorage) Stats() (map[string]interface{}, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	stats := make(map[string]interface{})
+	for key, f := range w.files {
+		if info, err := f.Stat(); err == nil {
+			stats[key] = map[string]interface{}{
+				"size": info.Size(),
+			}
+		}
+	}
+	return stats, nil
 }
 
 // SetCompactThreshold sets the byte threshold to trigger segment rotation/compaction.
@@ -699,31 +719,6 @@ func (w *WALStorage) SetCompactThreshold(n int64) {
 	w.mu.Lock()
 	w.compactThreshold = n
 	w.mu.Unlock()
-}
-
-// Close stops background goroutines and closes files. Safe to call multiple times.
-func (w *WALStorage) Close() error {
-	var firstErr error
-	w.closeOnce.Do(func() {
-		close(w.quit)
-		w.wg.Wait()
-		w.mu.Lock()
-		defer w.mu.Unlock()
-		for topic, wr := range w.writers {
-			if err := wr.Flush(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-			if f := w.files[topic]; f != nil {
-				if err := f.Sync(); err != nil && firstErr == nil {
-					firstErr = err
-				}
-				if err := f.Close(); err != nil && firstErr == nil {
-					firstErr = err
-				}
-			}
-		}
-	})
-	return firstErr
 }
 
 func (w *WALStorage) flusher() {
@@ -790,4 +785,14 @@ func (w *WALStorage) compactor() {
 			return
 		}
 	}
+}
+
+// syncDir performs an fsync on the directory containing path to ensure rename visibility.
+func syncDir(dirPath string) error {
+	d, err := os.Open(dirPath)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }

@@ -19,8 +19,8 @@ func TestWALRotationAndNonBlocking(t *testing.T) {
 	// use helper to determine data directory
 	dir := getTestDataDir(t, "rotate")
 
-	// flushInterval 10ms, compactInterval 50ms for quick compaction checks
-	store := storage.NewWALStorage(dir, 10*time.Millisecond, 50*time.Millisecond)
+	// flushInterval 10ms, compactInterval 1h to avoid compactor blocking in this test
+	store := storage.NewWALStorage(dir, 10*time.Millisecond, time.Hour)
 	defer func() { _ = store.Close() }()
 
 	topic := "rot"

@@ -59,6 +59,7 @@ func NewQueueWithStorage(store storage.Storage, topic string, queueID int) *Queu
 				qm := Message{
 					ID:        sm.ID,
 					Body:      sm.Body,
+					Tag:       sm.Tag,
 					Retry:     sm.Retry,
 					Timestamp: sm.Timestamp,
 				}
@@ -86,7 +87,8 @@ func (q *Queue) TryDequeue() (Message, bool) {
 	return msg, true
 }
 
-func (q *Queue) Enqueue(body string) Message {
+// Enqueue adds a message with an optional tag.
+func (q *Queue) Enqueue(body string, tag string) Message {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -97,15 +99,16 @@ func (q *Queue) Enqueue(body string) Message {
 	msg := Message{
 		ID:        uid.String(),
 		Body:      body,
+		Tag:       tag,
 		Timestamp: time.Now(),
 	}
 
 	q.data = append(q.data, msg)
 	if q.store != nil {
-		// convert to storage.Message
 		sm := storage.Message{
 			ID:        msg.ID,
 			Body:      msg.Body,
+			Tag:       msg.Tag,
 			Retry:     msg.Retry,
 			Timestamp: msg.Timestamp,
 		}
@@ -113,6 +116,11 @@ func (q *Queue) Enqueue(body string) Message {
 	}
 	q.cond.Signal()
 	return msg
+}
+
+// EnqueueBody keeps backward compatibility for callers without tags.
+func (q *Queue) EnqueueBody(body string) Message {
+	return q.Enqueue(body, "")
 }
 
 func (q *Queue) Dequeue() Message {
@@ -202,6 +210,7 @@ func (q *Queue) persistRetry(msg Message) {
 	sm := storage.Message{
 		ID:        msg.ID,
 		Body:      msg.Body,
+		Tag:       msg.Tag,
 		Retry:     msg.Retry,
 		Timestamp: msg.Timestamp,
 	}
@@ -218,6 +227,7 @@ func (q *Queue) persistDLQ(msg Message) {
 	sm := storage.Message{
 		ID:        msg.ID,
 		Body:      msg.Body,
+		Tag:       msg.Tag,
 		Retry:     msg.Retry,
 		Timestamp: msg.Timestamp,
 	}

@@ -1,8 +1,9 @@
 package api
 
 import (
-	"github.com/gin-gonic/gin"
 	"messageQ/mq/broker"
+
+	"github.com/gin-gonic/gin"
 )
 
 // NewRouter creates and returns a configured Gin engine with the queue API routes.
@@ -14,6 +15,10 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 	r.GET("/topics/:topic/messages", ConsumeHandler(b))
 	r.POST("/topics/:topic/messages/:id/ack", AckHandler(b))
 	r.POST("/topics/:topic/messages/:id/nack", NackHandler(b))
+
+	// consumer group offsets
+	r.GET("/topics/:topic/offsets/:group", GetOffsetHandler(b))
+	r.POST("/topics/:topic/offsets/:group", CommitOffsetHandler(b))
 
 	return r
 }

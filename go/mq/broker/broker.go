@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"errors"
 	"sync"
 
 	"messageQ/mq/queue"
@@ -59,13 +60,18 @@ func (b *Broker) getQueues(topic string) []*queue.Queue {
 }
 
 // Enqueue routes to a queue using round-robin and returns the message.
-func (b *Broker) Enqueue(topic string, body string) queue.Message {
+func (b *Broker) Enqueue(topic string, body string, tag string) queue.Message {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 	qs := b.getQueues(topic)
 	idx := b.rrEnq[topic] % len(qs)
 	b.rrEnq[topic] = (idx + 1) % len(qs)
-	return qs[idx].Enqueue(body)
+	return qs[idx].Enqueue(body, tag)
+}
+
+// EnqueueBody keeps backward compatibility for callers without tags.
+func (b *Broker) EnqueueBody(topic string, body string) queue.Message {
+	return b.Enqueue(topic, body, "")
 }
 
 // Dequeue attempts a non-blocking scan across queues; if empty, blocks on a queue in round-robin.
@@ -133,4 +139,28 @@ func (b *Broker) GetQueue(topic string) *queue.Queue {
 	defer b.lock.Unlock()
 	qs := b.getQueues(topic)
 	return qs[0]
+}
+
+// OffsetStore provides consumer group offset persistence.
+type OffsetStore interface {
+	CommitOffset(group, topic string, queueID int, offset int64) error
+	GetOffset(group, topic string, queueID int) (int64, bool, error)
+}
+
+var ErrOffsetUnsupported = errors.New("offset store not supported")
+
+// CommitOffset persists a consumer group offset if supported by storage.
+func (b *Broker) CommitOffset(group, topic string, queueID int, offset int64) error {
+	if os, ok := b.store.(OffsetStore); ok {
+		return os.CommitOffset(group, topic, queueID, offset)
+	}
+	return ErrOffsetUnsupported
+}
+
+// GetOffset loads a consumer group offset if supported by storage.
+func (b *Broker) GetOffset(group, topic string, queueID int) (int64, bool, error) {
+	if os, ok := b.store.(OffsetStore); ok {
+		return os.GetOffset(group, topic, queueID)
+	}
+	return 0, false, ErrOffsetUnsupported
 }

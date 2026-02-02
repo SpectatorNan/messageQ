@@ -14,19 +14,10 @@ import (
 	"github.com/google/uuid"
 )
 
-type LogType byte
-
-const (
-	LogProduce LogType = 1
-	LogAck     LogType = 2
-	LogNack    LogType = 3
-	LogRetry   LogType = 4
-	LogDLQ     LogType = 5
-)
-
 type Message struct {
 	ID        string
 	Body      string
+	Tag       string
 	Retry     int
 	Timestamp time.Time
 }
@@ -49,23 +40,6 @@ func listSegments(dir string, topic string, queueID int) ([]string, error) {
 	}
 	sort.Strings(segs)
 	return segs, nil
-}
-
-func typName(t LogType) string {
-	switch t {
-	case LogProduce:
-		return "PRODUCE"
-	case LogAck:
-		return "ACK"
-	case LogNack:
-		return "NACK"
-	case LogRetry:
-		return "RETRY"
-	case LogDLQ:
-		return "DLQ"
-	default:
-		return fmt.Sprintf("TYPE(%d)", t)
-	}
 }
 
 func inspectSegment(path string, showPayload bool) error {
@@ -96,13 +70,11 @@ func inspectSegment(path string, showPayload bool) error {
 		off := 0
 		crc := binary.BigEndian.Uint32(payload[off : off+4])
 		off += 4
-		typ := LogType(payload[off])
-		off += 1
 		idBytes := payload[off : off+16]
 		off += 16
 		uid, err := uuid.FromBytes(idBytes)
 		if err != nil {
-			fmt.Printf("  %d: %s invalid uuid\n", idx, typName(typ))
+			fmt.Printf("  %d: invalid uuid\n", idx)
 			continue
 		}
 		msgID := uid.String()
@@ -110,18 +82,26 @@ func inspectSegment(path string, showPayload bool) error {
 		off += 2
 		ts := int64(binary.BigEndian.Uint64(payload[off : off+8]))
 		off += 8
+		tagLen := int(binary.BigEndian.Uint16(payload[off : off+2]))
+		off += 2
+		if tagLen < 0 || off+tagLen > len(payload) {
+			fmt.Printf("  %d: invalid tagLen=%d\n", idx, tagLen)
+			continue
+		}
+		tag := string(payload[off : off+tagLen])
+		off += tagLen
 		bodyLen := int(binary.BigEndian.Uint32(payload[off : off+4]))
 		off += 4
 		if bodyLen < 0 || off+bodyLen > len(payload) {
-			fmt.Printf("  %d: %s invalid bodyLen=%d\n", idx, typName(typ), bodyLen)
+			fmt.Printf("  %d: invalid bodyLen=%d\n", idx, bodyLen)
 			continue
 		}
 		body := payload[off : off+bodyLen]
 		crcOK := (bodyLen == 0) || (crc32.ChecksumIEEE(body) == crc)
 		if showPayload {
-			fmt.Printf("  %d: %s id=%s retry=%d ts=%s body_len=%d crc_ok=%v\n", idx, typName(typ), msgID, retry, time.Unix(0, ts).Format(time.RFC3339Nano), bodyLen, crcOK)
+			fmt.Printf("  %d: id=%s tag=%s retry=%d ts=%s body_len=%d crc_ok=%v\n", idx, msgID, tag, retry, time.Unix(0, ts).Format(time.RFC3339Nano), bodyLen, crcOK)
 		} else {
-			fmt.Printf("  %d: %s body_len=%d crc_ok=%v\n", idx, typName(typ), bodyLen, crcOK)
+			fmt.Printf("  %d: tag=%s body_len=%d crc_ok=%v\n", idx, tag, bodyLen, crcOK)
 		}
 	}
 	return nil

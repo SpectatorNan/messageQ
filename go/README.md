@@ -13,10 +13,12 @@ Default server: `http://localhost:8080`
 
 ## API
 
-- Produce: `POST /topics/:topic/messages` JSON body `{"body":"..."}`
+- Produce: `POST /topics/:topic/messages` JSON body `{"body":"...","tag":"..."}`
 - Consume: `GET /topics/:topic/messages`
 - Ack: `POST /topics/:topic/messages/:id/ack`
 - Nack: `POST /topics/:topic/messages/:id/nack`
+- Get offset: `GET /topics/:topic/offsets/:group?queue_id=0`
+- Commit offset: `POST /topics/:topic/offsets/:group` JSON body `{"queue_id":0,"offset":123}`
 
 Message IDs are UUIDv7 strings.
 
@@ -25,22 +27,32 @@ Message IDs are UUIDv7 strings.
 ```
 <base>/commitlog/<topic>/<queueId>/*.wal
 <base>/consumequeue/<topic>/<queueId>/
+<base>/offsets/<group>/<topic>/<queueId>.offset
 ```
 
 DLQ uses `topic.dlq` and queueId=0.
 
-## WAL Format
+## CommitLog Format
 
 Binary record per segment:
 
 ```
-[totalSize:4][crc32:4][type:1][id:16][retry:2][ts:8][bodyLen:4][body]
+[totalSize:4][crc32:4][id:16][retry:2][ts:8][tagLen:2][tag][bodyLen:4][body]
 ```
 
-- `type`: 1=PRODUCE, 2=ACK, 3=NACK, 4=RETRY, 5=DLQ
 - `id`: UUIDv7 (16 bytes)
 - `crc32` is computed over `body` (raw bytes)
-- `body` stores application payload; ACK/NACK records have bodyLen=0
+- `tag` is stored with the message for filtering
+
+## ConsumeQueue Format
+
+Each entry is 20 bytes:
+
+```
+[segId:4][pos:8][size:4][tagHash:4]
+```
+
+`tagHash` is CRC32 of the tag (0 when empty).
 
 Segments are stored under `./data/commitlog/<topic>/<queueId>/00000001.wal` etc.
 

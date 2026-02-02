@@ -16,11 +16,9 @@ import (
 )
 
 // buildRecordBytes for tests (matches wal.go format)
-func buildRecordBytes(typ storage.LogType, msg storage.Message) []byte {
+func buildRecordBytes(msg storage.Message) []byte {
 	body := []byte(msg.Body)
-	if typ != storage.LogProduce {
-		body = nil
-	}
+	tag := []byte(msg.Tag)
 	ts := msg.Timestamp
 	if ts.IsZero() {
 		ts = time.Now()
@@ -33,20 +31,22 @@ func buildRecordBytes(typ storage.LogType, msg storage.Message) []byte {
 	if err != nil {
 		uid = uuid.Nil
 	}
-	totalSize := uint32(4 + 1 + 16 + 2 + 8 + 4 + len(body))
+	totalSize := uint32(4 + 16 + 2 + 8 + 2 + len(tag) + 4 + len(body))
 	buf := make([]byte, 4+totalSize)
 	binary.BigEndian.PutUint32(buf[0:4], totalSize)
 	off := 4
 	binary.BigEndian.PutUint32(buf[off:off+4], crc)
 	off += 4
-	buf[off] = byte(typ)
-	off++
 	copy(buf[off:off+16], uid[:])
 	off += 16
 	binary.BigEndian.PutUint16(buf[off:off+2], uint16(msg.Retry))
 	off += 2
 	binary.BigEndian.PutUint64(buf[off:off+8], uint64(ts.UnixNano()))
 	off += 8
+	binary.BigEndian.PutUint16(buf[off:off+2], uint16(len(tag)))
+	off += 2
+	copy(buf[off:off+len(tag)], tag)
+	off += len(tag)
 	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(body)))
 	off += 4
 	copy(buf[off:], body)
@@ -57,7 +57,7 @@ func buildRecordBytes(typ storage.LogType, msg storage.Message) []byte {
 func writeWALHeader(w io.Writer) error {
 	var hdr [8]byte
 	copy(hdr[0:4], []byte("MQW1"))
-	binary.BigEndian.PutUint16(hdr[4:6], 1)
+	binary.BigEndian.PutUint16(hdr[4:6], 2)
 	_, err := w.Write(hdr[:])
 	return err
 }
@@ -82,8 +82,8 @@ func TestPartialWriteIgnored(t *testing.T) {
 
 	// write one complete record
 	uid := uuid.New()
-	m1 := storage.Message{ID: uid.String(), Body: "hello", Retry: 0, Timestamp: time.Now()}
-	rec1 := buildRecordBytes(storage.LogProduce, m1)
+	m1 := storage.Message{ID: uid.String(), Body: "hello", Tag: "t1", Retry: 0, Timestamp: time.Now()}
+	rec1 := buildRecordBytes(m1)
 	if _, err := f.Write(rec1); err != nil {
 		t.Fatalf("write record: %v", err)
 	}
@@ -133,8 +133,8 @@ func TestLeftoverTmpIgnored(t *testing.T) {
 			t.Fatalf("write header: %v", err)
 		}
 		uid := uuid.New()
-		m := storage.Message{ID: uid.String(), Body: "m", Retry: 0, Timestamp: time.Now()}
-		rec := buildRecordBytes(storage.LogProduce, m)
+		m := storage.Message{ID: uid.String(), Body: "m", Tag: "t2", Retry: 0, Timestamp: time.Now()}
+		rec := buildRecordBytes(m)
 		if _, err := f.Write(rec); err != nil {
 			t.Fatalf("write record: %v", err)
 		}
