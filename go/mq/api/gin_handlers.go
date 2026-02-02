@@ -5,6 +5,7 @@ import (
 	"strconv"
 
 	"messageQ/mq/broker"
+	"messageQ/mq/queue"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -27,6 +28,12 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrInvalidMessage)
 			return
 		}
+
+		if payload.Tag == "" {
+			FailGin(c, ErrMissingTag)
+			return
+		}
+
 		msg := b.Enqueue(topic, payload.Body, payload.Tag)
 		c.JSON(http.StatusOK, NewRespSuccess(msg))
 	}
@@ -39,9 +46,55 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrMissingTopic)
 			return
 		}
+		group := c.Query("group")
+		if group == "" {
+			FailGin(c, ErrInvalidGroup)
+			return
+		}
+		queueID := 0
+		if q := c.Query("queue_id"); q != "" {
+			v, err := strconv.Atoi(q)
+			if err != nil || v < 0 {
+				FailGin(c, ErrInvalidOffset)
+				return
+			}
+			queueID = v
+		}
+		offset, ok, err := b.GetOffset(group, topic, queueID)
+		if err != nil {
+			FailGin(c, ErrOffsetUnsupported)
+			return
+		}
+		if !ok {
+			offset = 0
+		}
 		tag := c.Query("tag")
-		msg := b.DequeueTag(topic, tag)
-		c.JSON(http.StatusOK, NewRespSuccess(msg))
+
+		msgs, next, err := b.ReadFromConsumeQueue(topic, queueID, offset, 1, tag)
+		if err != nil {
+			FailGin(c, ErrOffsetUnsupported)
+			return
+		}
+		if len(msgs) == 0 {
+			FailGin(c, ErrNotFound)
+			return
+		}
+		msg := msgs[0]
+		b.BeginProcessing(group, topic, queueID, offset, next, queue.Message{
+			ID:        msg.ID,
+			Body:      msg.Body,
+			Tag:       msg.Tag,
+			Retry:     msg.Retry,
+			Timestamp: msg.Timestamp,
+		})
+		c.JSON(http.StatusOK, NewRespSuccess(map[string]interface{}{
+			"message":     msg,
+			"group":       group,
+			"queue_id":    queueID,
+			"offset":      offset,
+			"next_offset": next,
+			"state":       "processing",
+		}))
 	}
 }
 
@@ -61,8 +114,7 @@ func AckHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrInvalidID)
 			return
 		}
-		ok := b.Ack(topic, id)
-		if !ok {
+		if !b.CompleteProcessing(id) {
 			FailGin(c, ErrNotFound)
 			return
 		}
@@ -86,12 +138,19 @@ func NackHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrInvalidID)
 			return
 		}
-		ok := b.Nack(topic, id)
-		if !ok {
+		if !b.RetryProcessing(id) {
 			FailGin(c, ErrNotFound)
 			return
 		}
 		c.JSON(http.StatusOK, NewRespSuccess(map[string]bool{"nacked": true}))
+	}
+}
+
+// StatsHandler returns processing statistics per group.
+func StatsHandler(b *broker.Broker) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		stats := b.Stats()
+		c.JSON(http.StatusOK, NewRespSuccess(stats))
 	}
 }
 

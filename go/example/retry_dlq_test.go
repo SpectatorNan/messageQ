@@ -14,7 +14,7 @@ func TestRetryPersistedAcrossRestart(t *testing.T) {
 	defer store.Close()
 
 	q := queue.NewQueueWithStorage(store, "retry-topic", 0)
-	msg := q.Enqueue("retry me", "")
+	msg := q.Enqueue("retry me", "t")
 	received := q.Dequeue()
 	if received.ID != msg.ID {
 		t.Fatalf("expected dequeue id %s, got %s", msg.ID, received.ID)
@@ -54,7 +54,7 @@ func TestDLQPersisted(t *testing.T) {
 
 	topic := "dlq-topic"
 	q := queue.NewQueueWithStorage(store, topic, 0)
-	msg := q.Enqueue("dead letter", "")
+	msg := q.Enqueue("dead letter", "t")
 
 	// consume and nack enough times to exceed maxRetry (default 3)
 	for i := 0; i < 4; i++ {

@@ -20,5 +20,8 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 	r.GET("/topics/:topic/offsets/:group", GetOffsetHandler(b))
 	r.POST("/topics/:topic/offsets/:group", CommitOffsetHandler(b))
 
+	// stats
+	r.GET("/stats", StatsHandler(b))
+
 	return r
 }

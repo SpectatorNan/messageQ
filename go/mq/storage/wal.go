@@ -57,6 +57,7 @@ func readWALHeader(r io.Reader) error {
 const (
 	minRecordSize = 4 + 16 + 2 + 8 + 2 + 4 // crc + id(16) + retry + ts + tagLen + bodyLen
 	maxRecordSize = 64 * 1024 * 1024       // safety cap
+	cqEntrySize   = 20
 )
 
 // buildRecordBytes returns record bytes: [totalSize][crc][id(16)][retry][ts][tagLen][tag][bodyLen][body]
@@ -101,6 +102,42 @@ func buildRecordBytes(msg Message) ([]byte, int64, error) {
 	return buf, int64(len(buf)), nil
 }
 
+// readRecordPayload parses a record payload (without the length prefix).
+func readRecordPayload(payload []byte) (Message, error) {
+	off := 0
+	crc := binary.BigEndian.Uint32(payload[off : off+4])
+	off += 4
+	idBytes := payload[off : off+16]
+	off += 16
+	uid, err := uuid.FromBytes(idBytes)
+	if err != nil {
+		return Message{}, errCorruptRecord
+	}
+	msgID := uid.String()
+	retry := int(binary.BigEndian.Uint16(payload[off : off+2]))
+	off += 2
+	ts := int64(binary.BigEndian.Uint64(payload[off : off+8]))
+	off += 8
+	tagLen := int(binary.BigEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if tagLen < 0 || off+tagLen > len(payload) {
+		return Message{ID: msgID, Retry: retry, Timestamp: time.Unix(0, ts)}, errCorruptRecord
+	}
+	tag := string(payload[off : off+tagLen])
+	off += tagLen
+	bodyLen := int(binary.BigEndian.Uint32(payload[off : off+4]))
+	off += 4
+	if bodyLen < 0 || off+bodyLen > len(payload) {
+		return Message{ID: msgID, Retry: retry, Tag: tag, Timestamp: time.Unix(0, ts)}, errCorruptRecord
+	}
+	body := payload[off : off+bodyLen]
+	if bodyLen > 0 && crc32.ChecksumIEEE(body) != crc {
+		return Message{ID: msgID, Retry: retry, Tag: tag, Timestamp: time.Unix(0, ts)}, errBadCRC
+	}
+	msg := Message{ID: msgID, Retry: retry, Tag: tag, Timestamp: time.Unix(0, ts), Body: string(body)}
+	return msg, nil
+}
+
 // readRecord reads a single record from r; returns ok=false on EOF
 func readRecord(r io.Reader) (Message, bool, error) {
 	var lenBuf [4]byte
@@ -121,38 +158,35 @@ func readRecord(r io.Reader) (Message, bool, error) {
 		}
 		return Message{}, false, err
 	}
-	off := 0
-	crc := binary.BigEndian.Uint32(payload[off : off+4])
-	off += 4
-	idBytes := payload[off : off+16]
-	off += 16
-	uid, err := uuid.FromBytes(idBytes)
+	msg, err := readRecordPayload(payload)
 	if err != nil {
-		return Message{}, true, errCorruptRecord
+		return msg, true, err
 	}
-	msgID := uid.String()
-	retry := int(binary.BigEndian.Uint16(payload[off : off+2]))
-	off += 2
-	ts := int64(binary.BigEndian.Uint64(payload[off : off+8]))
-	off += 8
-	tagLen := int(binary.BigEndian.Uint16(payload[off : off+2]))
-	off += 2
-	if tagLen < 0 || off+tagLen > len(payload) {
-		return Message{ID: msgID, Retry: retry, Timestamp: time.Unix(0, ts)}, true, errCorruptRecord
-	}
-	tag := string(payload[off : off+tagLen])
-	off += tagLen
-	bodyLen := int(binary.BigEndian.Uint32(payload[off : off+4]))
-	off += 4
-	if bodyLen < 0 || off+bodyLen > len(payload) {
-		return Message{ID: msgID, Retry: retry, Tag: tag, Timestamp: time.Unix(0, ts)}, true, errCorruptRecord
-	}
-	body := payload[off : off+bodyLen]
-	if bodyLen > 0 && crc32.ChecksumIEEE(body) != crc {
-		return Message{ID: msgID, Retry: retry, Tag: tag, Timestamp: time.Unix(0, ts)}, true, errBadCRC
-	}
-	msg := Message{ID: msgID, Retry: retry, Tag: tag, Timestamp: time.Unix(0, ts), Body: string(body)}
 	return msg, true, nil
+}
+
+// readRecordAt reads a record at the given position in a segment file.
+func readRecordAt(f *os.File, pos int64) (Message, int64, error) {
+	if _, err := f.Seek(pos, io.SeekStart); err != nil {
+		return Message{}, 0, err
+	}
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
+		return Message{}, 0, err
+	}
+	total := binary.BigEndian.Uint32(lenBuf[:])
+	if total < minRecordSize || total > maxRecordSize {
+		return Message{}, 0, fmt.Errorf("invalid record size: %d", total)
+	}
+	payload := make([]byte, total)
+	if _, err := io.ReadFull(f, payload); err != nil {
+		return Message{}, 0, err
+	}
+	msg, err := readRecordPayload(payload)
+	if err != nil {
+		return msg, 0, err
+	}
+	return msg, int64(4 + total), nil
 }
 
 // WALStorage implements a segmented write-ahead log using a simple binary record format:
@@ -795,4 +829,66 @@ func syncDir(dirPath string) error {
 	}
 	defer d.Close()
 	return d.Sync()
+}
+
+// ReadFromConsumeQueue scans consumequeue from offset and returns up to max messages.
+func (w *WALStorage) ReadFromConsumeQueue(topic string, queueID int, offset int64, max int, tag string) ([]Message, int64, error) {
+	if offset < 0 {
+		offset = 0
+	}
+	if max <= 0 {
+		max = 1
+	}
+	if err := w.FlushTopic(topic, queueID); err != nil {
+		return nil, offset, err
+	}
+	cqPath := w.consumeQueueFile(topic, queueID)
+	cf, err := os.Open(cqPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, offset, nil
+		}
+		return nil, offset, err
+	}
+	defer cf.Close()
+
+	hash := hashTag(tag)
+	start := offset * cqEntrySize
+	if _, err := cf.Seek(start, io.SeekStart); err != nil {
+		return nil, offset, err
+	}
+
+	msgs := make([]Message, 0, max)
+	idx := offset
+	for len(msgs) < max {
+		var buf [cqEntrySize]byte
+		if _, err := io.ReadFull(cf, buf[:]); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			return msgs, idx, err
+		}
+		segID := binary.BigEndian.Uint32(buf[0:4])
+		pos := binary.BigEndian.Uint64(buf[4:12])
+		size := binary.BigEndian.Uint32(buf[12:16])
+		tagHash := binary.BigEndian.Uint32(buf[16:20])
+		idx++
+		if hash != 0 && tagHash != hash {
+			continue
+		}
+		segPath := filepath.Join(w.commitLogDir(topic, queueID), fmt.Sprintf("%08d.wal", segID))
+		segFile, err := os.Open(segPath)
+		if err != nil {
+			continue
+		}
+		msg, _, err := readRecordAt(segFile, int64(pos))
+		segFile.Close()
+		if err != nil {
+			continue
+		}
+		// optional sanity: size can be used for validation
+		_ = size
+		msgs = append(msgs, msg)
+	}
+	return msgs, idx, nil
 }

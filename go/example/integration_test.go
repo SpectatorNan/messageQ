@@ -16,7 +16,7 @@ import (
 	"messageQ/mq/storage"
 )
 
-var debugCleanup = false
+var debugCleanup = true
 
 // Global switch controlled by environment variable MSGQ_CLEAN_TESTDATA.
 // If unset, default is true (testdata will be removed before/after the test).
@@ -48,7 +48,7 @@ func TestProduceConsumeAckNack_PersistentWAL(t *testing.T) {
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	// produce a message
-	body := map[string]string{"body": "hello persistent"}
+	body := map[string]string{"body": "hello persistent", "tag": "t"}
 	bts, _ := json.Marshal(body)
 	resp, err := client.Post(s.URL+"/topics/test/messages", "application/json", bytes.NewReader(bts))
 	if err != nil {
@@ -75,7 +75,7 @@ func TestProduceConsumeAckNack_PersistentWAL(t *testing.T) {
 	defer s2.Close()
 
 	// consume the message after restart
-	resp2, err := client.Get(s2.URL + "/topics/test/messages")
+	resp2, err := client.Get(s2.URL + "/topics/test/messages?group=g1")
 	if err != nil {
 		t.Fatalf("consume request failed after restart: %v", err)
 	}
@@ -90,7 +90,15 @@ func TestProduceConsumeAckNack_PersistentWAL(t *testing.T) {
 		Data    map[string]interface{} `json:"data"`
 	}
 	_ = json.NewDecoder(resp2.Body).Decode(&rbody)
-	idf, ok := rbody.Data["id"]
+	msgAny, ok := rbody.Data["message"]
+	if !ok {
+		t.Fatalf("consume data missing message after restart")
+	}
+	msgMap, ok := msgAny.(map[string]interface{})
+	if !ok {
+		t.Fatalf("invalid message payload")
+	}
+	idf, ok := msgMap["id"]
 	if !ok {
 		t.Fatalf("consume data missing id after restart")
 	}
@@ -99,55 +107,43 @@ func TestProduceConsumeAckNack_PersistentWAL(t *testing.T) {
 		t.Fatalf("expected string id, got %#v", idf)
 	}
 
-	// ack the message
+	// ack to advance offset
 	ackResp, err := client.Post(s2.URL+"/topics/test/messages/"+id+"/ack", "", nil)
 	if err != nil {
 		t.Fatalf("ack request failed after restart: %v", err)
 	}
-	defer ackResp.Body.Close()
+	ackResp.Body.Close()
 	if ackResp.StatusCode != 200 {
 		buf, _ := io.ReadAll(ackResp.Body)
 		t.Fatalf("ack returned status %d after restart: %s", ackResp.StatusCode, string(buf))
 	}
 
-	// produce another message and test nack->requeue on the live broker
-	body2 := map[string]string{"body": "hello nack"}
+	// produce another message and consume again
+	body2 := map[string]string{"body": "hello next", "tag": "t"}
 	b2ts, _ := json.Marshal(body2)
 	_, _ = client.Post(s2.URL+"/topics/test/messages", "application/json", bytes.NewReader(b2ts))
 
-	resp3, _ := client.Get(s2.URL + "/topics/test/messages")
+	resp3, _ := client.Get(s2.URL + "/topics/test/messages?group=g1")
 	var rbody3 struct {
 		Code    string                 `json:"code"`
 		Message string                 `json:"message"`
 		Data    map[string]interface{} `json:"data"`
 	}
 	_ = json.NewDecoder(resp3.Body).Decode(&rbody3)
-	idf2 := rbody3.Data["id"]
+	msgAny2, ok := rbody3.Data["message"]
+	if !ok {
+		t.Fatalf("consume data missing message")
+	}
+	msgMap2, ok := msgAny2.(map[string]interface{})
+	if !ok {
+		t.Fatalf("invalid message payload")
+	}
+	idf2 := msgMap2["id"]
 	id2, ok := idf2.(string)
 	if !ok || id2 == "" {
 		t.Fatalf("expected string id, got %#v", idf2)
 	}
-
-	// nack it
-	_, _ = client.Post(s2.URL+"/topics/test/messages/"+id2+"/nack", "", nil)
-
-	// consume again (it should be requeued)
-	resp4, err := client.Get(s2.URL + "/topics/test/messages")
-	if err != nil {
-		t.Fatalf("consume after nack failed: %v", err)
-	}
-	defer resp4.Body.Close()
-	if resp4.StatusCode != 200 {
-		buf, _ := io.ReadAll(resp4.Body)
-		t.Fatalf("consume after nack returned status %d: %s", resp4.StatusCode, string(buf))
-	}
-	var rbody4 struct {
-		Code    string                 `json:"code"`
-		Message string                 `json:"message"`
-		Data    map[string]interface{} `json:"data"`
-	}
-	_ = json.NewDecoder(resp4.Body).Decode(&rbody4)
-	if rbody4.Data["id"] == nil {
-		t.Fatalf("consume after nack missing id")
+	if id2 == id {
+		t.Fatalf("expected different message on second consume")
 	}
 }

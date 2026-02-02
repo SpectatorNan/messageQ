@@ -92,6 +92,11 @@ func (q *Queue) Enqueue(body string, tag string) Message {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	if tag == "" {
+		log.Println("enqueue rejected: empty tag")
+		return Message{}
+	}
+
 	uid, err := uuid.NewV7()
 	if err != nil {
 		uid = uuid.New()

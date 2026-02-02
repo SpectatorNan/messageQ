@@ -2,6 +2,7 @@ package api
 
 var (
 	ErrMissingTopic      = NewRespErr(ErrCodeMissingTopic, "missing topic")
+	ErrMissingTag        = NewRespErr(ErrCodeMissingTag, "missing tag")
 	ErrInvalidMessage    = NewRespErr(ErrCodeInvalidMsg, "invalid message format")
 	ErrInvalidID         = NewRespErr(ErrCodeInvalidID, "invalid message id")
 	ErrNotFound          = NewRespErr(ErrCodeNotFound, "message not found or already acked/nacked")
@@ -13,6 +14,7 @@ var (
 // Optionally define error codes for API responses
 const (
 	ErrCodeMissingTopic      = "missing_topic"
+	ErrCodeMissingTag        = "missing_tag"
 	ErrCodeInvalidMsg        = "invalid_message"
 	ErrCodeInvalidID         = "invalid_id"
 	ErrCodeNotFound          = "not_found"

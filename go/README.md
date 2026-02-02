@@ -14,11 +14,12 @@ Default server: `http://localhost:8080`
 ## API
 
 - Produce: `POST /topics/:topic/messages` JSON body `{"body":"...","tag":"..."}`
-- Consume: `GET /topics/:topic/messages?tag=...`
-- Ack: `POST /topics/:topic/messages/:id/ack`
-- Nack: `POST /topics/:topic/messages/:id/nack`
+- Consume (stateful): `GET /topics/:topic/messages?group=...&queue_id=0&tag=...`
+- Ack (processing -> completed): `POST /topics/:topic/messages/:id/ack`
+- Nack (processing -> retry): `POST /topics/:topic/messages/:id/nack`
 - Get offset: `GET /topics/:topic/offsets/:group?queue_id=0`
 - Commit offset: `POST /topics/:topic/offsets/:group` JSON body `{"queue_id":0,"offset":123}`
+- Stats: `GET /stats`
 
 Message IDs are UUIDv7 strings.
 
@@ -56,10 +57,17 @@ Each entry is 20 bytes:
 
 Segments are stored under `./data/commitlog/<topic>/<queueId>/00000001.wal` etc.
 
-## Inspect WAL
+## Inspect WAL / CQ / Offsets
 
 ```bash
+# WAL (commitlog)
 go run ./cmd/mq-inspect -dir ./data -topic your-topic -queue 0 -show
+
+# ConsumeQueue
+go run ./cmd/mq-inspect -dir ./data -topic your-topic -queue 0 -cq
+
+# Consumer offsets
+go run ./cmd/mq-inspect -dir ./data -topic your-topic -queue 0 -offsets -group your-group
 ```
 
 ## Tests
