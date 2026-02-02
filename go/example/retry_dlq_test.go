@@ -1,8 +1,6 @@
 package example
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -11,7 +9,7 @@ import (
 )
 
 func TestRetryPersistedAcrossRestart(t *testing.T) {
-	dir := t.TempDir()
+	dir := getTestDataDir(t, "retry")
 	store := storage.NewWALStorage(dir, 10*time.Millisecond)
 	defer store.Close()
 
@@ -19,10 +17,10 @@ func TestRetryPersistedAcrossRestart(t *testing.T) {
 	msg := q.Enqueue("retry me")
 	received := q.Dequeue()
 	if received.ID != msg.ID {
-		t.Fatalf("expected dequeue id %d, got %d", msg.ID, received.ID)
+		t.Fatalf("expected dequeue id %s, got %s", msg.ID, received.ID)
 	}
 	if !q.Nack(received.ID) {
-		t.Fatalf("nack failed for id %d", received.ID)
+		t.Fatalf("nack failed for id %s", received.ID)
 	}
 
 	// ensure data flushed
@@ -40,7 +38,7 @@ func TestRetryPersistedAcrossRestart(t *testing.T) {
 }
 
 func TestDLQPersisted(t *testing.T) {
-	dir := t.TempDir()
+	dir := getTestDataDir(t, "dlq")
 	store := storage.NewWALStorage(dir, 10*time.Millisecond)
 	defer store.Close()
 
@@ -52,7 +50,7 @@ func TestDLQPersisted(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		received := q.Dequeue()
 		if received.ID != msg.ID {
-			t.Fatalf("unexpected id at iteration %d: %d", i, received.ID)
+			t.Fatalf("unexpected id at iteration %d: %s", i, received.ID)
 		}
 		if !q.Nack(received.ID) {
 			t.Fatalf("nack failed at iteration %d", i)
@@ -81,16 +79,9 @@ func TestDLQPersisted(t *testing.T) {
 		t.Fatalf("load dlq failed: %v", err)
 	}
 	if len(dlqMsgs) == 0 {
-		// log directory contents for diagnostics
-		dlqDir := filepath.Join(dir, topic+".dlq")
-		entries, _ := os.ReadDir(dlqDir)
-		names := []string{}
-		for _, e := range entries {
-			names = append(names, e.Name())
-		}
-		t.Fatalf("expected dlq to contain msg %d, got empty. dlq dir=%s entries=%v", msg.ID, dlqDir, names)
+		t.Fatalf("expected dlq to contain msg %s, got empty", msg.ID)
 	}
 	if dlqMsgs[len(dlqMsgs)-1].ID != msg.ID {
-		t.Fatalf("expected dlq to contain msg %d, got %#v", msg.ID, dlqMsgs)
+		t.Fatalf("expected dlq to contain msg %s, got %#v", msg.ID, dlqMsgs)
 	}
 }

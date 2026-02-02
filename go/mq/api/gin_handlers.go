@@ -2,11 +2,11 @@ package api
 
 import (
 	"net/http"
-	"strconv"
 
 	"messageQ/mq/broker"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 // Handler constructors that accept a broker and return gin.HandlerFunc.
@@ -51,9 +51,12 @@ func AckHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrMissingTopic)
 			return
 		}
-		idStr := c.Param("id")
-		id, err := strconv.ParseInt(idStr, 10, 64)
-		if err != nil {
+		id := c.Param("id")
+		if id == "" {
+			FailGin(c, ErrInvalidID)
+			return
+		}
+		if _, err := uuid.Parse(id); err != nil {
 			FailGin(c, ErrInvalidID)
 			return
 		}
@@ -74,9 +77,12 @@ func NackHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrMissingTopic)
 			return
 		}
-		idStr := c.Param("id")
-		id, err := strconv.ParseInt(idStr, 10, 64)
-		if err != nil {
+		id := c.Param("id")
+		if id == "" {
+			FailGin(c, ErrInvalidID)
+			return
+		}
+		if _, err := uuid.Parse(id); err != nil {
 			FailGin(c, ErrInvalidID)
 			return
 		}

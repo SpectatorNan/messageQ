@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -36,14 +35,11 @@ var cleanTestData = func() bool {
 }()
 
 func TestProduceConsumeAckNack_PersistentWAL(t *testing.T) {
-	// clean testdata dir conditionally
-	if cleanTestData {
-		_ = os.RemoveAll("./testdata")
-		defer func() { _ = os.RemoveAll("./testdata") }()
-	}
+	// use helper to determine data directory
+	dir := getTestDataDir(t, "integration")
 
 	// create WAL-backed broker and router
-	store := storage.NewWALStorage("./testdata", 10*time.Millisecond)
+	store := storage.NewWALStorage(dir, 10*time.Millisecond)
 	defer func() { _ = store.Close() }()
 	b := broker.NewBrokerWithStorage(store)
 	r := api.NewRouter(b)
@@ -71,7 +67,7 @@ func TestProduceConsumeAckNack_PersistentWAL(t *testing.T) {
 	}
 
 	// reopen WAL and new broker/router
-	store2 := storage.NewWALStorage("./testdata", 10*time.Millisecond)
+	store2 := storage.NewWALStorage(dir, 10*time.Millisecond)
 	defer func() { _ = store2.Close() }()
 	b2 := broker.NewBrokerWithStorage(store2)
 	r2 := api.NewRouter(b2)
@@ -98,10 +94,13 @@ func TestProduceConsumeAckNack_PersistentWAL(t *testing.T) {
 	if !ok {
 		t.Fatalf("consume data missing id after restart")
 	}
-	id := int64(idf.(float64))
+	id, ok := idf.(string)
+	if !ok || id == "" {
+		t.Fatalf("expected string id, got %#v", idf)
+	}
 
 	// ack the message
-	ackResp, err := client.Post(s2.URL+"/topics/test/messages/"+strconv.FormatInt(id, 10)+"/ack", "", nil)
+	ackResp, err := client.Post(s2.URL+"/topics/test/messages/"+id+"/ack", "", nil)
 	if err != nil {
 		t.Fatalf("ack request failed after restart: %v", err)
 	}
@@ -124,10 +123,13 @@ func TestProduceConsumeAckNack_PersistentWAL(t *testing.T) {
 	}
 	_ = json.NewDecoder(resp3.Body).Decode(&rbody3)
 	idf2 := rbody3.Data["id"]
-	id2 := int64(idf2.(float64))
+	id2, ok := idf2.(string)
+	if !ok || id2 == "" {
+		t.Fatalf("expected string id, got %#v", idf2)
+	}
 
 	// nack it
-	_, _ = client.Post(s2.URL+"/topics/test/messages/"+strconv.FormatInt(id2, 10)+"/nack", "", nil)
+	_, _ = client.Post(s2.URL+"/topics/test/messages/"+id2+"/nack", "", nil)
 
 	// consume again (it should be requeued)
 	resp4, err := client.Get(s2.URL + "/topics/test/messages")

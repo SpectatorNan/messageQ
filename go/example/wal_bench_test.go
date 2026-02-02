@@ -6,13 +6,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"messageQ/mq/storage"
 )
 
 func writeMessages(store *storage.WALStorage, topic string, count int, bodySize int, syncWrite bool) error {
 	for i := 0; i < count; i++ {
+		uid, err := uuid.NewV7()
+		if err != nil {
+			uid = uuid.New()
+		}
 		msg := storage.Message{
-			ID:        int64(i + 1),
+			ID:        uid.String(),
 			Body:      string(make([]byte, bodySize)),
 			Retry:     0,
 			Timestamp: time.Now(),

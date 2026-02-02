@@ -8,19 +8,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"messageQ/mq/storage"
 )
 
 // TestWALRotationAndNonBlocking concurrently writes to the same topic while rotation/compaction
 // thresholds are low. The test fails if writers block (timeout) or any write returns an error.
 func TestWALRotationAndNonBlocking(t *testing.T) {
-	// clean testdata dir conditionally
-	if cleanTestData {
-		_ = os.RemoveAll("./testdata")
-		defer func() { _ = os.RemoveAll("./testdata") }()
-	}
+	// use helper to determine data directory
+	dir := getTestDataDir(t, "rotate")
 
-	dir := "./testdata"
 	// flushInterval 10ms, compactInterval 50ms for quick compaction checks
 	store := storage.NewWALStorage(dir, 10*time.Millisecond, 50*time.Millisecond)
 	defer func() { _ = store.Close() }()
@@ -47,7 +45,11 @@ func TestWALRotationAndNonBlocking(t *testing.T) {
 					return
 				default:
 				}
-				m := storage.Message{ID: int64(id*perWorker + i + 1), Body: "hello-rotation-test", Retry: 0, Timestamp: time.Now()}
+				uid, err := uuid.NewV7()
+				if err != nil {
+					uid = uuid.New()
+				}
+				m := storage.Message{ID: uid.String(), Body: "hello-rotation-test", Retry: 0, Timestamp: time.Now()}
 				if err := store.Append(topic, m); err != nil {
 					errCh <- err
 					return

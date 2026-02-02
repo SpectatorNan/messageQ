@@ -4,7 +4,7 @@ import "time"
 
 // Message is storage's serializable representation to avoid importing queue (prevents cycles)
 type Message struct {
-	ID        int64     `json:"id"`
+	ID        string    `json:"id"`
 	Body      string    `json:"body"`
 	Retry     int       `json:"retry"`
 	Timestamp time.Time `json:"timestamp"`
@@ -18,5 +18,5 @@ type Storage interface {
 	// Load loads all persisted messages for the given topic (excluding acked)
 	Load(topic string) ([]Message, error)
 	// Ack marks message id as acknowledged in storage (so future Load will not return it)
-	Ack(topic string, id int64) error
+	Ack(topic string, id string) error
 }

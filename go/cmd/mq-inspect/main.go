@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type LogType byte
@@ -23,7 +25,7 @@ const (
 )
 
 type Message struct {
-	ID        int64
+	ID        string
 	Body      string
 	Retry     int
 	Timestamp time.Time
@@ -96,8 +98,14 @@ func inspectSegment(path string, showPayload bool) error {
 		off += 4
 		typ := LogType(payload[off])
 		off += 1
-		msgID := int64(binary.BigEndian.Uint64(payload[off : off+8]))
-		off += 8
+		idBytes := payload[off : off+16]
+		off += 16
+		uid, err := uuid.FromBytes(idBytes)
+		if err != nil {
+			fmt.Printf("  %d: %s invalid uuid\n", idx, typName(typ))
+			continue
+		}
+		msgID := uid.String()
 		retry := int(binary.BigEndian.Uint16(payload[off : off+2]))
 		off += 2
 		ts := int64(binary.BigEndian.Uint64(payload[off : off+8]))
@@ -111,7 +119,7 @@ func inspectSegment(path string, showPayload bool) error {
 		body := payload[off : off+bodyLen]
 		crcOK := (bodyLen == 0) || (crc32.ChecksumIEEE(body) == crc)
 		if showPayload {
-			fmt.Printf("  %d: %s id=%d retry=%d ts=%s body_len=%d crc_ok=%v\n", idx, typName(typ), msgID, retry, time.Unix(0, ts).Format(time.RFC3339Nano), bodyLen, crcOK)
+			fmt.Printf("  %d: %s id=%s retry=%d ts=%s body_len=%d crc_ok=%v\n", idx, typName(typ), msgID, retry, time.Unix(0, ts).Format(time.RFC3339Nano), bodyLen, crcOK)
 		} else {
 			fmt.Printf("  %d: %s body_len=%d crc_ok=%v\n", idx, typName(typ), bodyLen, crcOK)
 		}

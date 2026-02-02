@@ -18,15 +18,18 @@ Default server: `http://localhost:8080`
 - Ack: `POST /topics/:topic/messages/:id/ack`
 - Nack: `POST /topics/:topic/messages/:id/nack`
 
+Message IDs are UUIDv7 strings.
+
 ## WAL Format
 
 Binary record per segment:
 
 ```
-[totalSize:4][crc32:4][type:1][id:8][retry:2][ts:8][bodyLen:4][body]
+[totalSize:4][crc32:4][type:1][id:16][retry:2][ts:8][bodyLen:4][body]
 ```
 
 - `type`: 1=PRODUCE, 2=ACK, 3=NACK, 4=RETRY, 5=DLQ
+- `id`: UUIDv7 (16 bytes)
 - `crc32` is computed over `body` (raw bytes)
 - `body` stores application payload; ACK/NACK records have bodyLen=0
 

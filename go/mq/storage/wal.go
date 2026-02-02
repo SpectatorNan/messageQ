@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // LogType defines record type in WAL
@@ -30,11 +32,11 @@ var errBadCRC = errors.New("bad crc")
 var errCorruptRecord = errors.New("corrupt record")
 
 const (
-	minRecordSize = 4 + 1 + 8 + 2 + 8 + 4 // crc + type + id + retry + ts + bodyLen
-	maxRecordSize = 64 * 1024 * 1024      // safety cap
+	minRecordSize = 4 + 1 + 16 + 2 + 8 + 4 // crc + type + id(16) + retry + ts + bodyLen
+	maxRecordSize = 64 * 1024 * 1024       // safety cap
 )
 
-// buildRecordBytes returns the full record bytes: [totalSize][crc][type][id][retry][ts][bodyLen][body]
+// buildRecordBytes returns the full record bytes: [totalSize][crc][type][id(16)][retry][ts][bodyLen][body]
 func buildRecordBytes(typ LogType, msg Message) ([]byte, int64, error) {
 	body := []byte(msg.Body)
 	if typ != LogProduce {
@@ -48,7 +50,13 @@ func buildRecordBytes(typ LogType, msg Message) ([]byte, int64, error) {
 	if len(body) > 0 {
 		crc = crc32.ChecksumIEEE(body)
 	}
-	totalSize := uint32(4 + 1 + 8 + 2 + 8 + 4 + len(body))
+	uid, err := uuid.Parse(msg.ID)
+	if err != nil {
+		return nil, 0, err
+	}
+	uidBytes := uid[:]
+
+	totalSize := uint32(4 + 1 + 16 + 2 + 8 + 4 + len(body))
 	buf := make([]byte, 4+totalSize)
 	binary.BigEndian.PutUint32(buf[0:4], totalSize)
 	off := 4
@@ -56,8 +64,8 @@ func buildRecordBytes(typ LogType, msg Message) ([]byte, int64, error) {
 	off += 4
 	buf[off] = byte(typ)
 	off += 1
-	binary.BigEndian.PutUint64(buf[off:off+8], uint64(msg.ID))
-	off += 8
+	copy(buf[off:off+16], uidBytes)
+	off += 16
 	binary.BigEndian.PutUint16(buf[off:off+2], uint16(msg.Retry))
 	off += 2
 	binary.BigEndian.PutUint64(buf[off:off+8], uint64(ts.UnixNano()))
@@ -93,8 +101,13 @@ func readRecord(r io.Reader) (LogType, Message, bool, error) {
 	off += 4
 	typ := LogType(payload[off])
 	off += 1
-	msgID := int64(binary.BigEndian.Uint64(payload[off : off+8]))
-	off += 8
+	idBytes := payload[off : off+16]
+	off += 16
+	uid, err := uuid.FromBytes(idBytes)
+	if err != nil {
+		return typ, Message{}, true, errCorruptRecord
+	}
+	msgID := uid.String()
 	retry := int(binary.BigEndian.Uint16(payload[off : off+2]))
 	off += 2
 	ts := int64(binary.BigEndian.Uint64(payload[off : off+8]))
@@ -113,7 +126,7 @@ func readRecord(r io.Reader) (LogType, Message, bool, error) {
 }
 
 // WALStorage implements a segmented write-ahead log using a simple binary record format:
-// [4-byte totalSize][4-byte bodyCRC][1-byte type][8-byte id][2-byte retry][8-byte ts][4-byte bodyLen][body]
+// [4-byte totalSize][4-byte bodyCRC][1-byte type][16-byte id][2-byte retry][8-byte ts][4-byte bodyLen][body]
 // It supports per-topic segments, rotation and compaction.
 type WALStorage struct {
 	baseDir string
@@ -330,7 +343,7 @@ func (w *WALStorage) Append(topic string, msg Message) error {
 }
 
 // Ack appends an ACK operation for the message id (binary + CRC, body empty).
-func (w *WALStorage) Ack(topic string, id int64) error {
+func (w *WALStorage) Ack(topic string, id string) error {
 	return w.writeRecord(topic, LogAck, Message{ID: id})
 }
 
@@ -343,7 +356,7 @@ func (w *WALStorage) AppendSync(topic string, msg Message) error {
 }
 
 // AckSync writes ACK and flushes to make it durable.
-func (w *WALStorage) AckSync(topic string, id int64) error {
+func (w *WALStorage) AckSync(topic string, id string) error {
 	if err := w.Ack(topic, id); err != nil {
 		return err
 	}
@@ -407,9 +420,9 @@ func (w *WALStorage) Load(topic string) ([]Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	msgs := make(map[int64]Message)
-	order := make([]int64, 0)
-	acked := make(map[int64]struct{})
+	msgs := make(map[string]Message)
+	order := make([]string, 0)
+	acked := make(map[string]struct{})
 
 	for _, seg := range segs {
 		f, err := os.Open(seg)
@@ -540,9 +553,9 @@ func (w *WALStorage) Compact(topic string) error {
 	}
 	toCompact := segs[:len(segs)-1]
 
-	acked := make(map[int64]struct{})
-	order := make([]int64, 0)
-	msgs := make(map[int64]Message)
+	acked := make(map[string]struct{})
+	order := make([]string, 0)
+	msgs := make(map[string]Message)
 	for _, path := range toCompact {
 		f, err := os.Open(path)
 		if err != nil {

@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"messageQ/mq/storage"
 )
 
@@ -26,7 +28,11 @@ func buildRecordBytes(typ storage.LogType, msg storage.Message) []byte {
 	if len(body) > 0 {
 		crc = crc32.ChecksumIEEE(body)
 	}
-	totalSize := uint32(4 + 1 + 8 + 2 + 8 + 4 + len(body))
+	uid, err := uuid.Parse(msg.ID)
+	if err != nil {
+		uid = uuid.Nil
+	}
+	totalSize := uint32(4 + 1 + 16 + 2 + 8 + 4 + len(body))
 	buf := make([]byte, 4+totalSize)
 	binary.BigEndian.PutUint32(buf[0:4], totalSize)
 	off := 4
@@ -34,8 +40,8 @@ func buildRecordBytes(typ storage.LogType, msg storage.Message) []byte {
 	off += 4
 	buf[off] = byte(typ)
 	off++
-	binary.BigEndian.PutUint64(buf[off:off+8], uint64(msg.ID))
-	off += 8
+	copy(buf[off:off+16], uid[:])
+	off += 16
 	binary.BigEndian.PutUint16(buf[off:off+2], uint16(msg.Retry))
 	off += 2
 	binary.BigEndian.PutUint64(buf[off:off+8], uint64(ts.UnixNano()))
@@ -61,7 +67,8 @@ func TestPartialWriteIgnored(t *testing.T) {
 	defer f.Close()
 
 	// write one complete record
-	m1 := storage.Message{ID: 1, Body: "hello", Retry: 0, Timestamp: time.Now()}
+	uid := uuid.New()
+	m1 := storage.Message{ID: uid.String(), Body: "hello", Retry: 0, Timestamp: time.Now()}
 	rec1 := buildRecordBytes(storage.LogProduce, m1)
 	if _, err := f.Write(rec1); err != nil {
 		t.Fatalf("write record: %v", err)
@@ -88,8 +95,8 @@ func TestPartialWriteIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
-	if len(msgs) != 1 || msgs[0].ID != 1 {
-		t.Fatalf("expected only complete record id=1, got: %#v", msgs)
+	if len(msgs) != 1 || msgs[0].ID != uid.String() {
+		t.Fatalf("expected only complete record id=%s, got: %#v", uid.String(), msgs)
 	}
 }
 
@@ -107,7 +114,8 @@ func TestLeftoverTmpIgnored(t *testing.T) {
 		if err != nil {
 			t.Fatalf("open seg %d: %v", si, err)
 		}
-		m := storage.Message{ID: int64(si), Body: "m", Retry: 0, Timestamp: time.Now()}
+		uid := uuid.New()
+		m := storage.Message{ID: uid.String(), Body: "m", Retry: 0, Timestamp: time.Now()}
 		rec := buildRecordBytes(storage.LogProduce, m)
 		if _, err := f.Write(rec); err != nil {
 			t.Fatalf("write record: %v", err)
@@ -142,7 +150,8 @@ func TestCloseFlushes(t *testing.T) {
 	dir := t.TempDir()
 	store := storage.NewWALStorage(dir, 100*time.Millisecond)
 	// append without AppendSync
-	err := store.Append("t", storage.Message{ID: 10, Body: "persist", Retry: 0, Timestamp: time.Now()})
+	uid := uuid.New()
+	err := store.Append("t", storage.Message{ID: uid.String(), Body: "persist", Retry: 0, Timestamp: time.Now()})
 	if err != nil {
 		t.Fatalf("append failed: %v", err)
 	}
@@ -157,8 +166,8 @@ func TestCloseFlushes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
-	if len(msgs) != 1 || msgs[0].ID != 10 {
-		t.Fatalf("expected recovered msg id=10, got %#v", msgs)
+	if len(msgs) != 1 || msgs[0].ID != uid.String() {
+		t.Fatalf("expected recovered msg id=%s, got %#v", uid.String(), msgs)
 	}
 }
 

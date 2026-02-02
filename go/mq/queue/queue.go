@@ -5,6 +5,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"messageQ/mq/storage"
 )
 
@@ -12,8 +14,7 @@ type Queue struct {
 	mu       sync.Mutex
 	cond     *sync.Cond
 	data     []Message
-	inflight map[int64]InflightMsg
-	nextID   int64
+	inflight map[string]InflightMsg
 
 	ackTimeout time.Duration
 	maxRetry   int
@@ -26,7 +27,7 @@ type Queue struct {
 func NewQueue() *Queue {
 	q := &Queue{
 		data:       make([]Message, 0),
-		inflight:   make(map[int64]InflightMsg),
+		inflight:   make(map[string]InflightMsg),
 		ackTimeout: 10 * time.Second,
 		maxRetry:   3,
 	}
@@ -38,7 +39,7 @@ func NewQueue() *Queue {
 func NewQueueWithStorage(store storage.Storage, topic string) *Queue {
 	q := &Queue{
 		data:       make([]Message, 0),
-		inflight:   make(map[int64]InflightMsg),
+		inflight:   make(map[string]InflightMsg),
 		ackTimeout: 10 * time.Second,
 		maxRetry:   3,
 		store:      store,
@@ -60,9 +61,6 @@ func NewQueueWithStorage(store storage.Storage, topic string) *Queue {
 					Timestamp: sm.Timestamp,
 				}
 				q.data = append(q.data, qm)
-				if sm.ID > q.nextID {
-					q.nextID = sm.ID
-				}
 			}
 		}
 	}
@@ -74,9 +72,12 @@ func (q *Queue) Enqueue(body string) Message {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	q.nextID++
+	uid, err := uuid.NewV7()
+	if err != nil {
+		uid = uuid.New()
+	}
 	msg := Message{
-		ID:        q.nextID,
+		ID:        uid.String(),
 		Body:      body,
 		Timestamp: time.Now(),
 	}
@@ -115,7 +116,7 @@ func (q *Queue) Dequeue() Message {
 	return msg
 }
 
-func (q *Queue) Ack(id int64) bool {
+func (q *Queue) Ack(id string) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -129,7 +130,7 @@ func (q *Queue) Ack(id int64) bool {
 	return false
 }
 
-func (q *Queue) Nack(id int64) bool {
+func (q *Queue) Nack(id string) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
