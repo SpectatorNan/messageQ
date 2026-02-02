@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -52,6 +53,15 @@ func buildRecordBytes(typ storage.LogType, msg storage.Message) []byte {
 	return buf
 }
 
+// writeWALHeader writes the magic+version header used by WAL.
+func writeWALHeader(w io.Writer) error {
+	var hdr [8]byte
+	copy(hdr[0:4], []byte("MQW1"))
+	binary.BigEndian.PutUint16(hdr[4:6], 1)
+	_, err := w.Write(hdr[:])
+	return err
+}
+
 // TestPartialWriteIgnored simulates a partially-written record at the end of a segment
 // and verifies that Load ignores the incomplete record and returns only complete ones.
 func TestPartialWriteIgnored(t *testing.T) {
@@ -65,6 +75,10 @@ func TestPartialWriteIgnored(t *testing.T) {
 		t.Fatalf("open segment: %v", err)
 	}
 	defer f.Close()
+
+	if err := writeWALHeader(f); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
 
 	// write one complete record
 	uid := uuid.New()
@@ -113,6 +127,10 @@ func TestLeftoverTmpIgnored(t *testing.T) {
 		f, err := os.OpenFile(seg, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 		if err != nil {
 			t.Fatalf("open seg %d: %v", si, err)
+		}
+		if err := writeWALHeader(f); err != nil {
+			f.Close()
+			t.Fatalf("write header: %v", err)
 		}
 		uid := uuid.New()
 		m := storage.Message{ID: uid.String(), Body: "m", Retry: 0, Timestamp: time.Now()}

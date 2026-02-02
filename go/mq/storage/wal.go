@@ -32,6 +32,41 @@ var errBadCRC = errors.New("bad crc")
 var errCorruptRecord = errors.New("corrupt record")
 
 const (
+	walMagic      = "MQW1"
+	walVersion    = uint16(1)
+	walHeaderSize = 8
+)
+
+// writeWALHeader writes the magic + version header to a new segment.
+func writeWALHeader(w io.Writer) error {
+	var hdr [walHeaderSize]byte
+	copy(hdr[0:4], []byte(walMagic))
+	binary.BigEndian.PutUint16(hdr[4:6], walVersion)
+	// hdr[6:8] reserved
+	_, err := w.Write(hdr[:])
+	return err
+}
+
+// readWALHeader validates the magic + version header. Returns io.EOF for empty file.
+func readWALHeader(r io.Reader) error {
+	var hdr [walHeaderSize]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return io.EOF
+		}
+		return err
+	}
+	if string(hdr[0:4]) != walMagic {
+		return fmt.Errorf("invalid wal magic")
+	}
+	ver := binary.BigEndian.Uint16(hdr[4:6])
+	if ver != walVersion {
+		return fmt.Errorf("unsupported wal version: %d", ver)
+	}
+	return nil
+}
+
+const (
 	minRecordSize = 4 + 1 + 16 + 2 + 8 + 4 // crc + type + id(16) + retry + ts + bodyLen
 	maxRecordSize = 64 * 1024 * 1024       // safety cap
 )
@@ -226,6 +261,15 @@ func (w *WALStorage) ensureTopicLocked(topic string) error {
 	if err != nil {
 		return err
 	}
+	// write header if file is new/empty
+	if info, err := f.Stat(); err == nil && info.Size() == 0 {
+		if err := writeWALHeader(f); err != nil {
+			f.Close()
+			return err
+		}
+		_ = f.Sync()
+		_ = syncDir(topicDir)
+	}
 	w.files[topic] = f
 	w.writers[topic] = bufio.NewWriterSize(f, 64*1024)
 	if _, ok := w.bytesSinceCompact[topic]; !ok {
@@ -287,6 +331,10 @@ func (w *WALStorage) rotateSegment(topic string) error {
 	p := filepath.Join(w.walDir(topic), fmt.Sprintf("%08d.wal", next))
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
+		return err
+	}
+	if err := writeWALHeader(f); err != nil {
+		f.Close()
 		return err
 	}
 	// ensure the new file is synced so that directory entry is visible
@@ -429,6 +477,18 @@ func (w *WALStorage) Load(topic string) ([]Message, error) {
 		if err != nil {
 			return nil, err
 		}
+		if info, err := f.Stat(); err == nil && info.Size() == 0 {
+			f.Close()
+			continue
+		}
+		if err := readWALHeader(f); err != nil {
+			if err == io.EOF {
+				f.Close()
+				continue
+			}
+			f.Close()
+			return nil, err
+		}
 		for {
 			typ, msg, ok, err := readRecord(f)
 			if err != nil {
@@ -561,6 +621,18 @@ func (w *WALStorage) Compact(topic string) error {
 		if err != nil {
 			return err
 		}
+		if info, err := f.Stat(); err == nil && info.Size() == 0 {
+			f.Close()
+			continue
+		}
+		if err := readWALHeader(f); err != nil {
+			if err == io.EOF {
+				f.Close()
+				continue
+			}
+			f.Close()
+			return err
+		}
 		for {
 			typ, msg, ok, err := readRecord(f)
 			if err != nil {
@@ -590,6 +662,11 @@ func (w *WALStorage) Compact(topic string) error {
 	tmp := filepath.Join(w.walDir(topic), ".compact.tmp")
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
+		return err
+	}
+	if err := writeWALHeader(f); err != nil {
+		f.Close()
+		os.Remove(tmp)
 		return err
 	}
 	for _, id := range order {
