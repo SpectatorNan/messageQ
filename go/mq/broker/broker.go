@@ -76,6 +76,11 @@ func (b *Broker) EnqueueBody(topic string, body string) queue.Message {
 
 // Dequeue attempts a non-blocking scan across queues; if empty, blocks on a queue in round-robin.
 func (b *Broker) Dequeue(topic string) queue.Message {
+	return b.DequeueTag(topic, "")
+}
+
+// DequeueTag attempts a non-blocking scan across queues for tag; if none, blocks on a queue in round-robin.
+func (b *Broker) DequeueTag(topic string, tag string) queue.Message {
 	b.lock.Lock()
 	qs := b.getQueues(topic)
 	start := b.rrDeq[topic] % len(qs)
@@ -84,7 +89,7 @@ func (b *Broker) Dequeue(topic string) queue.Message {
 	// try each queue once without blocking
 	for i := 0; i < len(qs); i++ {
 		idx := (start + i) % len(qs)
-		if msg, ok := qs[idx].TryDequeue(); ok {
+		if msg, ok := qs[idx].TryDequeueTag(tag); ok {
 			b.lock.Lock()
 			b.rrDeq[topic] = (idx + 1) % len(qs)
 			b.inflight[msg.ID] = idx
@@ -95,7 +100,7 @@ func (b *Broker) Dequeue(topic string) queue.Message {
 
 	// if none available, block on the round-robin queue
 	idx := start
-	msg := qs[idx].Dequeue()
+	msg := qs[idx].DequeueTag(tag)
 	b.lock.Lock()
 	b.rrDeq[topic] = (idx + 1) % len(qs)
 	b.inflight[msg.ID] = idx

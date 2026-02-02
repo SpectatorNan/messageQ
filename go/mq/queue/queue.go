@@ -142,6 +142,58 @@ func (q *Queue) Dequeue() Message {
 	return msg
 }
 
+// TryDequeueTag returns immediately with a message matching tag; ok=false when none.
+func (q *Queue) TryDequeueTag(tag string) (Message, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	msg, ok := q.popByTagLocked(tag)
+	if !ok {
+		return Message{}, false
+	}
+	q.inflight[msg.ID] = InflightMsg{
+		Msg:      msg,
+		Deadline: time.Now().Add(q.ackTimeout),
+	}
+	return msg, true
+}
+
+// DequeueTag blocks until a message matching tag is available.
+func (q *Queue) DequeueTag(tag string) Message {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for {
+		msg, ok := q.popByTagLocked(tag)
+		if ok {
+			q.inflight[msg.ID] = InflightMsg{
+				Msg:      msg,
+				Deadline: time.Now().Add(q.ackTimeout),
+			}
+			return msg
+		}
+		q.cond.Wait()
+	}
+}
+
+// popByTagLocked removes and returns the first message matching tag.
+func (q *Queue) popByTagLocked(tag string) (Message, bool) {
+	if len(q.data) == 0 {
+		return Message{}, false
+	}
+	if tag == "" {
+		msg := q.data[0]
+		q.data = q.data[1:]
+		return msg, true
+	}
+	for i, m := range q.data {
+		if m.Tag == tag {
+			msg := m
+			q.data = append(q.data[:i], q.data[i+1:]...)
+			return msg, true
+		}
+	}
+	return Message{}, false
+}
+
 func (q *Queue) Ack(id string) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()

@@ -39,7 +39,8 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrMissingTopic)
 			return
 		}
-		msg := b.Dequeue(topic)
+		tag := c.Query("tag")
+		msg := b.DequeueTag(topic, tag)
 		c.JSON(http.StatusOK, NewRespSuccess(msg))
 	}
 }

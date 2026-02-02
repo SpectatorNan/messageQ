@@ -14,7 +14,7 @@ Default server: `http://localhost:8080`
 ## API
 
 - Produce: `POST /topics/:topic/messages` JSON body `{"body":"...","tag":"..."}`
-- Consume: `GET /topics/:topic/messages`
+- Consume: `GET /topics/:topic/messages?tag=...`
 - Ack: `POST /topics/:topic/messages/:id/ack`
 - Nack: `POST /topics/:topic/messages/:id/nack`
 - Get offset: `GET /topics/:topic/offsets/:group?queue_id=0`
