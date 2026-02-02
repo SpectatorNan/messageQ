@@ -13,7 +13,7 @@ func TestRetryPersistedAcrossRestart(t *testing.T) {
 	store := storage.NewWALStorage(dir, 10*time.Millisecond)
 	defer store.Close()
 
-	q := queue.NewQueueWithStorage(store, "retry-topic")
+	q := queue.NewQueueWithStorage(store, "retry-topic", 0)
 	msg := q.Enqueue("retry me")
 	received := q.Dequeue()
 	if received.ID != msg.ID {
@@ -30,7 +30,7 @@ func TestRetryPersistedAcrossRestart(t *testing.T) {
 
 	store2 := storage.NewWALStorage(dir, 10*time.Millisecond)
 	defer store2.Close()
-	q2 := queue.NewQueueWithStorage(store2, "retry-topic")
+	q2 := queue.NewQueueWithStorage(store2, "retry-topic", 0)
 	recovered := q2.Dequeue()
 	if recovered.Retry != 1 {
 		t.Fatalf("expected retry=1 after restart, got %d", recovered.Retry)
@@ -43,7 +43,7 @@ func TestDLQPersisted(t *testing.T) {
 	defer store.Close()
 
 	topic := "dlq-topic"
-	q := queue.NewQueueWithStorage(store, topic)
+	q := queue.NewQueueWithStorage(store, topic, 0)
 	msg := q.Enqueue("dead letter")
 
 	// consume and nack enough times to exceed maxRetry (default 3)
@@ -66,7 +66,7 @@ func TestDLQPersisted(t *testing.T) {
 	defer store2.Close()
 
 	// active topic should be empty
-	active, err := store2.Load(topic)
+	active, err := store2.Load(topic, 0)
 	if err != nil {
 		t.Fatalf("load active topic failed: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestDLQPersisted(t *testing.T) {
 		t.Fatalf("expected active topic empty, got %d messages", len(active))
 	}
 
-	dlqMsgs, err := store2.Load(topic + ".dlq")
+	dlqMsgs, err := store2.Load(topic+".dlq", 0)
 	if err != nil {
 		t.Fatalf("load dlq failed: %v", err)
 	}

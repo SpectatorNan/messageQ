@@ -24,11 +24,11 @@ func writeMessages(store *storage.WALStorage, topic string, count int, bodySize 
 			Timestamp: time.Now(),
 		}
 		if syncWrite {
-			if err := store.AppendSync(topic, msg); err != nil {
+			if err := store.AppendSync(topic, 0, msg); err != nil {
 				return err
 			}
 		} else {
-			if err := store.Append(topic, msg); err != nil {
+			if err := store.Append(topic, 0, msg); err != nil {
 				return err
 			}
 		}
@@ -37,7 +37,7 @@ func writeMessages(store *storage.WALStorage, topic string, count int, bodySize 
 }
 
 func walFileSize(dir string, topic string) (int64, error) {
-	p := filepath.Join(dir, topic, "00000001.wal")
+	p := filepath.Join(dir, "commitlog", topic, "0", "00000001.wal")
 	s, err := os.Stat(p)
 	if err != nil {
 		if os.IsNotExist(err) {

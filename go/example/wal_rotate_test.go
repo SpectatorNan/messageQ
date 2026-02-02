@@ -50,7 +50,7 @@ func TestWALRotationAndNonBlocking(t *testing.T) {
 					uid = uuid.New()
 				}
 				m := storage.Message{ID: uid.String(), Body: "hello-rotation-test", Retry: 0, Timestamp: time.Now()}
-				if err := store.Append(topic, m); err != nil {
+				if err := store.Append(topic, 0, m); err != nil {
 					errCh <- err
 					return
 				}
@@ -81,7 +81,7 @@ func TestWALRotationAndNonBlocking(t *testing.T) {
 
 	// allow compactor to run and then inspect segments
 	time.Sleep(200 * time.Millisecond)
-	entries, err := os.ReadDir(filepath.Join(dir, topic))
+	entries, err := os.ReadDir(filepath.Join(dir, "commitlog", topic, "0"))
 	if err != nil {
 		t.Fatalf("list segments failed: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestWALRotationAndNonBlocking(t *testing.T) {
 			continue
 		}
 		if filepath.Ext(e.Name()) == ".wal" {
-			segs = append(segs, filepath.Join(dir, topic, e.Name()))
+			segs = append(segs, filepath.Join(dir, "commitlog", topic, "0", e.Name()))
 		}
 	}
 	if len(segs) < 1 {
@@ -100,7 +100,7 @@ func TestWALRotationAndNonBlocking(t *testing.T) {
 	t.Logf("segments after writes: %v", segs)
 
 	// ensure Load returns the total number of live messages (should be workers*perWorker)
-	msgs, err := store.Load(topic)
+	msgs, err := store.Load(topic, 0)
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}

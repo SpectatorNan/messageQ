@@ -41,7 +41,7 @@ func TestProduceConsumeAckNack_PersistentWAL(t *testing.T) {
 	// create WAL-backed broker and router
 	store := storage.NewWALStorage(dir, 10*time.Millisecond)
 	defer func() { _ = store.Close() }()
-	b := broker.NewBrokerWithStorage(store)
+	b := broker.NewBrokerWithStorage(store, 4)
 	r := api.NewRouter(b)
 	s := httptest.NewServer(r)
 	defer s.Close()
@@ -69,7 +69,7 @@ func TestProduceConsumeAckNack_PersistentWAL(t *testing.T) {
 	// reopen WAL and new broker/router
 	store2 := storage.NewWALStorage(dir, 10*time.Millisecond)
 	defer func() { _ = store2.Close() }()
-	b2 := broker.NewBrokerWithStorage(store2)
+	b2 := broker.NewBrokerWithStorage(store2, 4)
 	r2 := api.NewRouter(b2)
 	s2 := httptest.NewServer(r2)
 	defer s2.Close()

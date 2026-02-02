@@ -10,13 +10,13 @@ type Message struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// Storage is a simple persistence interface for queue messages per topic.
+// Storage is a simple persistence interface for queue messages per topic/queue.
 // Implementations should be safe for concurrent use by the application layer.
 type Storage interface {
-	// Append writes the message to storage for the given topic (persist the message)
-	Append(topic string, msg Message) error
-	// Load loads all persisted messages for the given topic (excluding acked)
-	Load(topic string) ([]Message, error)
+	// Append writes the message to storage for the given topic/queue (persist the message)
+	Append(topic string, queueID int, msg Message) error
+	// Load loads all persisted messages for the given topic/queue (excluding acked)
+	Load(topic string, queueID int) ([]Message, error)
 	// Ack marks message id as acknowledged in storage (so future Load will not return it)
-	Ack(topic string, id string) error
+	Ack(topic string, queueID int, id string) error
 }

@@ -19,9 +19,9 @@ type Queue struct {
 	ackTimeout time.Duration
 	maxRetry   int
 
-	store storage.Storage
-	// topic name used when persisting
-	topic string
+	store   storage.Storage
+	topic   string
+	queueID int
 }
 
 func NewQueue() *Queue {
@@ -30,13 +30,14 @@ func NewQueue() *Queue {
 		inflight:   make(map[string]InflightMsg),
 		ackTimeout: 10 * time.Second,
 		maxRetry:   3,
+		queueID:    0,
 	}
 	q.cond = sync.NewCond(&q.mu)
 	go q.reclaimLoop()
 	return q
 }
 
-func NewQueueWithStorage(store storage.Storage, topic string) *Queue {
+func NewQueueWithStorage(store storage.Storage, topic string, queueID int) *Queue {
 	q := &Queue{
 		data:       make([]Message, 0),
 		inflight:   make(map[string]InflightMsg),
@@ -44,11 +45,12 @@ func NewQueueWithStorage(store storage.Storage, topic string) *Queue {
 		maxRetry:   3,
 		store:      store,
 		topic:      topic,
+		queueID:    queueID,
 	}
 	q.cond = sync.NewCond(&q.mu)
 	// load persisted messages into data
 	if store != nil {
-		msgs, err := store.Load(topic)
+		msgs, err := store.Load(topic, queueID)
 		if err != nil {
 			log.Println("storage load error:", err)
 		} else {
@@ -66,6 +68,22 @@ func NewQueueWithStorage(store storage.Storage, topic string) *Queue {
 	}
 	go q.reclaimLoop()
 	return q
+}
+
+// TryDequeue returns immediately; ok=false when empty.
+func (q *Queue) TryDequeue() (Message, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.data) == 0 {
+		return Message{}, false
+	}
+	msg := q.data[0]
+	q.data = q.data[1:]
+	q.inflight[msg.ID] = InflightMsg{
+		Msg:      msg,
+		Deadline: time.Now().Add(q.ackTimeout),
+	}
+	return msg, true
 }
 
 func (q *Queue) Enqueue(body string) Message {
@@ -91,7 +109,7 @@ func (q *Queue) Enqueue(body string) Message {
 			Retry:     msg.Retry,
 			Timestamp: msg.Timestamp,
 		}
-		_ = q.store.Append(q.topic, sm)
+		_ = q.store.Append(q.topic, q.queueID, sm)
 	}
 	q.cond.Signal()
 	return msg
@@ -123,7 +141,7 @@ func (q *Queue) Ack(id string) bool {
 	if _, ok := q.inflight[id]; ok {
 		delete(q.inflight, id)
 		if q.store != nil {
-			_ = q.store.Ack(q.topic, id)
+			_ = q.store.Ack(q.topic, q.queueID, id)
 		}
 		return true
 	}
@@ -187,7 +205,7 @@ func (q *Queue) persistRetry(msg Message) {
 		Retry:     msg.Retry,
 		Timestamp: msg.Timestamp,
 	}
-	if err := q.store.Append(q.topic, sm); err != nil {
+	if err := q.store.Append(q.topic, q.queueID, sm); err != nil {
 		log.Println("storage retry append error:", err)
 	}
 }
@@ -203,17 +221,17 @@ func (q *Queue) persistDLQ(msg Message) {
 		Retry:     msg.Retry,
 		Timestamp: msg.Timestamp,
 	}
-	if err := q.store.Append(topicDLQ, sm); err != nil {
+	if err := q.store.Append(topicDLQ, 0, sm); err != nil {
 		log.Println("storage dlq append error:", err)
 	}
-	if f, ok := q.store.(interface{ FlushTopic(string) error }); ok {
-		_ = f.FlushTopic(topicDLQ)
+	if f, ok := q.store.(interface{ FlushTopic(string, int) error }); ok {
+		_ = f.FlushTopic(topicDLQ, 0)
 	}
 	// mark as acked in active topic so replay won't restore it
-	if err := q.store.Ack(q.topic, msg.ID); err != nil {
+	if err := q.store.Ack(q.topic, q.queueID, msg.ID); err != nil {
 		log.Println("storage dlq ack error:", err)
 	}
-	if f, ok := q.store.(interface{ FlushTopic(string) error }); ok {
-		_ = f.FlushTopic(q.topic)
+	if f, ok := q.store.(interface{ FlushTopic(string, int) error }); ok {
+		_ = f.FlushTopic(q.topic, q.queueID)
 	}
 }

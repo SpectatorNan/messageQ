@@ -19,7 +19,7 @@ func main() {
 	// enable WAL-based persistence under ./data
 	store := storage.NewWALStorage("./data")
 	defer func() { _ = store.Close() }()
-	b := broker.NewBrokerWithStorage(store)
+	b := broker.NewBrokerWithStorage(store, 4)
 
 	r := api.NewRouter(b)
 	srv := &http.Server{

@@ -67,9 +67,9 @@ func writeWALHeader(w io.Writer) error {
 func TestPartialWriteIgnored(t *testing.T) {
 	dir := t.TempDir()
 	topic := "crash1"
-	topicDir := filepath.Join(dir, topic)
-	_ = os.MkdirAll(topicDir, 0o755)
-	p := filepath.Join(topicDir, "00000001.wal")
+	commitDir := filepath.Join(dir, "commitlog", topic, "0")
+	_ = os.MkdirAll(commitDir, 0o755)
+	p := filepath.Join(commitDir, "00000001.wal")
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		t.Fatalf("open segment: %v", err)
@@ -105,7 +105,7 @@ func TestPartialWriteIgnored(t *testing.T) {
 	// open storage and load
 	store := storage.NewWALStorage(dir, 10*time.Millisecond)
 	defer store.Close()
-	msgs, err := store.Load(topic)
+	msgs, err := store.Load(topic, 0)
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
@@ -118,12 +118,12 @@ func TestPartialWriteIgnored(t *testing.T) {
 func TestLeftoverTmpIgnored(t *testing.T) {
 	dir := t.TempDir()
 	topic := "crash2"
-	topicDir := filepath.Join(dir, topic)
-	_ = os.MkdirAll(topicDir, 0o755)
+	commitDir := filepath.Join(dir, "commitlog", topic, "0")
+	_ = os.MkdirAll(commitDir, 0o755)
 
 	// create two segments with records
 	for si := 1; si <= 2; si++ {
-		seg := filepath.Join(topicDir, filesystemSegmentName(si))
+		seg := filepath.Join(commitDir, filesystemSegmentName(si))
 		f, err := os.OpenFile(seg, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 		if err != nil {
 			t.Fatalf("open seg %d: %v", si, err)
@@ -143,7 +143,7 @@ func TestLeftoverTmpIgnored(t *testing.T) {
 	}
 
 	// create a leftover .compact.tmp with some content (should be ignored by listTopicSegments)
-	tmp := filepath.Join(topicDir, ".compact.tmp")
+	tmp := filepath.Join(commitDir, ".compact.tmp")
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		t.Fatalf("create tmp: %v", err)
@@ -154,7 +154,7 @@ func TestLeftoverTmpIgnored(t *testing.T) {
 
 	store := storage.NewWALStorage(dir, 10*time.Millisecond)
 	defer store.Close()
-	msgs, err := store.Load(topic)
+	msgs, err := store.Load(topic, 0)
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}
@@ -169,7 +169,7 @@ func TestCloseFlushes(t *testing.T) {
 	store := storage.NewWALStorage(dir, 100*time.Millisecond)
 	// append without AppendSync
 	uid := uuid.New()
-	err := store.Append("t", storage.Message{ID: uid.String(), Body: "persist", Retry: 0, Timestamp: time.Now()})
+	err := store.Append("t", 0, storage.Message{ID: uid.String(), Body: "persist", Retry: 0, Timestamp: time.Now()})
 	if err != nil {
 		t.Fatalf("append failed: %v", err)
 	}
@@ -180,7 +180,7 @@ func TestCloseFlushes(t *testing.T) {
 	// reopen
 	store2 := storage.NewWALStorage(dir, 10*time.Millisecond)
 	defer store2.Close()
-	msgs, err := store2.Load("t")
+	msgs, err := store2.Load("t", 0)
 	if err != nil {
 		t.Fatalf("load failed: %v", err)
 	}

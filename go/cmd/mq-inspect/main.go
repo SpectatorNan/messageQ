@@ -31,9 +31,9 @@ type Message struct {
 	Timestamp time.Time
 }
 
-func listSegments(dir string, topic string) ([]string, error) {
-	topicDir := filepath.Join(dir, topic)
-	entries, err := os.ReadDir(topicDir)
+func listSegments(dir string, topic string, queueID int) ([]string, error) {
+	commitDir := filepath.Join(dir, "commitlog", topic, fmt.Sprintf("%d", queueID))
+	entries, err := os.ReadDir(commitDir)
 	if err != nil {
 		return nil, err
 	}
@@ -45,7 +45,7 @@ func listSegments(dir string, topic string) ([]string, error) {
 		if filepath.Ext(e.Name()) != ".wal" {
 			continue
 		}
-		segs = append(segs, filepath.Join(topicDir, e.Name()))
+		segs = append(segs, filepath.Join(commitDir, e.Name()))
 	}
 	sort.Strings(segs)
 	return segs, nil
@@ -130,15 +130,16 @@ func inspectSegment(path string, showPayload bool) error {
 func main() {
 	dir := flag.String("dir", "./testdata", "base data directory")
 	topic := flag.String("topic", "test", "topic to inspect")
+	queueID := flag.Int("queue", 0, "queue id")
 	show := flag.Bool("show", false, "show parsed payloads")
 	flag.Parse()
-	segs, err := listSegments(*dir, *topic)
+	segs, err := listSegments(*dir, *topic, *queueID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error listing segments: %v\n", err)
 		os.Exit(2)
 	}
 	if len(segs) == 0 {
-		fmt.Printf("no segments found for topic %s in %s\n", *topic, *dir)
+		fmt.Printf("no segments found for topic %s queue %d in %s\n", *topic, *queueID, *dir)
 		return
 	}
 	for _, s := range segs {

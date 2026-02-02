@@ -20,6 +20,15 @@ Default server: `http://localhost:8080`
 
 Message IDs are UUIDv7 strings.
 
+## Storage Layout (RocketMQ-style)
+
+```
+<base>/commitlog/<topic>/<queueId>/*.wal
+<base>/consumequeue/<topic>/<queueId>/
+```
+
+DLQ uses `topic.dlq` and queueId=0.
+
 ## WAL Format
 
 Binary record per segment:
@@ -33,12 +42,12 @@ Binary record per segment:
 - `crc32` is computed over `body` (raw bytes)
 - `body` stores application payload; ACK/NACK records have bodyLen=0
 
-Segments are stored under `./data/<topic>/00000001.wal` etc.
+Segments are stored under `./data/commitlog/<topic>/<queueId>/00000001.wal` etc.
 
 ## Inspect WAL
 
 ```bash
-go run ./cmd/mq-inspect -dir ./data -topic your-topic -show
+go run ./cmd/mq-inspect -dir ./data -topic your-topic -queue 0 -show
 ```
 
 ## Tests

@@ -25,8 +25,7 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrInvalidMessage)
 			return
 		}
-		q := b.GetQueue(topic)
-		msg := q.Enqueue(payload.Body)
+		msg := b.Enqueue(topic, payload.Body)
 		c.JSON(http.StatusOK, NewRespSuccess(msg))
 	}
 }
@@ -38,8 +37,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrMissingTopic)
 			return
 		}
-		q := b.GetQueue(topic)
-		msg := q.Dequeue()
+		msg := b.Dequeue(topic)
 		c.JSON(http.StatusOK, NewRespSuccess(msg))
 	}
 }
@@ -60,8 +58,7 @@ func AckHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrInvalidID)
 			return
 		}
-		q := b.GetQueue(topic)
-		ok := q.Ack(id)
+		ok := b.Ack(topic, id)
 		if !ok {
 			FailGin(c, ErrNotFound)
 			return
@@ -86,8 +83,7 @@ func NackHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrInvalidID)
 			return
 		}
-		q := b.GetQueue(topic)
-		ok := q.Nack(id)
+		ok := b.Nack(topic, id)
 		if !ok {
 			FailGin(c, ErrNotFound)
 			return

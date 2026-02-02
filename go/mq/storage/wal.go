@@ -220,20 +220,33 @@ func (w *WALStorage) walDir(topic string) string {
 	return filepath.Join(w.baseDir, topic)
 }
 
+// queueKey builds a unique key for per-queue maps.
+func queueKey(topic string, queueID int) string {
+	return fmt.Sprintf("%s#%d", topic, queueID)
+}
+
+// commitLogDir returns the commitlog directory for a topic/queue.
+func (w *WALStorage) commitLogDir(topic string, queueID int) string {
+	return filepath.Join(w.baseDir, "commitlog", topic, fmt.Sprintf("%d", queueID))
+}
+
 // ensureTopicLocked must be called with w.mu held (or from a context where we will hold it).
-// It opens or creates the current highest-numbered segment in topic directory.
-func (w *WALStorage) ensureTopicLocked(topic string) error {
-	if _, ok := w.writers[topic]; ok {
+// It opens or creates the current highest-numbered segment in topic/queue directory.
+func (w *WALStorage) ensureTopicLocked(topic string, queueID int) error {
+	key := queueKey(topic, queueID)
+	if _, ok := w.writers[key]; ok {
 		return nil
 	}
-	if _, ok := w.topicCond[topic]; !ok {
-		w.topicCond[topic] = sync.NewCond(&w.mu)
+	if _, ok := w.topicCond[key]; !ok {
+		w.topicCond[key] = sync.NewCond(&w.mu)
 	}
-	topicDir := w.walDir(topic)
-	if err := os.MkdirAll(topicDir, 0o755); err != nil {
+	commitDir := w.commitLogDir(topic, queueID)
+	if err := os.MkdirAll(commitDir, 0o755); err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(topicDir)
+	// create consumequeue dir for layout completeness (not used yet)
+	_ = os.MkdirAll(filepath.Join(w.baseDir, "consumequeue", topic, fmt.Sprintf("%d", queueID)), 0o755)
+	entries, err := os.ReadDir(commitDir)
 	if err != nil {
 		return err
 	}
@@ -256,7 +269,7 @@ func (w *WALStorage) ensureTopicLocked(topic string) error {
 	if maxSeg == 0 {
 		maxSeg = 1
 	}
-	p := filepath.Join(topicDir, fmt.Sprintf("%08d.wal", maxSeg))
+	p := filepath.Join(commitDir, fmt.Sprintf("%08d.wal", maxSeg))
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
@@ -268,19 +281,20 @@ func (w *WALStorage) ensureTopicLocked(topic string) error {
 			return err
 		}
 		_ = f.Sync()
-		_ = syncDir(topicDir)
+		_ = syncDir(commitDir)
 	}
-	w.files[topic] = f
-	w.writers[topic] = bufio.NewWriterSize(f, 64*1024)
-	if _, ok := w.bytesSinceCompact[topic]; !ok {
-		w.bytesSinceCompact[topic] = 0
+	w.files[key] = f
+	w.writers[key] = bufio.NewWriterSize(f, 64*1024)
+	if _, ok := w.bytesSinceCompact[key]; !ok {
+		w.bytesSinceCompact[key] = 0
 	}
 	return nil
 }
 
-// listTopicSegments returns absolute paths of segment files sorted by name
-func (w *WALStorage) listTopicSegments(topic string) ([]string, error) {
-	entries, err := os.ReadDir(w.walDir(topic))
+// listTopicSegments returns absolute paths of segment files sorted by name for a topic/queue.
+func (w *WALStorage) listTopicSegments(topic string, queueID int) ([]string, error) {
+	commitDir := w.commitLogDir(topic, queueID)
+	entries, err := os.ReadDir(commitDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -296,20 +310,21 @@ func (w *WALStorage) listTopicSegments(topic string) ([]string, error) {
 		if filepath.Ext(name) != ".wal" {
 			continue
 		}
-		segs = append(segs, filepath.Join(w.walDir(topic), name))
+		segs = append(segs, filepath.Join(commitDir, name))
 	}
 	sort.Strings(segs)
 	return segs, nil
 }
 
-// rotateSegment closes current segment and opens a new numbered one
-func (w *WALStorage) rotateSegment(topic string) error {
+// rotateSegment closes current segment and opens a new numbered one.
+func (w *WALStorage) rotateSegment(topic string, queueID int) error {
+	key := queueKey(topic, queueID)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if err := w.ensureTopicLocked(topic); err != nil {
+	if err := w.ensureTopicLocked(topic, queueID); err != nil {
 		return err
 	}
-	segs, err := w.listTopicSegments(topic)
+	segs, err := w.listTopicSegments(topic, queueID)
 	if err != nil {
 		return err
 	}
@@ -321,14 +336,15 @@ func (w *WALStorage) rotateSegment(topic string) error {
 			next = n + 1
 		}
 	}
-	if f, ok := w.files[topic]; ok {
-		_ = w.writers[topic].Flush()
+	if f, ok := w.files[key]; ok {
+		_ = w.writers[key].Flush()
 		_ = f.Sync()
 		_ = f.Close()
-		delete(w.files, topic)
-		delete(w.writers, topic)
+		delete(w.files, key)
+		delete(w.writers, key)
 	}
-	p := filepath.Join(w.walDir(topic), fmt.Sprintf("%08d.wal", next))
+	commitDir := w.commitLogDir(topic, queueID)
+	p := filepath.Join(commitDir, fmt.Sprintf("%08d.wal", next))
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
@@ -337,94 +353,94 @@ func (w *WALStorage) rotateSegment(topic string) error {
 		f.Close()
 		return err
 	}
-	// ensure the new file is synced so that directory entry is visible
 	if err := f.Sync(); err != nil {
 		f.Close()
 		return err
 	}
-	w.files[topic] = f
-	w.writers[topic] = bufio.NewWriterSize(f, 64*1024)
-	w.bytesSinceCompact[topic] = 0
-	// ensure directory metadata is persisted
-	_ = syncDir(w.walDir(topic))
+	w.files[key] = f
+	w.writers[key] = bufio.NewWriterSize(f, 64*1024)
+	w.bytesSinceCompact[key] = 0
+	_ = syncDir(commitDir)
 	return nil
 }
 
-// writeRecord writes a binary record to topic's current segment.
-func (w *WALStorage) writeRecord(topic string, typ LogType, msg Message) error {
+// writeRecord writes a binary record to topic/queue's current segment.
+func (w *WALStorage) writeRecord(topic string, queueID int, typ LogType, msg Message) error {
+	key := queueKey(topic, queueID)
 	rec, recLen, err := buildRecordBytes(typ, msg)
 	if err != nil {
 		return err
 	}
 
 	w.mu.Lock()
-	if _, ok := w.topicCond[topic]; !ok {
-		w.topicCond[topic] = sync.NewCond(&w.mu)
+	if _, ok := w.topicCond[key]; !ok {
+		w.topicCond[key] = sync.NewCond(&w.mu)
 	}
-	for w.topicCompacting[topic] {
-		w.topicCond[topic].Wait()
+	for w.topicCompacting[key] {
+		w.topicCond[key].Wait()
 	}
-	if err := w.ensureTopicLocked(topic); err != nil {
+	if err := w.ensureTopicLocked(topic, queueID); err != nil {
 		w.mu.Unlock()
 		return err
 	}
-	if _, err := w.writers[topic].Write(rec); err != nil {
+	if _, err := w.writers[key].Write(rec); err != nil {
 		w.mu.Unlock()
 		return err
 	}
-	w.bytesSinceCompact[topic] += recLen
-	shouldRotate := w.bytesSinceCompact[topic] >= w.compactThreshold
+	w.bytesSinceCompact[key] += recLen
+	shouldRotate := w.bytesSinceCompact[key] >= w.compactThreshold
 	if shouldRotate {
-		w.bytesSinceCompact[topic] = 0
+		w.bytesSinceCompact[key] = 0
 	}
 	w.mu.Unlock()
 
 	if shouldRotate {
-		_ = w.rotateSegment(topic)
+		_ = w.rotateSegment(topic, queueID)
 	}
 	return nil
 }
 
 // Append writes an ENQ operation for the message to the WAL (binary + CRC).
-func (w *WALStorage) Append(topic string, msg Message) error {
-	return w.writeRecord(topic, LogProduce, msg)
+func (w *WALStorage) Append(topic string, queueID int, msg Message) error {
+	return w.writeRecord(topic, queueID, LogProduce, msg)
 }
 
 // Ack appends an ACK operation for the message id (binary + CRC, body empty).
-func (w *WALStorage) Ack(topic string, id string) error {
-	return w.writeRecord(topic, LogAck, Message{ID: id})
+func (w *WALStorage) Ack(topic string, queueID int, id string) error {
+	return w.writeRecord(topic, queueID, LogAck, Message{ID: id})
 }
 
-// AppendSync writes and then flushes+fsyncs the topic so the write is durable when the call returns.
-func (w *WALStorage) AppendSync(topic string, msg Message) error {
-	if err := w.Append(topic, msg); err != nil {
+// AppendSync writes and then flushes+fsyncs the topic/queue so the write is durable when the call returns.
+func (w *WALStorage) AppendSync(topic string, queueID int, msg Message) error {
+	if err := w.Append(topic, queueID, msg); err != nil {
 		return err
 	}
-	return w.FlushTopic(topic)
+	return w.FlushTopic(topic, queueID)
 }
 
 // AckSync writes ACK and flushes to make it durable.
-func (w *WALStorage) AckSync(topic string, id string) error {
-	if err := w.Ack(topic, id); err != nil {
+func (w *WALStorage) AckSync(topic string, queueID int, id string) error {
+	if err := w.Ack(topic, queueID, id); err != nil {
 		return err
 	}
-	return w.FlushTopic(topic)
+	return w.FlushTopic(topic, queueID)
 }
 
-// FlushTopic flushes and fsyncs a single topic's pending writes.
-func (w *WALStorage) FlushTopic(topic string) error {
+// FlushTopic flushes and fsyncs a single topic/queue's pending writes.
+func (w *WALStorage) FlushTopic(topic string, queueID int) error {
+	key := queueKey(topic, queueID)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if err := w.ensureTopicLocked(topic); err != nil {
+	if err := w.ensureTopicLocked(topic, queueID); err != nil {
 		return err
 	}
-	wr := w.writers[topic]
+	wr := w.writers[key]
 	if wr != nil {
 		if err := wr.Flush(); err != nil {
 			return err
 		}
 	}
-	if f := w.files[topic]; f != nil {
+	if f := w.files[key]; f != nil {
 		return f.Sync()
 	}
 	return nil
@@ -458,13 +474,12 @@ func (w *WALStorage) flushTopicLocked(topic string) error {
 	return f.Sync()
 }
 
-// Load replays all segment files for topic and returns the list of messages that have been ENQ'd and not ACK'd, in enqueue order.
-func (w *WALStorage) Load(topic string) ([]Message, error) {
-	// flush topic first
-	if err := w.FlushTopic(topic); err != nil {
+// Load replays all segment files for topic/queue and returns the list of messages that have been ENQ'd and not ACK'd, in enqueue order.
+func (w *WALStorage) Load(topic string, queueID int) ([]Message, error) {
+	if err := w.FlushTopic(topic, queueID); err != nil {
 		return nil, err
 	}
-	segs, err := w.listTopicSegments(topic)
+	segs, err := w.listTopicSegments(topic, queueID)
 	if err != nil {
 		return nil, err
 	}
@@ -529,82 +544,28 @@ func (w *WALStorage) Load(topic string) ([]Message, error) {
 	return res, nil
 }
 
-func (w *WALStorage) flusher() {
-	defer w.wg.Done()
-	t := time.NewTicker(w.flushInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-t.C:
-			_ = w.Flush()
-		case <-w.quit:
-			_ = w.Flush()
-			return
-		}
-	}
-}
-
-// compactor periodically checks topic directories and triggers compaction when threshold exceeded.
-func (w *WALStorage) compactor() {
-	defer w.wg.Done()
-	t := time.NewTicker(w.compactInterval)
-	defer t.Stop()
-	for {
-		select {
-		case <-t.C:
-			entries, err := os.ReadDir(w.baseDir)
-			if err != nil {
-				continue
-			}
-			for _, e := range entries {
-				if !e.IsDir() {
-					continue
-				}
-				topic := e.Name()
-				segs, err := w.listTopicSegments(topic)
-				if err != nil {
-					continue
-				}
-				if len(segs) <= 1 {
-					continue
-				}
-				var total int64
-				for _, s := range segs[:len(segs)-1] {
-					if info, err := os.Stat(s); err == nil {
-						total += info.Size()
-					}
-				}
-				if total >= w.compactThreshold {
-					go func(tpc string) { _ = w.Compact(tpc) }(topic)
-				}
-			}
-		case <-w.quit:
-			return
-		}
-	}
-}
-
-// Compact rewrites the earliest compactable segments for the topic into a single compacted segment file.
-func (w *WALStorage) Compact(topic string) error {
+// Compact rewrites the earliest compactable segments for the topic/queue into a single compacted segment file.
+func (w *WALStorage) Compact(topic string, queueID int) error {
+	key := queueKey(topic, queueID)
 	w.mu.Lock()
-	if w.topicCompacting[topic] {
+	if w.topicCompacting[key] {
 		w.mu.Unlock()
 		return nil
 	}
-	w.topicCompacting[topic] = true
-	if _, ok := w.topicCond[topic]; !ok {
-		w.topicCond[topic] = sync.NewCond(&w.mu)
+	w.topicCompacting[key] = true
+	if _, ok := w.topicCond[key]; !ok {
+		w.topicCond[key] = sync.NewCond(&w.mu)
 	}
 	w.mu.Unlock()
 
 	defer func() {
 		w.mu.Lock()
-		w.topicCompacting[topic] = false
-		w.topicCond[topic].Broadcast()
+		w.topicCompacting[key] = false
+		w.topicCond[key].Broadcast()
 		w.mu.Unlock()
 	}()
 
-	segs, err := w.listTopicSegments(topic)
+	segs, err := w.listTopicSegments(topic, queueID)
 	if err != nil {
 		return err
 	}
@@ -659,7 +620,8 @@ func (w *WALStorage) Compact(topic string) error {
 		f.Close()
 	}
 
-	tmp := filepath.Join(w.walDir(topic), ".compact.tmp")
+	commitDir := w.commitLogDir(topic, queueID)
+	tmp := filepath.Join(commitDir, ".compact.tmp")
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
@@ -701,23 +663,21 @@ func (w *WALStorage) Compact(topic string) error {
 		os.Remove(tmp)
 		return err
 	}
-	// ensure directory metadata persisted after rename
-	_ = syncDir(w.walDir(topic))
+	_ = syncDir(commitDir)
 	for i := 1; i < len(toCompact); i++ {
 		_ = os.Remove(toCompact[i])
 	}
-	// sync dir again after removals
-	_ = syncDir(w.walDir(topic))
+	_ = syncDir(commitDir)
 
 	w.mu.Lock()
-	if oldf, ok := w.files[topic]; ok {
-		_ = w.writers[topic].Flush()
+	if oldf, ok := w.files[key]; ok {
+		_ = w.writers[key].Flush()
 		_ = oldf.Sync()
 		_ = oldf.Close()
-		delete(w.files, topic)
-		delete(w.writers, topic)
+		delete(w.files, key)
+		delete(w.writers, key)
 	}
-	_ = w.ensureTopicLocked(topic)
+	_ = w.ensureTopicLocked(topic, queueID)
 	w.mu.Unlock()
 
 	return nil
@@ -764,4 +724,70 @@ func (w *WALStorage) Close() error {
 		}
 	})
 	return firstErr
+}
+
+func (w *WALStorage) flusher() {
+	defer w.wg.Done()
+	t := time.NewTicker(w.flushInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			_ = w.Flush()
+		case <-w.quit:
+			_ = w.Flush()
+			return
+		}
+	}
+}
+
+// compactor periodically checks commitlog directories and triggers compaction when threshold exceeded.
+func (w *WALStorage) compactor() {
+	defer w.wg.Done()
+	t := time.NewTicker(w.compactInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			commitBase := filepath.Join(w.baseDir, "commitlog")
+			topics, err := os.ReadDir(commitBase)
+			if err != nil {
+				continue
+			}
+			for _, te := range topics {
+				if !te.IsDir() {
+					continue
+				}
+				topic := te.Name()
+				queues, err := os.ReadDir(filepath.Join(commitBase, topic))
+				if err != nil {
+					continue
+				}
+				for _, qe := range queues {
+					if !qe.IsDir() {
+						continue
+					}
+					qid, err := strconv.Atoi(qe.Name())
+					if err != nil {
+						continue
+					}
+					segs, err := w.listTopicSegments(topic, qid)
+					if err != nil || len(segs) <= 1 {
+						continue
+					}
+					var total int64
+					for _, s := range segs[:len(segs)-1] {
+						if info, err := os.Stat(s); err == nil {
+							total += info.Size()
+						}
+					}
+					if total >= w.compactThreshold {
+						go func(tp string, q int) { _ = w.Compact(tp, q) }(topic, qid)
+					}
+				}
+			}
+		case <-w.quit:
+			return
+		}
+	}
 }
