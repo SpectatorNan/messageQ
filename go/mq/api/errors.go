@@ -2,25 +2,27 @@ package api
 
 var (
 	ErrMissingTopic      = NewRespErr(ErrCodeMissingTopic, "missing topic")
-	ErrMissingTag        = NewRespErr(ErrCodeMissingTag, "missing tag")
 	ErrInvalidMessage    = NewRespErr(ErrCodeInvalidMsg, "invalid message format")
 	ErrInvalidID         = NewRespErr(ErrCodeInvalidID, "invalid message id")
 	ErrNotFound          = NewRespErr(ErrCodeNotFound, "message not found or already acked/nacked")
 	ErrInvalidGroup      = NewRespErr(ErrCodeInvalidGroup, "invalid consumer group")
 	ErrInvalidOffset     = NewRespErr(ErrCodeInvalidOffset, "invalid offset")
 	ErrOffsetUnsupported = NewRespErr(ErrCodeOffsetUnsupported, "offset store not supported")
+	ErrMissingTag        = NewRespErr(ErrCodeMissingTag, "missing tag")
+	ErrBusy              = NewRespErr(ErrCodeBusy, "message in processing")
 )
 
 // Optionally define error codes for API responses
 const (
 	ErrCodeMissingTopic      = "missing_topic"
-	ErrCodeMissingTag        = "missing_tag"
 	ErrCodeInvalidMsg        = "invalid_message"
 	ErrCodeInvalidID         = "invalid_id"
 	ErrCodeNotFound          = "not_found"
 	ErrCodeInvalidGroup      = "invalid_group"
 	ErrCodeInvalidOffset     = "invalid_offset"
 	ErrCodeOffsetUnsupported = "offset_unsupported"
+	ErrCodeMissingTag        = "missing_tag"
+	ErrCodeBusy              = "busy"
 )
 
 // RespErr is an error that carries an API error code and message and implements error

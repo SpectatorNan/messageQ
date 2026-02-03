@@ -60,17 +60,10 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			}
 			queueID = v
 		}
-		offset, ok, err := b.GetOffset(group, topic, queueID)
-		if err != nil {
-			FailGin(c, ErrOffsetUnsupported)
-			return
-		}
-		if !ok {
-			offset = 0
-		}
 		tag := c.Query("tag")
-
-		msgs, next, err := b.ReadFromConsumeQueue(topic, queueID, offset, 1, tag)
+		
+		// 使用线程安全的消费方法，防止多consumer重复消费
+		msgs, offset, next, err := b.ConsumeWithLock(group, topic, queueID, tag, 1)
 		if err != nil {
 			FailGin(c, ErrOffsetUnsupported)
 			return

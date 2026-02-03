@@ -2,14 +2,18 @@ package broker
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"messageQ/mq/queue"
 	"messageQ/mq/storage"
 )
 
 const defaultQueueCount = 4
+const defaultMaxRetry = 3
 
 type processingState string
 
@@ -35,20 +39,19 @@ type processingEntry struct {
 }
 
 type Broker struct {
-	queues     map[string][]*queue.Queue
-	lock       sync.Mutex
-	store      storage.Storage
-	queueCount int
-
-	// round-robin pointers per topic
-	rrEnq map[string]int
-	rrDeq map[string]int
-
-	// inflight routing: msgID -> queueID
-	inflight map[string]int
-
-	processing map[string]processingEntry // msgID -> entry
-	stats      map[string]*groupStats     // group -> stats
+	queues            map[string][]*queue.Queue
+	lock              sync.Mutex
+	store             storage.Storage
+	queueCount        int
+	rrEnq             map[string]int
+	rrDeq             map[string]int
+	inflight          map[string]int
+	processing        map[string]processingEntry // msgID -> entry
+	stats             map[string]*groupStats     // group -> stats
+	retryCounts       map[string]int             // msgID -> retry count (in-memory)
+	maxRetry          int
+	consumeOffsetLock map[string]*sync.Mutex // "group:topic:queueID" -> lock for concurrent consume
+	delayScheduler    *DelayScheduler        // delay message and retry scheduler
 }
 
 type groupStats struct {
@@ -65,15 +68,21 @@ func NewBrokerWithStorage(store storage.Storage, queueCount int) *Broker {
 	if queueCount <= 0 {
 		queueCount = defaultQueueCount
 	}
+	scheduler := NewDelayScheduler(store)
+	scheduler.Start()
 	return &Broker{
-		queues:     make(map[string][]*queue.Queue),
-		store:      store,
-		queueCount: queueCount,
-		rrEnq:      make(map[string]int),
-		rrDeq:      make(map[string]int),
-		inflight:   make(map[string]int),
-		processing: make(map[string]processingEntry),
-		stats:      make(map[string]*groupStats),
+		queues:            make(map[string][]*queue.Queue),
+		store:             store,
+		queueCount:        queueCount,
+		rrEnq:             make(map[string]int),
+		rrDeq:             make(map[string]int),
+		inflight:          make(map[string]int),
+		processing:        make(map[string]processingEntry),
+		stats:             make(map[string]*groupStats),
+		retryCounts:       make(map[string]int),
+		maxRetry:          defaultMaxRetry,
+		consumeOffsetLock: make(map[string]*sync.Mutex),
+		delayScheduler:    scheduler,
 	}
 }
 
@@ -110,6 +119,39 @@ func (b *Broker) Enqueue(topic string, body string, tag string) queue.Message {
 // EnqueueBody keeps backward compatibility for callers without tags.
 func (b *Broker) EnqueueBody(topic string, body string) queue.Message {
 	return b.Enqueue(topic, body, "")
+}
+
+// EnqueueWithDelay schedules a message for delayed delivery
+func (b *Broker) EnqueueWithDelay(topic string, body string, tag string, delay time.Duration) queue.Message {
+	if tag == "" {
+		return queue.Message{}
+	}
+	
+	b.lock.Lock()
+	qs := b.getQueues(topic)
+	idx := b.rrEnq[topic] % len(qs)
+	b.rrEnq[topic] = (idx + 1) % len(qs)
+	b.lock.Unlock()
+	
+	// Generate message ID and metadata
+	uid, _ := uuid.NewV7()
+	msg := queue.Message{
+		ID:        uid.String(),
+		Body:      body,
+		Tag:       tag,
+		Timestamp: time.Now(),
+	}
+	
+	// Schedule for delayed delivery
+	b.delayScheduler.ScheduleWithDelay(topic, idx, storage.Message{
+		ID:        msg.ID,
+		Body:      msg.Body,
+		Tag:       msg.Tag,
+		Retry:     0,
+		Timestamp: msg.Timestamp,
+	}, delay)
+	
+	return msg
 }
 
 // Dequeue attempts a non-blocking scan across queues; if empty, blocks on a queue in round-robin.
@@ -221,10 +263,64 @@ func (b *Broker) ReadFromConsumeQueue(topic string, queueID int, offset int64, m
 	return nil, offset, ErrOffsetUnsupported
 }
 
+// getConsumeLock returns the lock for a specific group/topic/queue combination.
+func (b *Broker) getConsumeLock(group, topic string, queueID int) *sync.Mutex {
+	key := fmt.Sprintf("%s:%s:%d", group, topic, queueID)
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	if _, ok := b.consumeOffsetLock[key]; !ok {
+		b.consumeOffsetLock[key] = &sync.Mutex{}
+	}
+	return b.consumeOffsetLock[key]
+}
+
+// ConsumeWithLock 提供线程安全的消费操作，防止多consumer重复消费
+func (b *Broker) ConsumeWithLock(group, topic string, queueID int, tag string, maxMessages int) ([]storage.Message, int64, int64, error) {
+	if maxMessages <= 0 {
+		maxMessages = 1
+	}
+	
+	// 获取该group/topic/queue的专属锁
+	consumeLock := b.getConsumeLock(group, topic, queueID)
+	consumeLock.Lock()
+	defer consumeLock.Unlock()
+	
+	// 获取当前offset
+	offset, ok, err := b.GetOffset(group, topic, queueID)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if !ok {
+		offset = 0
+	}
+	
+	// 从consumequeue读取消息
+	msgs, nextOffset, err := b.ReadFromConsumeQueue(topic, queueID, offset, maxMessages, tag)
+	if err != nil {
+		return nil, offset, offset, err
+	}
+	
+	if len(msgs) == 0 {
+		return nil, offset, offset, nil
+	}
+	
+	// 立即提交nextOffset，防止其他consumer读取相同消息
+	// 如果消费失败，通过重试机制处理，不回退offset
+	if err := b.CommitOffset(group, topic, queueID, nextOffset); err != nil {
+		return nil, offset, offset, err
+	}
+	
+	return msgs, offset, nextOffset, nil
+}
+
 // BeginProcessing records a message as processing for a group/queue/offset.
 func (b *Broker) BeginProcessing(group, topic string, queueID int, offset, nextOffset int64, msg queue.Message) {
 	b.lock.Lock()
 	defer b.lock.Unlock()
+	// apply retry count if tracked
+	if rc := b.retryCounts[msg.ID]; rc > msg.Retry {
+		msg.Retry = rc
+	}
 	entry := processingEntry{
 		Group:      group,
 		Topic:      topic,
@@ -240,6 +336,7 @@ func (b *Broker) BeginProcessing(group, topic string, queueID int, offset, nextO
 		UpdatedAt:  time.Now(),
 	}
 	b.processing[msg.ID] = entry
+	// fmt.Printf("[DEBUG] BeginProcessing: added %s to processing map (total: %d)\n", msg.ID, len(b.processing))
 	gs := b.stats[group]
 	if gs == nil {
 		gs = &groupStats{}
@@ -248,7 +345,7 @@ func (b *Broker) BeginProcessing(group, topic string, queueID int, offset, nextO
 	gs.Processing++
 }
 
-// RetryProcessing marks a message retry without committing offset.
+// RetryProcessing marks a message retry and reappends to queue end or DLQ.
 func (b *Broker) RetryProcessing(msgID string) bool {
 	b.lock.Lock()
 	entry, ok := b.processing[msgID]
@@ -256,8 +353,11 @@ func (b *Broker) RetryProcessing(msgID string) bool {
 		b.lock.Unlock()
 		return false
 	}
+	retryCount := b.retryCounts[msgID] + 1
+	b.retryCounts[msgID] = retryCount
 	entry.State = stateRetry
 	entry.UpdatedAt = time.Now()
+	entry.Retry = retryCount
 	b.processing[msgID] = entry
 	gs := b.stats[entry.Group]
 	if gs != nil {
@@ -265,34 +365,58 @@ func (b *Broker) RetryProcessing(msgID string) bool {
 		gs.Retry++
 	}
 	delete(b.processing, msgID)
+	// exceed max retry -> send to DLQ
+	if retryCount > b.maxRetry {
+		b.clearRetryCount(msgID)
+		b.lock.Unlock()
+		dlqTopic := entry.Topic + ".dlq"
+		_ = b.store.Append(dlqTopic, 0, storage.Message{
+			ID:        entry.MsgID,
+			Body:      entry.Body,
+			Tag:       entry.Tag,
+			Retry:     retryCount,
+			Timestamp: time.Now(),
+		})
+		return true
+	}
 	b.lock.Unlock()
-	// no offset commit on retry; message will be re-consumed
+	// Schedule retry with exponential backoff
+	delay := CalculateRetryBackoff(retryCount)
+	b.delayScheduler.ScheduleWithDelay(entry.Topic, entry.QueueID, storage.Message{
+		ID:        entry.MsgID,
+		Body:      entry.Body,
+		Tag:       entry.Tag,
+		Retry:     retryCount,
+		Timestamp: time.Now(),
+	}, delay)
 	return true
 }
 
-// CompleteProcessing marks a message completed and commits offset.
+// CompleteProcessing marks a message completed (offset already committed in ConsumeWithLock).
 func (b *Broker) CompleteProcessing(msgID string) bool {
 	b.lock.Lock()
 	entry, ok := b.processing[msgID]
-	if ok && entry.State == stateProcessing {
-		entry.State = stateCompleted
-		entry.UpdatedAt = time.Now()
-		b.processing[msgID] = entry
-		gs := b.stats[entry.Group]
-		if gs != nil {
-			gs.Processing--
-			gs.Completed++
-		}
-		delete(b.processing, msgID)
-	}
-	b.lock.Unlock()
 	if !ok {
+		// fmt.Printf("[DEBUG] CompleteProcessing: msgID %s not found in processing map (total: %d)\n", msgID, len(b.processing))
+		b.lock.Unlock()
 		return false
 	}
-	cur, _, err := b.GetOffset(entry.Group, entry.Topic, entry.QueueID)
-	if err == nil && entry.NextOffset > cur {
-		_ = b.CommitOffset(entry.Group, entry.Topic, entry.QueueID, entry.NextOffset)
+	if entry.State != stateProcessing {
+		// fmt.Printf("[DEBUG] CompleteProcessing: msgID %s has wrong state: %s\n", msgID, entry.State)
+		b.lock.Unlock()
+		return false
 	}
+	entry.State = stateCompleted
+	entry.UpdatedAt = time.Now()
+	b.processing[msgID] = entry
+	gs := b.stats[entry.Group]
+	if gs != nil {
+		gs.Processing--
+		gs.Completed++
+	}
+	delete(b.processing, msgID)
+	b.clearRetryCount(msgID)
+	b.lock.Unlock()
 	return true
 }
 
@@ -305,4 +429,29 @@ func (b *Broker) Stats() map[string]groupStats {
 		out[g] = *s
 	}
 	return out
+}
+
+// GetRetryCount returns current retry count for a message id.
+func (b *Broker) GetRetryCount(msgID string) int {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	return b.retryCounts[msgID]
+}
+
+// clearRetryCount removes retry count tracking for a message id.
+func (b *Broker) clearRetryCount(msgID string) {
+	delete(b.retryCounts, msgID)
+}
+
+// Close gracefully stops the broker and its components
+func (b *Broker) Close() error {
+	if b.delayScheduler != nil {
+		b.delayScheduler.Stop()
+	}
+	return nil
+}
+
+// GetDelayScheduler returns the delay scheduler for direct access
+func (b *Broker) GetDelayScheduler() *DelayScheduler {
+	return b.delayScheduler
 }

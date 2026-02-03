@@ -16,7 +16,7 @@ import (
 	"messageQ/mq/storage"
 )
 
-var debugCleanup = true
+var debugCleanup = false
 
 // Global switch controlled by environment variable MSGQ_CLEAN_TESTDATA.
 // If unset, default is true (testdata will be removed before/after the test).

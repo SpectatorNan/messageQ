@@ -2,3 +2,5 @@
 /go/example/testdata
 /go/example/benchdata
 /go/example/dlqdata
+/go/data
+go/messageq

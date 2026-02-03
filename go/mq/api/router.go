@@ -12,6 +12,7 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 
 	// RESTful routes
 	r.POST("/topics/:topic/messages", ProduceHandler(b))
+	r.POST("/topics/:topic/messages/delay", ProduceDelayedHandler(b))
 	r.GET("/topics/:topic/messages", ConsumeHandler(b))
 	r.POST("/topics/:topic/messages/:id/ack", AckHandler(b))
 	r.POST("/topics/:topic/messages/:id/nack", NackHandler(b))
@@ -21,7 +22,7 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 	r.POST("/topics/:topic/offsets/:group", CommitOffsetHandler(b))
 
 	// stats
-	r.GET("/stats", StatsHandler(b))
+	r.GET("/stats", DelayStatsHandler(b))
 
 	return r
 }
