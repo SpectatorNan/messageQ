@@ -133,8 +133,8 @@ func TestProduceData(t *testing.T) {
 
 	topic := "normal"
 	client := &http.Client{Timeout: 5 * time.Second}
-	produce := func() error {
-		msg := fmt.Sprintf("hello concurrent %d", time.Now().UnixNano())
+	produce := func(idx int) error {
+		msg := fmt.Sprintf("hello concurrent %d", idx)
 		body := map[string]string{"body": msg, "tag": "testProduce"}
 		bts, _ := json.Marshal(body)
 		_, err := client.Post("http://localhost:8080/api/v1/topics/"+topic+"/messages", "application/json", bytes.NewReader(bts))
@@ -144,8 +144,8 @@ func TestProduceData(t *testing.T) {
 		}
 		return nil
 	}
-	for i := 0; i < 5; i++ {
-		err := produce()
+	for i := 0; i < 20; i++ {
+		err := produce(i)
 		if err != nil {
 			t.Errorf("produce failed: %v", err)
 			break

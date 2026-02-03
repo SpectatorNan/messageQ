@@ -336,6 +336,46 @@ func (b *Broker) ReadFromConsumeQueue(topic string, queueID int, offset int64, m
 	return nil, offset, ErrOffsetUnsupported
 }
 
+// GetRetryTopicName returns the retry topic name for a group and topic.
+// Example: "orders" + "g1" -> "orders.retry.g1"
+func GetRetryTopicName(group, topic string) string {
+	return topic + ".retry." + group
+}
+
+// getRetryTopicIfExists checks if retry topic exists for group/topic.
+func (b *Broker) getRetryTopicIfExists(group, topic string) (string, bool) {
+	retryTopic := GetRetryTopicName(group, topic)
+	if _, err := b.topicManager.GetTopicConfig(retryTopic); err == nil {
+		return retryTopic, true
+	}
+	return "", false
+}
+
+// ensureRetryTopic creates retry topic for group/topic if missing.
+func (b *Broker) ensureRetryTopic(group, topic string) (string, error) {
+	retryTopic := GetRetryTopicName(group, topic)
+	if _, err := b.topicManager.GetTopicConfig(retryTopic); err == nil {
+		return retryTopic, nil
+	}
+
+	// Use original topic queue count when creating retry topic
+	queueCount := b.queueCount
+	if cfg, err := b.topicManager.GetTopicConfig(topic); err == nil {
+		if cfg.QueueCount > 0 {
+			queueCount = cfg.QueueCount
+		}
+	}
+
+	if err := b.topicManager.CreateTopic(retryTopic, TopicTypeNormal, queueCount); err != nil {
+		// If it was created concurrently, treat as success
+		if _, getErr := b.topicManager.GetTopicConfig(retryTopic); getErr == nil {
+			return retryTopic, nil
+		}
+		return "", err
+	}
+	return retryTopic, nil
+}
+
 // getConsumeLock returns the lock for a specific group/topic/queue combination.
 func (b *Broker) getConsumeLock(group, topic string, queueID int) *sync.Mutex {
 	key := fmt.Sprintf("%s:%s:%d", group, topic, queueID)
@@ -386,6 +426,17 @@ func (b *Broker) ConsumeWithLock(group, topic string, queueID int, tag string, m
 	return msgs, offset, nextOffset, nil
 }
 
+// ConsumeWithRetry first tries the group retry topic, then falls back to original topic.
+func (b *Broker) ConsumeWithRetry(group, topic string, queueID int, tag string, maxMessages int) ([]storage.Message, int64, int64, error) {
+	if retryTopic, ok := b.getRetryTopicIfExists(group, topic); ok {
+		msgs, offset, next, err := b.ConsumeWithLock(group, retryTopic, queueID, tag, maxMessages)
+		if err == nil && len(msgs) > 0 {
+			return msgs, offset, next, nil
+		}
+	}
+	return b.ConsumeWithLock(group, topic, queueID, tag, maxMessages)
+}
+
 // BeginProcessing records a message as processing for a group/queue/offset.
 func (b *Broker) BeginProcessing(group, topic string, queueID int, offset, nextOffset int64, msg queue.Message) {
 	b.lock.Lock()
@@ -418,7 +469,7 @@ func (b *Broker) BeginProcessing(group, topic string, queueID int, offset, nextO
 	gs.Processing++
 }
 
-// RetryProcessing marks a message retry and reappends to queue end or DLQ.
+// RetryProcessing schedules a retry to the group retry topic or DLQ.
 func (b *Broker) RetryProcessing(msgID string) bool {
 	b.lock.Lock()
 	entry, ok := b.processing[msgID]
@@ -438,6 +489,7 @@ func (b *Broker) RetryProcessing(msgID string) bool {
 		gs.Retry++
 	}
 	delete(b.processing, msgID)
+	
 	// exceed max retry -> send to DLQ
 	if retryCount > b.maxRetry {
 		b.clearRetryCount(msgID)
@@ -452,16 +504,31 @@ func (b *Broker) RetryProcessing(msgID string) bool {
 		})
 		return true
 	}
-	b.lock.Unlock()
-	// Schedule retry with exponential backoff
-	delay := CalculateRetryBackoff(retryCount)
-	b.delayScheduler.ScheduleWithDelay(entry.Topic, entry.QueueID, storage.Message{
+	
+	group := entry.Group
+	topic := entry.Topic
+	queueID := entry.QueueID
+	msg := storage.Message{
 		ID:        entry.MsgID,
 		Body:      entry.Body,
 		Tag:       entry.Tag,
 		Retry:     retryCount,
 		Timestamp: time.Now(),
-	}, delay)
+	}
+	b.lock.Unlock()
+
+	retryTopic, err := b.ensureRetryTopic(group, topic)
+	if err != nil {
+		logger.Error("Failed to ensure retry topic",
+			zap.String("group", group),
+			zap.String("topic", topic),
+			zap.Error(err))
+		return false
+	}
+
+	// Schedule retry to group retry topic (RocketMQ-style), no offset rollback
+	delay := CalculateRetryBackoff(retryCount)
+	b.delayScheduler.ScheduleWithDelay(retryTopic, queueID, msg, delay)
 	return true
 }
 

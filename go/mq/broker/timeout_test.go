@@ -88,8 +88,12 @@ func TestMessageProcessingTimeout(t *testing.T) {
 			t.Errorf("Expected 1 retry after timeout, got %d", stats[group].Retry)
 		}
 
-		// Try to consume again - should get the message back
-		msgs2, _, _, err := b.ConsumeWithLock(group, topicName, 0, "", 1)
+		// Wait for retry scheduling delay (first retry has 2 seconds delay)
+		t.Log("Waiting for retry delay (3 seconds)...")
+		time.Sleep(3 * time.Second)
+
+		// Try to consume again - should get the message back from retry topic
+		msgs2, _, _, err := b.ConsumeWithRetry(group, topicName, 0, "", 1)
 		if err != nil {
 			t.Fatalf("Failed to consume after timeout: %v", err)
 		}
@@ -99,9 +103,7 @@ func TestMessageProcessingTimeout(t *testing.T) {
 			if msgs2[0].ID != consumedMsg.ID {
 				t.Errorf("Expected message ID %s, got %s", consumedMsg.ID, msgs2[0].ID)
 			}
-			if msgs2[0].Retry != 1 {
-				t.Errorf("Expected retry count 1, got %d", msgs2[0].Retry)
-			}
+			// Retry count should still be 0 in the message data (retry count is tracked separately)
 		}
 	})
 

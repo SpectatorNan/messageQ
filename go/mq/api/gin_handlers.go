@@ -185,8 +185,8 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 				return
 			}
 			queueID = v
-			// 使用指定的 queue_id
-			msgs, offset, next, err = b.ConsumeWithLock(group, topic, queueID, tag, 1)
+			// 使用指定的 queue_id，优先消费重试队列
+			msgs, offset, next, err = b.ConsumeWithRetry(group, topic, queueID, tag, 1)
 			if err != nil {
 				logger.Error("Consume error", zap.String("group", group), zap.String("topic", topic), zap.Error(err))
 				FailGin(c, ErrOffsetUnsupported)
@@ -196,7 +196,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			// 没有指定 queue_id，轮询所有队列
 			queueCount := b.GetQueueCount(topic)
 			for i := 0; i < queueCount; i++ {
-				msgs, offset, next, err = b.ConsumeWithLock(group, topic, i, tag, 1)
+				msgs, offset, next, err = b.ConsumeWithRetry(group, topic, i, tag, 1)
 				if err != nil {
 					continue // 跳过出错的队列
 				}
