@@ -3,6 +3,7 @@ package example
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -125,5 +126,29 @@ func TestProduceConsumeAckNack_PersistentWAL(t *testing.T) {
 	}
 	if id2 == id {
 		t.Fatalf("expected different message on second consume")
+	}
+}
+
+func TestProduceData(t *testing.T) {
+
+	topic := "normal"
+	client := &http.Client{Timeout: 5 * time.Second}
+	produce := func() error {
+		msg := fmt.Sprintf("hello concurrent %d", time.Now().UnixNano())
+		body := map[string]string{"body": msg, "tag": "testProduce"}
+		bts, _ := json.Marshal(body)
+		_, err := client.Post("http://localhost:8080/api/v1/topics/"+topic+"/messages", "application/json", bytes.NewReader(bts))
+		if err != nil {
+			//t.Errorf("produce request failed: %v", err)
+			return err
+		}
+		return nil
+	}
+	for i := 0; i < 5; i++ {
+		err := produce()
+		if err != nil {
+			t.Errorf("produce failed: %v", err)
+			break
+		}
 	}
 }

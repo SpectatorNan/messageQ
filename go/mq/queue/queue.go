@@ -13,13 +13,9 @@ import (
 )
 
 type Queue struct {
-	mu       sync.Mutex
-	cond     *sync.Cond
-	data     []Message
-	inflight map[string]InflightMsg
-
-	ackTimeout time.Duration
-	maxRetry   int
+	mu   sync.Mutex
+	cond *sync.Cond
+	data []Message
 
 	store   storage.Storage
 	topic   string
@@ -28,26 +24,19 @@ type Queue struct {
 
 func NewQueue() *Queue {
 	q := &Queue{
-		data:       make([]Message, 0),
-		inflight:   make(map[string]InflightMsg),
-		ackTimeout: 10 * time.Second,
-		maxRetry:   3,
-		queueID:    0,
+		data:    make([]Message, 0),
+		queueID: 0,
 	}
 	q.cond = sync.NewCond(&q.mu)
-	go q.reclaimLoop()
 	return q
 }
 
 func NewQueueWithStorage(store storage.Storage, topic string, queueID int) *Queue {
 	q := &Queue{
-		data:       make([]Message, 0),
-		inflight:   make(map[string]InflightMsg),
-		ackTimeout: 10 * time.Second,
-		maxRetry:   3,
-		store:      store,
-		topic:      topic,
-		queueID:    queueID,
+		data:    make([]Message, 0),
+		store:   store,
+		topic:   topic,
+		queueID: queueID,
 	}
 	q.cond = sync.NewCond(&q.mu)
 	// load persisted messages into data
@@ -72,11 +61,10 @@ func NewQueueWithStorage(store storage.Storage, topic string, queueID int) *Queu
 			}
 		}
 	}
-	go q.reclaimLoop()
 	return q
 }
 
-// TryDequeue returns immediately; ok=false when empty.
+// TryDequeue is deprecated - system uses ConsumeQueue + Offset pattern
 func (q *Queue) TryDequeue() (Message, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -85,10 +73,6 @@ func (q *Queue) TryDequeue() (Message, bool) {
 	}
 	msg := q.data[0]
 	q.data = q.data[1:]
-	q.inflight[msg.ID] = InflightMsg{
-		Msg:      msg,
-		Deadline: time.Now().Add(q.ackTimeout),
-	}
 	return msg, true
 }
 
@@ -135,6 +119,7 @@ func (q *Queue) EnqueueBody(body string) Message {
 	return q.Enqueue(body, "")
 }
 
+// Dequeue is deprecated - system uses ConsumeQueue + Offset pattern
 func (q *Queue) Dequeue() Message {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -145,16 +130,10 @@ func (q *Queue) Dequeue() Message {
 
 	msg := q.data[0]
 	q.data = q.data[1:]
-
-	q.inflight[msg.ID] = InflightMsg{
-		Msg:      msg,
-		Deadline: time.Now().Add(q.ackTimeout),
-	}
-
 	return msg
 }
 
-// TryDequeueTag returns immediately with a message matching tag; ok=false when none.
+// TryDequeueTag is deprecated - system uses ConsumeQueue + Offset pattern
 func (q *Queue) TryDequeueTag(tag string) (Message, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -162,24 +141,16 @@ func (q *Queue) TryDequeueTag(tag string) (Message, bool) {
 	if !ok {
 		return Message{}, false
 	}
-	q.inflight[msg.ID] = InflightMsg{
-		Msg:      msg,
-		Deadline: time.Now().Add(q.ackTimeout),
-	}
 	return msg, true
 }
 
-// DequeueTag blocks until a message matching tag is available.
+// DequeueTag is deprecated - system uses ConsumeQueue + Offset pattern
 func (q *Queue) DequeueTag(tag string) Message {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	for {
 		msg, ok := q.popByTagLocked(tag)
 		if ok {
-			q.inflight[msg.ID] = InflightMsg{
-				Msg:      msg,
-				Deadline: time.Now().Add(q.ackTimeout),
-			}
 			return msg
 		}
 		q.cond.Wait()
@@ -204,73 +175,6 @@ func (q *Queue) popByTagLocked(tag string) (Message, bool) {
 		}
 	}
 	return Message{}, false
-}
-
-func (q *Queue) Ack(id string) bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	if _, ok := q.inflight[id]; ok {
-		delete(q.inflight, id)
-		if q.store != nil {
-			_ = q.store.Ack(q.topic, q.queueID, id)
-		}
-		return true
-	}
-	return false
-}
-
-func (q *Queue) Nack(id string) bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-
-	im, ok := q.inflight[id]
-	if !ok {
-		return false
-	}
-
-	delete(q.inflight, id)
-
-	im.Msg.Retry++
-	if im.Msg.Retry > q.maxRetry {
-		q.persistDLQ(im.Msg)
-		logger.Warn("Message moved to DLQ after nack",
-			zap.String("message_id", im.Msg.ID),
-			zap.String("topic", q.topic),
-			zap.Int("retry_count", im.Msg.Retry))
-		return true
-	}
-
-	q.persistRetry(im.Msg)
-	q.data = append(q.data, im.Msg)
-	q.cond.Signal()
-	return true
-}
-
-func (q *Queue) reclaimLoop() {
-	ticker := time.NewTicker(time.Second)
-	for range ticker.C {
-		now := time.Now()
-		q.mu.Lock()
-		for id, im := range q.inflight {
-			if now.After(im.Deadline) {
-				delete(q.inflight, id)
-				im.Msg.Retry++
-				if im.Msg.Retry <= q.maxRetry {
-					q.persistRetry(im.Msg)
-					q.data = append(q.data, im.Msg)
-					q.cond.Signal()
-				} else {
-					q.persistDLQ(im.Msg)
-					logger.Warn("Message moved to DLQ due to timeout",
-						zap.String("message_id", id),
-						zap.String("topic", q.topic),
-						zap.Int("retry_count", im.Msg.Retry))
-				}
-			}
-		}
-		q.mu.Unlock()
-	}
 }
 
 func (q *Queue) persistRetry(msg Message) {

@@ -4,3 +4,4 @@
 /go/example/dlqdata
 /go/data
 go/messageq
+topics.json

@@ -16,13 +16,25 @@ import (
 
 func TestAPIValidation(t *testing.T) {
 	dataDir := "testdata/api_validation"
+	os.RemoveAll(dataDir) // Clean up before test
 	defer os.RemoveAll(dataDir)
 
 	store := storage.NewWALStorage(dataDir, 10*time.Millisecond)
 	defer store.Close()
 
-	b := broker.NewBrokerWithStorage(store, 4)
+	b := broker.NewBrokerWithPersistence(store, 4, dataDir)
 	defer b.Close()
+
+	// Create test topics
+	err := b.CreateTopic("test-topic", broker.TopicTypeNormal, 4)
+	if err != nil {
+		t.Fatalf("Failed to create test-topic: %v", err)
+	}
+
+	err = b.CreateTopic("test-delay-topic", broker.TopicTypeDelay, 4)
+	if err != nil {
+		t.Fatalf("Failed to create test-delay-topic: %v", err)
+	}
 
 	router := api.NewRouter(b)
 
@@ -135,8 +147,8 @@ func TestAPIValidation(t *testing.T) {
 		}
 		body, _ := json.Marshal(payload)
 
-		// Use the unified /messages endpoint with delay parameters
-		req := httptest.NewRequest("POST", "/api/v1/topics/test-topic/messages", bytes.NewReader(body))
+		// Use the unified /messages endpoint with delay parameters on delay topic
+		req := httptest.NewRequest("POST", "/api/v1/topics/test-delay-topic/messages", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 

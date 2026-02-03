@@ -38,32 +38,49 @@ func TestUnifiedProduceAPI(t *testing.T) {
 
 	router := api.NewRouter(b)
 
-	// Create a test topic first
-	topicName := "test-unified"
-	createBody, _ := json.Marshal(map[string]interface{}{
-		"name":        topicName,
+	// Create a normal topic for normal message tests
+	normalTopic := "test-normal"
+	createNormalBody, _ := json.Marshal(map[string]interface{}{
+		"name":        normalTopic,
 		"type":        "NORMAL",
 		"queue_count": 1,
 	})
 
-	createReq := httptest.NewRequest("POST", "/api/v1/topics", bytes.NewReader(createBody))
+	createReq := httptest.NewRequest("POST", "/api/v1/topics", bytes.NewReader(createNormalBody))
 	createReq.Header.Set("Content-Type", "application/json")
 	createW := httptest.NewRecorder()
 	router.ServeHTTP(createW, createReq)
 
 	if createW.Code != http.StatusCreated {
-		t.Fatalf("Failed to create topic: %d - %s", createW.Code, createW.Body.String())
+		t.Fatalf("Failed to create normal topic: %d - %s", createW.Code, createW.Body.String())
+	}
+
+	// Create a delay topic for delay message tests
+	delayTopic := "test-delay"
+	createDelayBody, _ := json.Marshal(map[string]interface{}{
+		"name":        delayTopic,
+		"type":        "DELAY",
+		"queue_count": 1,
+	})
+
+	createReq = httptest.NewRequest("POST", "/api/v1/topics", bytes.NewReader(createDelayBody))
+	createReq.Header.Set("Content-Type", "application/json")
+	createW = httptest.NewRecorder()
+	router.ServeHTTP(createW, createReq)
+
+	if createW.Code != http.StatusCreated {
+		t.Fatalf("Failed to create delay topic: %d - %s", createW.Code, createW.Body.String())
 	}
 
 	t.Run("ProduceNormalMessage", func(t *testing.T) {
-		// Produce a normal message (no delay parameters)
+		// Produce a normal message (no delay parameters) to normal topic
 		payload := map[string]interface{}{
 			"body": "normal message",
 			"tag":  "test",
 		}
 		body, _ := json.Marshal(payload)
 
-		req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/topics/%s/messages", topicName), bytes.NewReader(body))
+		req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/topics/%s/messages", normalTopic), bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 
@@ -86,7 +103,7 @@ func TestUnifiedProduceAPI(t *testing.T) {
 	})
 
 	t.Run("ProduceDelayedMessageWithMilliseconds", func(t *testing.T) {
-		// Produce a delayed message using delay_ms
+		// Produce a delayed message using delay_ms to delay topic
 		payload := map[string]interface{}{
 			"body":     "delayed message with ms",
 			"tag":      "test",
@@ -94,7 +111,7 @@ func TestUnifiedProduceAPI(t *testing.T) {
 		}
 		body, _ := json.Marshal(payload)
 
-		req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/topics/%s/messages", topicName), bytes.NewReader(body))
+		req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/topics/%s/messages", delayTopic), bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 
@@ -128,7 +145,7 @@ func TestUnifiedProduceAPI(t *testing.T) {
 	})
 
 	t.Run("ProduceDelayedMessageWithSeconds", func(t *testing.T) {
-		// Produce a delayed message using delay_sec
+		// Produce a delayed message using delay_sec to delay topic
 		payload := map[string]interface{}{
 			"body":      "delayed message with sec",
 			"tag":       "test",
@@ -136,7 +153,7 @@ func TestUnifiedProduceAPI(t *testing.T) {
 		}
 		body, _ := json.Marshal(payload)
 
-		req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/topics/%s/messages", topicName), bytes.NewReader(body))
+		req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/topics/%s/messages", delayTopic), bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 
@@ -170,7 +187,7 @@ func TestUnifiedProduceAPI(t *testing.T) {
 	})
 
 	t.Run("ProduceBothDelayParametersError", func(t *testing.T) {
-		// Try to produce with both delay_ms and delay_sec (should fail)
+		// Try to produce with both delay_ms and delay_sec to delay topic (should be treated as having delay_ms only)
 		payload := map[string]interface{}{
 			"body":      "invalid message",
 			"tag":       "test",
@@ -179,12 +196,13 @@ func TestUnifiedProduceAPI(t *testing.T) {
 		}
 		body, _ := json.Marshal(payload)
 
-		req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/topics/%s/messages", topicName), bytes.NewReader(body))
+		req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/topics/%s/messages", delayTopic), bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 
 		router.ServeHTTP(w, req)
 
+		// This should fail with validation error
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("Expected 400, got %d: %s", w.Code, w.Body.String())
 		}
@@ -198,7 +216,7 @@ func TestUnifiedProduceAPI(t *testing.T) {
 	})
 
 	t.Run("ProduceDelayOutOfRangeError", func(t *testing.T) {
-		// Try to produce with delay exceeding 30 days (should fail)
+		// Try to produce with delay exceeding 30 days to delay topic (should fail)
 		payload := map[string]interface{}{
 			"body":      "invalid message",
 			"tag":       "test",
@@ -206,7 +224,7 @@ func TestUnifiedProduceAPI(t *testing.T) {
 		}
 		body, _ := json.Marshal(payload)
 
-		req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/topics/%s/messages", topicName), bytes.NewReader(body))
+		req := httptest.NewRequest("POST", fmt.Sprintf("/api/v1/topics/%s/messages", delayTopic), bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 

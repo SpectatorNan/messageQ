@@ -17,6 +17,7 @@ import (
 
 const defaultQueueCount = 4
 const defaultMaxRetry = 3
+const defaultProcessingTimeout = 30 * time.Second // 消息处理超时时间
 
 type processingState string
 
@@ -53,10 +54,12 @@ type Broker struct {
 	stats             map[string]*groupStats     // group -> stats
 	retryCounts       map[string]int             // msgID -> retry count (in-memory)
 	maxRetry          int
-	consumeOffsetLock map[string]*sync.Mutex          // "group:topic:queueID" -> lock for concurrent consume
-	delayScheduler    *BinaryDelayScheduler           // binary delay scheduler (CommitLog based)
-	topicManager      *TopicManager                   // topic metadata manager
-	dataDir           string                          // data directory for persistence
+	consumeOffsetLock map[string]*sync.Mutex // "group:topic:queueID" -> lock for concurrent consume
+	delayScheduler    *BinaryDelayScheduler  // binary delay scheduler (CommitLog based)
+	topicManager      *TopicManager          // topic metadata manager
+	dataDir           string                 // data directory for persistence
+	processingTimeout time.Duration          // message processing timeout
+	stopChan          chan struct{}          // channel to stop background goroutines
 }
 
 type groupStats struct {
@@ -82,26 +85,26 @@ func NewBrokerWithPersistence(store storage.Storage, queueCount int, dataDir str
 	if queueCount <= 0 {
 		queueCount = defaultQueueCount
 	}
-	
+
 	// Initialize topic manager
 	tm, err := NewTopicManager(dataDir)
 	if err != nil {
 		logger.Warn("Failed to load topic manager, creating new one", zap.Error(err))
 		tm, _ = NewTopicManager(dataDir) // Create empty one
 	}
-	
+
 	// Initialize binary delay scheduler (CommitLog based)
 	scheduler, err := NewBinaryDelayScheduler(store, tm)
 	if err != nil {
 		logger.Warn("Failed to load delay scheduler, creating new one", zap.Error(err))
 		scheduler, _ = NewBinaryDelayScheduler(store, tm) // Create empty one
 	}
-	
+
 	logger.Info("Broker with persistence initialized",
 		zap.Int("queue_count", queueCount),
 		zap.String("data_dir", dataDir))
-	
-	return &Broker{
+
+	b := &Broker{
 		queues:            make(map[string][]*queue.Queue),
 		store:             store,
 		queueCount:        queueCount,
@@ -116,6 +119,53 @@ func NewBrokerWithPersistence(store storage.Storage, queueCount int, dataDir str
 		delayScheduler:    scheduler,
 		topicManager:      tm,
 		dataDir:           dataDir,
+		processingTimeout: defaultProcessingTimeout,
+		stopChan:          make(chan struct{}),
+	}
+
+	// 初始化已有 topics 的 queues，确保 reclaimLoop 运行
+	b.initializeExistingTopics()
+
+	// 启动处理超时检查
+	go b.checkProcessingTimeouts()
+
+	return b
+}
+
+// initializeExistingTopics 初始化所有已存在的 topics 的 queues
+// 这样可以确保 reclaimLoop 在 broker 启动时就开始运行
+func (b *Broker) initializeExistingTopics() {
+	topics := b.topicManager.ListTopics()
+	if len(topics) == 0 {
+		return
+	}
+
+	logger.Info("Initializing queues for existing topics",
+		zap.Int("topic_count", len(topics)))
+
+	b.lock.Lock()
+	defer b.lock.Unlock()
+
+	for _, topicConfig := range topics {
+		// 根据 topic 配置的 queue_count 创建 queues
+		queueCount := topicConfig.QueueCount
+		if queueCount <= 0 {
+			queueCount = b.queueCount
+		}
+
+		qs := make([]*queue.Queue, queueCount)
+		for i := 0; i < queueCount; i++ {
+			if b.store != nil {
+				qs[i] = queue.NewQueueWithStorage(b.store, topicConfig.Name, i)
+			} else {
+				qs[i] = queue.NewQueue()
+			}
+		}
+		b.queues[topicConfig.Name] = qs
+
+		logger.Debug("Initialized queues for topic",
+			zap.String("topic", topicConfig.Name),
+			zap.Int("queue_count", queueCount))
 	}
 }
 
@@ -127,8 +177,17 @@ func (b *Broker) getQueues(topic string) []*queue.Queue {
 	if qs, ok := b.queues[topic]; ok {
 		return qs
 	}
-	qs := make([]*queue.Queue, b.queueCount)
-	for i := 0; i < b.queueCount; i++ {
+
+	// Get queue count from topic config, fallback to broker default
+	queueCount := b.queueCount
+	if topicConfig, err := b.topicManager.GetTopicConfig(topic); err == nil {
+		if topicConfig.QueueCount > 0 {
+			queueCount = topicConfig.QueueCount
+		}
+	}
+
+	qs := make([]*queue.Queue, queueCount)
+	for i := 0; i < queueCount; i++ {
 		if b.store != nil {
 			qs[i] = queue.NewQueueWithStorage(b.store, topic, i)
 		} else {
@@ -162,13 +221,13 @@ func (b *Broker) EnqueueWithDelay(topic string, body string, tag string, delay t
 	if tag == "" {
 		return queue.Message{}
 	}
-	
+
 	b.lock.Lock()
 	qs := b.getQueues(topic)
 	idx := b.rrEnq[topic] % len(qs)
 	b.rrEnq[topic] = (idx + 1) % len(qs)
 	b.lock.Unlock()
-	
+
 	// Generate message ID and metadata
 	uid, _ := uuid.NewV7()
 	msg := queue.Message{
@@ -177,7 +236,7 @@ func (b *Broker) EnqueueWithDelay(topic string, body string, tag string, delay t
 		Tag:       tag,
 		Timestamp: time.Now(),
 	}
-	
+
 	// Schedule for delayed delivery
 	b.delayScheduler.ScheduleWithDelay(topic, idx, storage.Message{
 		ID:        msg.ID,
@@ -186,7 +245,7 @@ func (b *Broker) EnqueueWithDelay(topic string, body string, tag string, delay t
 		Retry:     0,
 		Timestamp: msg.Timestamp,
 	}, delay)
-	
+
 	return msg
 }
 
@@ -223,37 +282,7 @@ func (b *Broker) DequeueTag(topic string, tag string) queue.Message {
 	b.lock.Unlock()
 	return msg
 }
-
-// Ack routes to the inflight queue based on msgID.
-func (b *Broker) Ack(topic string, id string) bool {
-	b.lock.Lock()
-	idx, ok := b.inflight[id]
-	qs := b.getQueues(topic)
-	if ok {
-		delete(b.inflight, id)
-	}
-	b.lock.Unlock()
-	if !ok || idx < 0 || idx >= len(qs) {
-		return false
-	}
-	return qs[idx].Ack(id)
-}
-
-// Nack routes to the inflight queue based on msgID.
-func (b *Broker) Nack(topic string, id string) bool {
-	b.lock.Lock()
-	idx, ok := b.inflight[id]
-	qs := b.getQueues(topic)
-	if ok {
-		delete(b.inflight, id)
-	}
-	b.lock.Unlock()
-	if !ok || idx < 0 || idx >= len(qs) {
-		return false
-	}
-	return qs[idx].Nack(id)
-}
-
+ 
 // GetQueue returns the first queue for backward compatibility.
 func (b *Broker) GetQueue(topic string) *queue.Queue {
 	b.lock.Lock()
@@ -315,12 +344,12 @@ func (b *Broker) ConsumeWithLock(group, topic string, queueID int, tag string, m
 	if maxMessages <= 0 {
 		maxMessages = 1
 	}
-	
+
 	// 获取该group/topic/queue的专属锁
 	consumeLock := b.getConsumeLock(group, topic, queueID)
 	consumeLock.Lock()
 	defer consumeLock.Unlock()
-	
+
 	// 获取当前offset
 	offset, ok, err := b.GetOffset(group, topic, queueID)
 	if err != nil {
@@ -329,23 +358,23 @@ func (b *Broker) ConsumeWithLock(group, topic string, queueID int, tag string, m
 	if !ok {
 		offset = 0
 	}
-	
+
 	// 从consumequeue读取消息
 	msgs, nextOffset, err := b.ReadFromConsumeQueue(topic, queueID, offset, maxMessages, tag)
 	if err != nil {
 		return nil, offset, offset, err
 	}
-	
+
 	if len(msgs) == 0 {
 		return nil, offset, offset, nil
 	}
-	
+
 	// 立即提交nextOffset，防止其他consumer读取相同消息
 	// 如果消费失败，通过重试机制处理，不回退offset
 	if err := b.CommitOffset(group, topic, queueID, nextOffset); err != nil {
 		return nil, offset, offset, err
 	}
-	
+
 	return msgs, offset, nextOffset, nil
 }
 
@@ -508,6 +537,7 @@ func (b *Broker) clearRetryCount(msgID string) {
 
 // Close gracefully stops the broker and its components
 func (b *Broker) Close() error {
+	close(b.stopChan) // 停止超时检查
 	if b.delayScheduler != nil {
 		b.delayScheduler.Stop()
 	}
@@ -517,4 +547,39 @@ func (b *Broker) Close() error {
 // GetDelayScheduler returns the delay scheduler for direct access
 func (b *Broker) GetDelayScheduler() *BinaryDelayScheduler {
 	return b.delayScheduler
+}
+
+// checkProcessingTimeouts 定期检查超时的处理中消息并自动重试
+func (b *Broker) checkProcessingTimeouts() {
+	ticker := time.NewTicker(5 * time.Second) // 每 5 秒检查一次
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-b.stopChan:
+			return
+		case <-ticker.C:
+			b.lock.Lock()
+			now := time.Now()
+			var timeoutMsgIDs []string
+
+			// 查找超时的消息
+			for msgID, entry := range b.processing {
+				if entry.State == stateProcessing && now.Sub(entry.UpdatedAt) > b.processingTimeout {
+					timeoutMsgIDs = append(timeoutMsgIDs, msgID)
+					logger.Warn("Message processing timeout",
+						zap.String("message_id", msgID),
+						zap.String("group", entry.Group),
+						zap.String("topic", entry.Topic),
+						zap.Duration("elapsed", now.Sub(entry.UpdatedAt)))
+				}
+			}
+			b.lock.Unlock()
+
+			// 对超时的消息执行重试
+			for _, msgID := range timeoutMsgIDs {
+				b.RetryProcessing(msgID)
+			}
+		}
+	}
 }

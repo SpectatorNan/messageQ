@@ -10,7 +10,4 @@ type Message struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-type InflightMsg struct {
-	Msg      Message
-	Deadline time.Time
-}
+// InflightMsg is deprecated - inflight tracking is now handled at broker level

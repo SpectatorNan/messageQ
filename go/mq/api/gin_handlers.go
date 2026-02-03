@@ -65,9 +65,19 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 		 
 		if isDelayTopic {
 			hasDelay := payload.DelayMs > 0 || payload.DelaySec > 0
+			
+			// Validate delay parameters
+			if payload.DelayMs > 0 && payload.DelaySec > 0 {
+				// Can't specify both
+				FailGin(c, ErrInvalidDelay)
+				return
+			}
+			
 			if !hasDelay {
+				// Use default delay of 1 second for delay topic
 				payload.DelaySec = 1 
 			}
+			
 			var delay time.Duration
 			if payload.DelayMs > 0 {
 				if payload.DelayMs < 0 || payload.DelayMs > 86400000*30 { // max 30 days
