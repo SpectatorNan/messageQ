@@ -1,15 +1,21 @@
 package api
 
 var (
-	ErrMissingTopic      = NewRespErr(ErrCodeMissingTopic, "missing topic")
-	ErrInvalidMessage    = NewRespErr(ErrCodeInvalidMsg, "invalid message format")
-	ErrInvalidID         = NewRespErr(ErrCodeInvalidID, "invalid message id")
+	ErrMissingTopic      = NewRespErr(ErrCodeMissingTopic, "missing topic parameter")
+	ErrInvalidMessage    = NewRespErr(ErrCodeInvalidMsg, "invalid message format or empty body")
+	ErrInvalidID         = NewRespErr(ErrCodeInvalidID, "invalid message id format")
 	ErrNotFound          = NewRespErr(ErrCodeNotFound, "message not found or already acked/nacked")
-	ErrInvalidGroup      = NewRespErr(ErrCodeInvalidGroup, "invalid consumer group")
-	ErrInvalidOffset     = NewRespErr(ErrCodeInvalidOffset, "invalid offset")
+	ErrInvalidGroup      = NewRespErr(ErrCodeInvalidGroup, "invalid or missing consumer group")
+	ErrInvalidOffset     = NewRespErr(ErrCodeInvalidOffset, "invalid offset value")
 	ErrOffsetUnsupported = NewRespErr(ErrCodeOffsetUnsupported, "offset store not supported")
-	ErrMissingTag        = NewRespErr(ErrCodeMissingTag, "missing tag")
-	ErrBusy              = NewRespErr(ErrCodeBusy, "message in processing")
+	ErrMissingTag        = NewRespErr(ErrCodeMissingTag, "missing tag parameter")
+	ErrBusy              = NewRespErr(ErrCodeBusy, "message is currently being processed")
+	ErrInvalidDelay      = NewRespErr(ErrCodeInvalidDelay, "invalid delay parameter")
+	ErrInvalidTopicType  = NewRespErr(ErrCodeInvalidTopicType, "invalid topic type, must be NORMAL or DELAY")
+	ErrTopicExists       = NewRespErr(ErrCodeTopicExists, "topic already exists")
+	ErrInvalidQueueID    = NewRespErr(ErrCodeInvalidQueueID, "invalid queue_id parameter")
+	ErrTopicNotFound     = NewRespErr(ErrCodeTopicNotFound, "topic not found")
+	ErrInvalidTopicName  = NewRespErr(ErrCodeInvalidTopicName, "invalid topic name")
 )
 
 // Optionally define error codes for API responses
@@ -23,6 +29,12 @@ const (
 	ErrCodeOffsetUnsupported = "offset_unsupported"
 	ErrCodeMissingTag        = "missing_tag"
 	ErrCodeBusy              = "busy"
+	ErrCodeInvalidDelay      = "invalid_delay"
+	ErrCodeInvalidTopicType  = "invalid_topic_type"
+	ErrCodeTopicExists       = "topic_exists"
+	ErrCodeInvalidQueueID    = "invalid_queue_id"
+	ErrCodeTopicNotFound     = "topic_not_found"
+	ErrCodeInvalidTopicName  = "invalid_topic_name"
 )
 
 // RespErr is an error that carries an API error code and message and implements error

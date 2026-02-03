@@ -10,14 +10,13 @@ import (
 
 func TestDelayInspect(t *testing.T) {
 	dataDir := "testdata/delay_inspect"
+	os.RemoveAll(dataDir) // 清理旧数据
 	defer os.RemoveAll(dataDir)
 
 	// Create broker and schedule some delay messages
 	store := storage.NewWALStorage(dataDir, 10*time.Millisecond)
-	defer store.Close()
 	
 	b := broker.NewBrokerWithStorage(store, 4)
-	defer b.Close()
 
 	// Schedule messages with different delays
 	msg1 := b.EnqueueWithDelay("orders", "Order #1001: iPhone 15 Pro", "electronics", 5*time.Second)
@@ -31,7 +30,7 @@ func TestDelayInspect(t *testing.T) {
 	// Wait a bit to ensure persistence (scheduler ticks and persists)
 	time.Sleep(1 * time.Second)
 	
-	// Close broker to trigger final persistence
+	// Close broker first, then storage
 	b.Close()
 	store.Close()
 

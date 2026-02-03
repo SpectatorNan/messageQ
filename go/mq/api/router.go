@@ -10,25 +10,34 @@ import (
 func NewRouter(b *broker.Broker) *gin.Engine {
 	r := gin.Default()
 
-	// Topic management
-	r.POST("/topics", CreateTopicHandler(b))
-	r.GET("/topics", ListTopicsHandler(b))
-	r.GET("/topics/:topic", GetTopicHandler(b))
-	r.DELETE("/topics/:topic", DeleteTopicHandler(b))
+	// API version 1
+	v1 := r.Group("/api/v1")
+	{
+		// Topic management
+		v1.POST("/topics", CreateTopicHandler(b))
+		v1.GET("/topics", ListTopicsHandler(b))
+		v1.GET("/topics/:topic", GetTopicHandler(b))
+		v1.DELETE("/topics/:topic", DeleteTopicHandler(b))
 
-	// Message production/consumption
-	r.POST("/topics/:topic/messages", ProduceHandler(b))
-	r.POST("/topics/:topic/messages/delay", ProduceDelayedHandler(b))
-	r.GET("/topics/:topic/messages", ConsumeHandler(b))
-	r.POST("/topics/:topic/messages/:id/ack", AckHandler(b))
-	r.POST("/topics/:topic/messages/:id/nack", NackHandler(b))
+		// Message production
+		v1.POST("/topics/:topic/messages", ProduceHandler(b))
+		v1.POST("/topics/:topic/delayed-messages", ProduceDelayedHandler(b))
 
-	// Consumer group offsets
-	r.GET("/topics/:topic/offsets/:group", GetOffsetHandler(b))
-	r.POST("/topics/:topic/offsets/:group", CommitOffsetHandler(b))
+		// Message consumption (consumer-centric)
+		consumers := v1.Group("/consumers/:group")
+		{
+			consumers.GET("/topics/:topic/messages", ConsumeHandler(b))
+			consumers.GET("/topics/:topic/offsets", GetOffsetHandler(b))
+			consumers.POST("/topics/:topic/offsets", CommitOffsetHandler(b))
+		}
 
-	// Stats
-	r.GET("/stats", DelayStatsHandler(b))
+		// Message acknowledgment (message-centric)
+		v1.POST("/messages/:id/ack", AckHandler(b))
+		v1.POST("/messages/:id/nack", NackHandler(b))
+
+		// Monitoring
+		v1.GET("/stats", DelayStatsHandler(b))
+	}
 
 	return r
 }
