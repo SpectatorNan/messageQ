@@ -11,6 +11,7 @@ import (
 	"messageQ/mq/broker"
 	"messageQ/mq/logger"
 	"messageQ/mq/queue"
+	"messageQ/mq/storage"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -169,25 +170,43 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			return
 		}
 
-		queueID := 0
+		tag := c.Query("tag")
+		
+		// 如果指定了 queue_id，直接使用
+		var msgs []storage.Message
+		var offset, next int64
+		var err error
+		var queueID int
+		
 		if q := c.Query("queue_id"); q != "" {
-			v, err := strconv.Atoi(q)
-			if err != nil || v < 0 {
+			v, parseErr := strconv.Atoi(q)
+			if parseErr != nil || v < 0 {
 				FailGin(c, ErrInvalidQueueID)
 				return
 			}
 			queueID = v
+			// 使用指定的 queue_id
+			msgs, offset, next, err = b.ConsumeWithLock(group, topic, queueID, tag, 1)
+			if err != nil {
+				logger.Error("Consume error", zap.String("group", group), zap.String("topic", topic), zap.Error(err))
+				FailGin(c, ErrOffsetUnsupported)
+				return
+			}
+		} else {
+			// 没有指定 queue_id，轮询所有队列
+			queueCount := b.GetQueueCount(topic)
+			for i := 0; i < queueCount; i++ {
+				msgs, offset, next, err = b.ConsumeWithLock(group, topic, i, tag, 1)
+				if err != nil {
+					continue // 跳过出错的队列
+				}
+				if len(msgs) > 0 {
+					queueID = i
+					break // 找到消息，退出循环
+				}
+			}
 		}
-
-		tag := c.Query("tag")
-
-		// 使用线程安全的消费方法，防止多consumer重复消费
-		msgs, offset, next, err := b.ConsumeWithLock(group, topic, queueID, tag, 1)
-		if err != nil {
-			logger.Error("Consume error", zap.String("group", group), zap.String("topic", topic), zap.Error(err))
-			FailGin(c, ErrOffsetUnsupported)
-			return
-		}
+		
 		if len(msgs) == 0 {
 			logger.Debug("No messages available", zap.String("group", group), zap.String("topic", topic))
 			FailGin(c, ErrNotFound)

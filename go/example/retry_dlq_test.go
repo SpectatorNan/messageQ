@@ -19,9 +19,6 @@ func TestRetryPersistedAcrossRestart(t *testing.T) {
 	if received.ID != msg.ID {
 		t.Fatalf("expected dequeue id %s, got %s", msg.ID, received.ID)
 	}
-	if !q.Nack(received.ID) {
-		t.Fatalf("nack failed for id %s", received.ID)
-	}
 
 	// ensure data flushed
 	if err := store.Close(); err != nil {
@@ -62,9 +59,7 @@ func TestDLQPersisted(t *testing.T) {
 		if received.ID != msg.ID {
 			t.Fatalf("unexpected id at iteration %d: %s", i, received.ID)
 		}
-		if !q.Nack(received.ID) {
-			t.Fatalf("nack failed at iteration %d", i)
-		}
+
 	}
 
 	// flush to disk

@@ -198,6 +198,14 @@ func (b *Broker) getQueues(topic string) []*queue.Queue {
 	return qs
 }
 
+// GetQueueCount returns the number of queues for a topic
+func (b *Broker) GetQueueCount(topic string) int {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	qs := b.getQueues(topic)
+	return len(qs)
+}
+
 // Enqueue routes to a queue using round-robin and returns the message.
 func (b *Broker) Enqueue(topic string, body string, tag string) queue.Message {
 	if tag == "" {
