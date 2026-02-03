@@ -6,8 +6,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"strings"
 	"testing"
 	"time"
 
@@ -15,24 +13,6 @@ import (
 	"messageQ/mq/broker"
 	"messageQ/mq/storage"
 )
-
-var debugCleanup = false
-
-// Global switch controlled by environment variable MSGQ_CLEAN_TESTDATA.
-// If unset, default is true (testdata will be removed before/after the test).
-// To keep the testdata for inspection set MSGQ_CLEAN_TESTDATA=false in your environment.
-var cleanTestData = func() bool {
-	v := os.Getenv("MSGQ_CLEAN_TESTDATA")
-	if v == "" {
-		return debugCleanup
-	}
-	switch strings.ToLower(v) {
-	case "0", "false", "no", "off":
-		return false
-	default:
-		return true
-	}
-}()
 
 func TestProduceConsumeAckNack_PersistentWAL(t *testing.T) {
 	// use helper to determine data directory

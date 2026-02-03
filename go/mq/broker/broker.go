@@ -51,7 +51,7 @@ type Broker struct {
 	retryCounts       map[string]int             // msgID -> retry count (in-memory)
 	maxRetry          int
 	consumeOffsetLock map[string]*sync.Mutex          // "group:topic:queueID" -> lock for concurrent consume
-	delayScheduler    *PersistentDelayScheduler       // persistent delay scheduler
+	delayScheduler    *BinaryDelayScheduler           // binary delay scheduler (CommitLog based)
 	topicManager      *TopicManager                   // topic metadata manager
 	dataDir           string                          // data directory for persistence
 }
@@ -87,11 +87,11 @@ func NewBrokerWithPersistence(store storage.Storage, queueCount int, dataDir str
 		tm, _ = NewTopicManager(dataDir) // Create empty one
 	}
 	
-	// Initialize persistent delay scheduler
-	scheduler, err := NewPersistentDelayScheduler(store, dataDir, tm)
+	// Initialize binary delay scheduler (CommitLog based)
+	scheduler, err := NewBinaryDelayScheduler(store, tm)
 	if err != nil {
 		fmt.Printf("Warning: failed to load delay scheduler: %v\n", err)
-		scheduler, _ = NewPersistentDelayScheduler(store, dataDir, tm) // Create empty one
+		scheduler, _ = NewBinaryDelayScheduler(store, tm) // Create empty one
 	}
 	
 	return &Broker{
@@ -508,6 +508,6 @@ func (b *Broker) Close() error {
 }
 
 // GetDelayScheduler returns the delay scheduler for direct access
-func (b *Broker) GetDelayScheduler() *PersistentDelayScheduler {
+func (b *Broker) GetDelayScheduler() *BinaryDelayScheduler {
 	return b.delayScheduler
 }

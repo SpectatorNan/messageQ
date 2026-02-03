@@ -3,9 +3,26 @@ package example
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+const debugCleanup = false
+
+// cleanTestData is controlled by environment variable
+var cleanTestData = func() bool {
+	v := os.Getenv("MSGQ_CLEAN_TESTDATA")
+	if v == "" {
+		return debugCleanup
+	}
+	switch strings.ToLower(v) {
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
+}()
 
 // getTestDataDir returns a test data directory. When cleanTestData is true, a temp dir is used.
 // When false, a unique directory under ./testdata is created and preserved for inspection.
