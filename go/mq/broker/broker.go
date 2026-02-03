@@ -6,8 +6,11 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/google/uuid"
 
+	"messageQ/mq/logger"
 	"messageQ/mq/queue"
 	"messageQ/mq/storage"
 )
@@ -83,16 +86,20 @@ func NewBrokerWithPersistence(store storage.Storage, queueCount int, dataDir str
 	// Initialize topic manager
 	tm, err := NewTopicManager(dataDir)
 	if err != nil {
-		fmt.Printf("Warning: failed to load topic manager: %v\n", err)
+		logger.Warn("Failed to load topic manager, creating new one", zap.Error(err))
 		tm, _ = NewTopicManager(dataDir) // Create empty one
 	}
 	
 	// Initialize binary delay scheduler (CommitLog based)
 	scheduler, err := NewBinaryDelayScheduler(store, tm)
 	if err != nil {
-		fmt.Printf("Warning: failed to load delay scheduler: %v\n", err)
+		logger.Warn("Failed to load delay scheduler, creating new one", zap.Error(err))
 		scheduler, _ = NewBinaryDelayScheduler(store, tm) // Create empty one
 	}
+	
+	logger.Info("Broker with persistence initialized",
+		zap.Int("queue_count", queueCount),
+		zap.String("data_dir", dataDir))
 	
 	return &Broker{
 		queues:            make(map[string][]*queue.Queue),

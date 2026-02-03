@@ -3,23 +3,40 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"go.uber.org/zap"
+
 	"messageQ/mq/api"
 	"messageQ/mq/broker"
+	"messageQ/mq/logger"
 	"messageQ/mq/storage"
 )
 
 func main() {
+	// Initialize logger
+	if err := logger.InitDefault(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer logger.Sync()
+
+	logger.Info("Starting MessageQ server")
+
 	// enable WAL-based persistence under ./data
 	store := storage.NewWALStorage("./data")
-	defer func() { _ = store.Close() }()
+	defer func() {
+		if err := store.Close(); err != nil {
+			logger.Error("Failed to close storage", zap.Error(err))
+		}
+	}()
+	
 	b := broker.NewBrokerWithStorage(store, 4)
+	logger.Info("Broker initialized", zap.Int("queue_count", 4))
 
 	r := api.NewRouter(b)
 	srv := &http.Server{
@@ -29,9 +46,9 @@ func main() {
 
 	// start server
 	go func() {
-		fmt.Println("MQ listening on :8080 (gin + WAL)")
+		logger.Info("HTTP server listening", zap.String("addr", ":8080"))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server failed: %v", err)
+			logger.Fatal("Server failed to start", zap.Error(err))
 		}
 	}()
 
@@ -39,18 +56,18 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	fmt.Println("shutting down server...")
+	logger.Info("Shutdown signal received, shutting down gracefully...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("server shutdown error: %v", err)
+		logger.Error("Server shutdown error", zap.Error(err))
 	}
 
 	// ensure WAL is closed (Flush + background goroutines stopped)
 	if err := store.Close(); err != nil {
-		log.Printf("wal close error: %v", err)
+		logger.Error("WAL close error", zap.Error(err))
 	}
 
-	fmt.Println("server stopped")
+	logger.Info("Server gracefully stopped")
 }

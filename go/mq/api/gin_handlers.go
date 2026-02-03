@@ -5,7 +5,10 @@ import (
 	"strconv"
 	"strings"
 
+	"go.uber.org/zap"
+
 	"messageQ/mq/broker"
+	"messageQ/mq/logger"
 	"messageQ/mq/queue"
 
 	"github.com/gin-gonic/gin"
@@ -24,6 +27,7 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 		
 		// Validate topic name
 		if err := validateTopicName(topic); err != nil {
+			logger.Warn("Invalid topic name", zap.String("topic", topic))
 			FailGin(c, err)
 			return
 		}
@@ -34,6 +38,7 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 		}
 		
 		if err := c.ShouldBindJSON(&payload); err != nil {
+			logger.Warn("Invalid message payload", zap.Error(err))
 			FailGin(c, ErrInvalidMessage)
 			return
 		}
@@ -45,6 +50,10 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 		}
 
 		msg := b.Enqueue(topic, payload.Body, payload.Tag)
+		logger.Info("Message produced",
+			zap.String("topic", topic),
+			zap.String("message_id", msg.ID),
+			zap.String("tag", payload.Tag))
 		
 		resp := ProduceResponse{
 			ID:        msg.ID,
@@ -101,10 +110,12 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 		// 使用线程安全的消费方法，防止多consumer重复消费
 		msgs, offset, next, err := b.ConsumeWithLock(group, topic, queueID, tag, 1)
 		if err != nil {
+			logger.Error("Consume error", zap.String("group", group), zap.String("topic", topic), zap.Error(err))
 			FailGin(c, ErrOffsetUnsupported)
 			return
 		}
 		if len(msgs) == 0 {
+			logger.Debug("No messages available", zap.String("group", group), zap.String("topic", topic))
 			FailGin(c, ErrNotFound)
 			return
 		}
@@ -117,6 +128,13 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			Retry:     msg.Retry,
 			Timestamp: msg.Timestamp,
 		})
+		
+		logger.Info("Message consumed",
+			zap.String("group", group),
+			zap.String("topic", topic),
+			zap.String("message_id", msg.ID),
+			zap.Int("queue_id", queueID),
+			zap.Int64("offset", offset))
 		
 		resp := ConsumeResponse{
 			Message:    msg,
@@ -142,14 +160,18 @@ func AckHandler(b *broker.Broker) gin.HandlerFunc {
 		
 		// Validate UUID format
 		if _, err := uuid.Parse(id); err != nil {
+			logger.Warn("Invalid message ID format", zap.String("message_id", id), zap.Error(err))
 			FailGin(c, ErrInvalidID)
 			return
 		}
 		
 		if !b.CompleteProcessing(id) {
+			logger.Error("Ack failed - message not found", zap.String("message_id", id))
 			FailGin(c, ErrNotFound)
 			return
 		}
+		
+		logger.Info("Message acknowledged", zap.String("message_id", id))
 		
 		resp := AckResponse{
 			MessageID: id,
@@ -171,14 +193,18 @@ func NackHandler(b *broker.Broker) gin.HandlerFunc {
 		
 		// Validate UUID format
 		if _, err := uuid.Parse(id); err != nil {
+			logger.Warn("Invalid message ID format for nack", zap.String("message_id", id), zap.Error(err))
 			FailGin(c, ErrInvalidID)
 			return
 		}
 		
 		if !b.RetryProcessing(id) {
+			logger.Error("Nack failed - message not found", zap.String("message_id", id))
 			FailGin(c, ErrNotFound)
 			return
 		}
+		
+		logger.Info("Message nacked for retry", zap.String("message_id", id))
 		
 		resp := NackResponse{
 			MessageID: id,

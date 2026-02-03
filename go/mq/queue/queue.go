@@ -1,12 +1,14 @@
 package queue
 
 import (
-	"log"
 	"sync"
 	"time"
 
+	"go.uber.org/zap"
+
 	"github.com/google/uuid"
 
+	"messageQ/mq/logger"
 	"messageQ/mq/storage"
 )
 
@@ -52,7 +54,10 @@ func NewQueueWithStorage(store storage.Storage, topic string, queueID int) *Queu
 	if store != nil {
 		msgs, err := store.Load(topic, queueID)
 		if err != nil {
-			log.Println("storage load error:", err)
+			logger.Error("Failed to load messages from storage",
+				zap.String("topic", topic),
+				zap.Int("queue_id", queueID),
+				zap.Error(err))
 		} else {
 			// convert storage.Message to queue.Message
 			for _, sm := range msgs {
@@ -93,7 +98,9 @@ func (q *Queue) Enqueue(body string, tag string) Message {
 	defer q.mu.Unlock()
 
 	if tag == "" {
-		log.Println("enqueue rejected: empty tag")
+		logger.Warn("Enqueue rejected: empty tag",
+			zap.String("topic", q.topic),
+			zap.Int("queue_id", q.queueID))
 		return Message{}
 	}
 
@@ -227,7 +234,10 @@ func (q *Queue) Nack(id string) bool {
 	im.Msg.Retry++
 	if im.Msg.Retry > q.maxRetry {
 		q.persistDLQ(im.Msg)
-		log.Println("DLQ:", im.Msg.ID)
+		logger.Warn("Message moved to DLQ after nack",
+			zap.String("message_id", im.Msg.ID),
+			zap.String("topic", q.topic),
+			zap.Int("retry_count", im.Msg.Retry))
 		return true
 	}
 
@@ -252,7 +262,10 @@ func (q *Queue) reclaimLoop() {
 					q.cond.Signal()
 				} else {
 					q.persistDLQ(im.Msg)
-					log.Println("DLQ timeout:", id)
+					logger.Warn("Message moved to DLQ due to timeout",
+						zap.String("message_id", id),
+						zap.String("topic", q.topic),
+						zap.Int("retry_count", im.Msg.Retry))
 				}
 			}
 		}
@@ -272,7 +285,11 @@ func (q *Queue) persistRetry(msg Message) {
 		Timestamp: msg.Timestamp,
 	}
 	if err := q.store.Append(q.topic, q.queueID, sm); err != nil {
-		log.Println("storage retry append error:", err)
+		logger.Error("Failed to persist retry message",
+			zap.String("topic", q.topic),
+			zap.Int("queue_id", q.queueID),
+			zap.String("message_id", msg.ID),
+			zap.Error(err))
 	}
 }
 
@@ -289,14 +306,22 @@ func (q *Queue) persistDLQ(msg Message) {
 		Timestamp: msg.Timestamp,
 	}
 	if err := q.store.Append(topicDLQ, 0, sm); err != nil {
-		log.Println("storage dlq append error:", err)
+		logger.Error("Failed to append message to DLQ",
+			zap.String("topic", q.topic),
+			zap.String("dlq_topic", topicDLQ),
+			zap.String("message_id", msg.ID),
+			zap.Error(err))
 	}
 	if f, ok := q.store.(interface{ FlushTopic(string, int) error }); ok {
 		_ = f.FlushTopic(topicDLQ, 0)
 	}
 	// mark as acked in active topic so replay won't restore it
 	if err := q.store.Ack(q.topic, q.queueID, msg.ID); err != nil {
-		log.Println("storage dlq ack error:", err)
+		logger.Error("Failed to ack message in DLQ processing",
+			zap.String("topic", q.topic),
+			zap.Int("queue_id", q.queueID),
+			zap.String("message_id", msg.ID),
+			zap.Error(err))
 	}
 	if f, ok := q.store.(interface{ FlushTopic(string, int) error }); ok {
 		_ = f.FlushTopic(q.topic, q.queueID)

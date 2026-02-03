@@ -1,6 +1,6 @@
 # MessageQ (Go)
 
-Minimal MQ with per-topic WAL segments, retry, and DLQ.
+Minimal MQ with per-topic WAL segments, retry, DLQ, and structured logging.
 
 ## Quick Run
 
@@ -11,17 +11,58 @@ go run .
 
 Default server: `http://localhost:8080`
 
+## Features
+
+- ✅ **RESTful API** with versioned endpoints (`/api/v1`)
+- ✅ **WAL-based persistence** (RocketMQ-style CommitLog)
+- ✅ **Retry & DLQ** (Dead Letter Queue)
+- ✅ **Consumer groups** with offset management
+- ✅ **Delayed messages** with persistent binary scheduler
+- ✅ **Tag filtering** for selective consumption
+- ✅ **Structured logging** with zap (JSON/console formats)
+- ✅ **Graceful shutdown** with proper resource cleanup
+
 ## API
 
-- Produce: `POST /topics/:topic/messages` JSON body `{"body":"...","tag":"..."}`
-- Consume (stateful): `GET /topics/:topic/messages?group=...&queue_id=0&tag=...`
-- Ack (processing -> completed): `POST /topics/:topic/messages/:id/ack`
-- Nack (processing -> retry): `POST /topics/:topic/messages/:id/nack`
-- Get offset: `GET /topics/:topic/offsets/:group?queue_id=0`
-- Commit offset: `POST /topics/:topic/offsets/:group` JSON body `{"queue_id":0,"offset":123}`
-- Stats: `GET /stats`
+See [API documentation](mq/api/ROUTE_OPTIMIZATION.md) for complete endpoint reference.
 
-Message IDs are UUIDv7 strings.
+**Quick reference:**
+- Produce: `POST /api/v1/topics/:topic/messages`
+- Consume: `GET /api/v1/consumers/:group/topics/:topic/messages`
+- Ack: `POST /api/v1/messages/:id/ack`
+- Nack: `POST /api/v1/messages/:id/nack`
+- Delayed: `POST /api/v1/topics/:topic/delayed-messages`
+- Stats: `GET /api/v1/stats`
+
+## Logging
+
+MessageQ uses [zap](https://github.com/uber-go/zap) for structured, high-performance logging.
+
+See [LOGGING.md](LOGGING.md) for detailed documentation.
+
+**Quick configuration:**
+
+```go
+// Default: INFO level, console format
+logger.InitDefault()
+
+// Custom configuration
+cfg := logger.Config{
+    Level:      logger.DebugLevel,
+    OutputPath: "stdout",  // or file path
+    Format:     "json",    // or "console"
+}
+logger.Init(cfg)
+```
+
+**Example logs:**
+
+```
+2026-02-03T17:38:00.123+0800    INFO    Starting MessageQ server
+2026-02-03T17:38:05.234+0800    INFO    Message produced    topic=orders message_id=550e8400... tag=create
+2026-02-03T17:38:05.345+0800    INFO    Message consumed    group=consumers topic=orders message_id=550e8400... queue_id=2
+2026-02-03T17:38:10.123+0800    WARN    Message moved to DLQ - max retries exceeded    message_id=550e8400... topic=orders retry_count=3
+```
 
 ## Storage Layout (RocketMQ-style)
 
