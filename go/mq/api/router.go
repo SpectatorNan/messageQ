@@ -10,18 +10,24 @@ import (
 func NewRouter(b *broker.Broker) *gin.Engine {
 	r := gin.Default()
 
-	// RESTful routes
+	// Topic management
+	r.POST("/topics", CreateTopicHandler(b))
+	r.GET("/topics", ListTopicsHandler(b))
+	r.GET("/topics/:topic", GetTopicHandler(b))
+	r.DELETE("/topics/:topic", DeleteTopicHandler(b))
+
+	// Message production/consumption
 	r.POST("/topics/:topic/messages", ProduceHandler(b))
 	r.POST("/topics/:topic/messages/delay", ProduceDelayedHandler(b))
 	r.GET("/topics/:topic/messages", ConsumeHandler(b))
 	r.POST("/topics/:topic/messages/:id/ack", AckHandler(b))
 	r.POST("/topics/:topic/messages/:id/nack", NackHandler(b))
 
-	// consumer group offsets
+	// Consumer group offsets
 	r.GET("/topics/:topic/offsets/:group", GetOffsetHandler(b))
 	r.POST("/topics/:topic/offsets/:group", CommitOffsetHandler(b))
 
-	// stats
+	// Stats
 	r.GET("/stats", DelayStatsHandler(b))
 
 	return r

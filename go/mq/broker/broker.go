@@ -50,8 +50,10 @@ type Broker struct {
 	stats             map[string]*groupStats     // group -> stats
 	retryCounts       map[string]int             // msgID -> retry count (in-memory)
 	maxRetry          int
-	consumeOffsetLock map[string]*sync.Mutex // "group:topic:queueID" -> lock for concurrent consume
-	delayScheduler    *DelayScheduler        // delay message and retry scheduler
+	consumeOffsetLock map[string]*sync.Mutex          // "group:topic:queueID" -> lock for concurrent consume
+	delayScheduler    *PersistentDelayScheduler       // persistent delay scheduler
+	topicManager      *TopicManager                   // topic metadata manager
+	dataDir           string                          // data directory for persistence
 }
 
 type groupStats struct {
@@ -68,8 +70,30 @@ func NewBrokerWithStorage(store storage.Storage, queueCount int) *Broker {
 	if queueCount <= 0 {
 		queueCount = defaultQueueCount
 	}
-	scheduler := NewDelayScheduler(store)
-	scheduler.Start()
+	// Use default data directory
+	return NewBrokerWithPersistence(store, queueCount, "data")
+}
+
+// NewBrokerWithPersistence creates a broker with persistent delay scheduler
+func NewBrokerWithPersistence(store storage.Storage, queueCount int, dataDir string) *Broker {
+	if queueCount <= 0 {
+		queueCount = defaultQueueCount
+	}
+	
+	// Initialize topic manager
+	tm, err := NewTopicManager(dataDir)
+	if err != nil {
+		fmt.Printf("Warning: failed to load topic manager: %v\n", err)
+		tm, _ = NewTopicManager(dataDir) // Create empty one
+	}
+	
+	// Initialize persistent delay scheduler
+	scheduler, err := NewPersistentDelayScheduler(store, dataDir, tm)
+	if err != nil {
+		fmt.Printf("Warning: failed to load delay scheduler: %v\n", err)
+		scheduler, _ = NewPersistentDelayScheduler(store, dataDir, tm) // Create empty one
+	}
+	
 	return &Broker{
 		queues:            make(map[string][]*queue.Queue),
 		store:             store,
@@ -83,8 +107,13 @@ func NewBrokerWithStorage(store storage.Storage, queueCount int) *Broker {
 		maxRetry:          defaultMaxRetry,
 		consumeOffsetLock: make(map[string]*sync.Mutex),
 		delayScheduler:    scheduler,
+		topicManager:      tm,
+		dataDir:           dataDir,
 	}
 }
+
+// now returns current time (can be mocked in tests)
+var now = time.Now
 
 // getQueues ensures queues exist for a topic.
 func (b *Broker) getQueues(topic string) []*queue.Queue {
@@ -431,6 +460,33 @@ func (b *Broker) Stats() map[string]groupStats {
 	return out
 }
 
+// Topic Management Methods
+
+// CreateTopic creates a new topic with specified type
+func (b *Broker) CreateTopic(name string, topicType TopicType, queueCount int) error {
+	return b.topicManager.CreateTopic(name, topicType, queueCount)
+}
+
+// GetTopicConfig returns the configuration of a topic
+func (b *Broker) GetTopicConfig(name string) (*TopicConfig, error) {
+	return b.topicManager.GetTopicConfig(name)
+}
+
+// ListTopics returns all topics
+func (b *Broker) ListTopics() []*TopicConfig {
+	return b.topicManager.ListTopics()
+}
+
+// DeleteTopic deletes a topic
+func (b *Broker) DeleteTopic(name string) error {
+	return b.topicManager.DeleteTopic(name)
+}
+
+// IsDelayTopic checks if a topic is configured as a delay topic
+func (b *Broker) IsDelayTopic(name string) bool {
+	return b.topicManager.IsDelayTopic(name)
+}
+
 // GetRetryCount returns current retry count for a message id.
 func (b *Broker) GetRetryCount(msgID string) int {
 	b.lock.Lock()
@@ -452,6 +508,6 @@ func (b *Broker) Close() error {
 }
 
 // GetDelayScheduler returns the delay scheduler for direct access
-func (b *Broker) GetDelayScheduler() *DelayScheduler {
+func (b *Broker) GetDelayScheduler() *PersistentDelayScheduler {
 	return b.delayScheduler
 }
