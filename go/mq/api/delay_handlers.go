@@ -25,6 +25,12 @@ func ProduceDelayedHandler(b *broker.Broker) gin.HandlerFunc {
 			return
 		}
 		
+		// Check if topic exists
+		if _, err := b.GetTopicConfig(topic); err != nil {
+			FailGin(c, ErrTopicNotFound)
+			return
+		}
+		
 		var payload struct {
 			Body      string `json:"body" binding:"required"`
 			Tag       string `json:"tag" binding:"required"`

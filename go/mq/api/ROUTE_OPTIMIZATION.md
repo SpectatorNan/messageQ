@@ -1,7 +1,25 @@
 # API Route Optimization Summary
 
 ## Overview
-The API routes have been refactored to follow RESTful design principles with better organization and versioning.
+The API routes have been refactored to follow RESTful design principles with better organization, versioning, and comprehensive validation.
+
+## Recent Updates
+
+### Topic Existence Validation (2026-02-03)
+Added topic existence validation to all topic-related operations:
+- ✅ **ProduceHandler** - Validates topic exists before producing messages
+- ✅ **ProduceDelayedHandler** - Validates topic exists before producing delayed messages
+- ✅ **ConsumeHandler** - Validates topic exists before consuming messages
+- ✅ **GetOffsetHandler** - Validates topic exists before retrieving offsets
+- ✅ **CommitOffsetHandler** - Validates topic exists before committing offsets
+
+**Behavior**: Returns `404 Not Found` with error code `topic_not_found` when attempting operations on non-existent topics.
+
+**Benefits**:
+- Prevents queue creation for non-existent topics
+- Clear error messages for missing topics
+- Encourages explicit topic creation via `/api/v1/topics` endpoint
+- Consistent error handling across all endpoints
 
 ## Changes
 

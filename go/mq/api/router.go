@@ -19,9 +19,8 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 		v1.GET("/topics/:topic", GetTopicHandler(b))
 		v1.DELETE("/topics/:topic", DeleteTopicHandler(b))
 
-		// Message production
+		// Message production (supports both normal and delayed messages via optional delay_ms/delay_sec parameters)
 		v1.POST("/topics/:topic/messages", ProduceHandler(b))
-		v1.POST("/topics/:topic/delayed-messages", ProduceDelayedHandler(b))
 
 		// Message consumption (consumer-centric)
 		consumers := v1.Group("/consumers/:group")

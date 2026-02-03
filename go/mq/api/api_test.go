@@ -135,7 +135,8 @@ func TestAPIValidation(t *testing.T) {
 		}
 		body, _ := json.Marshal(payload)
 
-		req := httptest.NewRequest("POST", "/api/v1/topics/test-topic/delayed-messages", bytes.NewReader(body))
+		// Use the unified /messages endpoint with delay parameters
+		req := httptest.NewRequest("POST", "/api/v1/topics/test-topic/messages", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 
@@ -168,21 +169,24 @@ func TestAPIValidation(t *testing.T) {
 		}
 		body, _ := json.Marshal(payload)
 
-		req := httptest.NewRequest("POST", "/api/v1/topics/test-topic/delayed-messages", bytes.NewReader(body))
+		// Use the unified /messages endpoint without delay - this should succeed
+		// as a normal message, not fail with invalid_delay
+		req := httptest.NewRequest("POST", "/api/v1/topics/test-topic/messages", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 
 		router.ServeHTTP(w, req)
 
-		if w.Code != http.StatusBadRequest {
-			t.Errorf("Expected 400, got %d", w.Code)
+		// This should succeed as a normal message
+		if w.Code != http.StatusOK {
+			t.Errorf("Expected 200, got %d: %s", w.Code, w.Body.String())
 		}
 
-		var resp api.Resp[string]
+		var resp api.Resp[api.ProduceResponse]
 		json.Unmarshal(w.Body.Bytes(), &resp)
 
-		if resp.Code != api.ErrCodeInvalidDelay {
-			t.Errorf("Expected error code '%s', got %s", api.ErrCodeInvalidDelay, resp.Code)
+		if resp.Code != api.RespCodeOk {
+			t.Errorf("Expected code 'ok', got %s", resp.Code)
 		}
 	})
 

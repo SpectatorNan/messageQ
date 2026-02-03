@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -24,19 +25,29 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrMissingTopic)
 			return
 		}
-		
+
 		// Validate topic name
 		if err := validateTopicName(topic); err != nil {
 			logger.Warn("Invalid topic name", zap.String("topic", topic))
 			FailGin(c, err)
 			return
 		}
-		
-		var payload struct {
-			Body string `json:"body" binding:"required"`
-			Tag  string `json:"tag" binding:"required"`
+
+		// Check if topic exists
+		topicConfig, err := b.GetTopicConfig(topic)
+		if err != nil {
+			logger.Warn("Topic not found", zap.String("topic", topic))
+			FailGin(c, ErrTopicNotFound)
+			return
 		}
-		
+
+		var payload struct {
+			Body     string `json:"body" binding:"required"`
+			Tag      string `json:"tag" binding:"required"`
+			DelayMs  int64  `json:"delay_ms"`  // optional: delay in milliseconds
+			DelaySec int64  `json:"delay_sec"` // optional: delay in seconds
+		}
+
 		if err := c.ShouldBindJSON(&payload); err != nil {
 			logger.Warn("Invalid message payload", zap.Error(err))
 			FailGin(c, ErrInvalidMessage)
@@ -49,12 +60,58 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 			return
 		}
 
+		// Check if this is a delay topic and if delay parameters are provided
+		isDelayTopic := topicConfig.Type == broker.TopicTypeDelay
+		 
+		if isDelayTopic {
+			hasDelay := payload.DelayMs > 0 || payload.DelaySec > 0
+			if !hasDelay {
+				payload.DelaySec = 1 
+			}
+			var delay time.Duration
+			if payload.DelayMs > 0 {
+				if payload.DelayMs < 0 || payload.DelayMs > 86400000*30 { // max 30 days
+					FailGin(c, ErrInvalidDelay)
+					return
+				}
+				delay = time.Duration(payload.DelayMs) * time.Millisecond
+			} else {
+				if payload.DelaySec < 1 || payload.DelaySec > 86400*30 { // max 30 days, min 1 second
+					FailGin(c, ErrInvalidDelay)
+					return
+				}
+				delay = time.Duration(payload.DelaySec) * time.Second
+			}
+
+			// Produce delayed message
+			msg := b.EnqueueWithDelay(topic, payload.Body, payload.Tag, delay)
+			logger.Info("Delayed message produced",
+				zap.String("topic", topic),
+				zap.String("message_id", msg.ID),
+				zap.String("tag", payload.Tag),
+				zap.Duration("delay", delay))
+
+			resp := ProduceDelayResponse{
+				ID:           msg.ID,
+				Topic:        topic,
+				Tag:          msg.Tag,
+				ScheduledAt:  msg.Timestamp,
+				ExecuteAt:    msg.Timestamp.Add(delay),
+				DelaySeconds: delay.Seconds(),
+				DelayMs:      delay.Milliseconds(),
+			}
+
+			c.JSON(http.StatusOK, NewRespSuccess(resp))
+			return
+		}
+
+		// Produce normal message
 		msg := b.Enqueue(topic, payload.Body, payload.Tag)
 		logger.Info("Message produced",
 			zap.String("topic", topic),
 			zap.String("message_id", msg.ID),
 			zap.String("tag", payload.Tag))
-		
+
 		resp := ProduceResponse{
 			ID:        msg.ID,
 			Topic:     topic,
@@ -63,7 +120,7 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 			Timestamp: msg.Timestamp,
 			Retry:     msg.Retry,
 		}
-		
+
 		c.JSON(http.StatusOK, NewRespSuccess(resp))
 	}
 }
@@ -75,26 +132,33 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrMissingTopic)
 			return
 		}
-		
+
 		// Validate topic name
 		if err := validateTopicName(topic); err != nil {
 			FailGin(c, err)
 			return
 		}
-		
+
+		// Check if topic exists
+		if _, err := b.GetTopicConfig(topic); err != nil {
+			logger.Warn("Topic not found for consumption", zap.String("topic", topic))
+			FailGin(c, ErrTopicNotFound)
+			return
+		}
+
 		// Get group from URL parameter
 		group := c.Param("group")
 		if group == "" {
 			FailGin(c, ErrInvalidGroup)
 			return
 		}
-		
+
 		// Validate group name
 		if err := validateGroupName(group); err != nil {
 			FailGin(c, err)
 			return
 		}
-		
+
 		queueID := 0
 		if q := c.Query("queue_id"); q != "" {
 			v, err := strconv.Atoi(q)
@@ -104,9 +168,9 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			}
 			queueID = v
 		}
-		
+
 		tag := c.Query("tag")
-		
+
 		// 使用线程安全的消费方法，防止多consumer重复消费
 		msgs, offset, next, err := b.ConsumeWithLock(group, topic, queueID, tag, 1)
 		if err != nil {
@@ -119,7 +183,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrNotFound)
 			return
 		}
-		
+
 		msg := msgs[0]
 		b.BeginProcessing(group, topic, queueID, offset, next, queue.Message{
 			ID:        msg.ID,
@@ -128,14 +192,14 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			Retry:     msg.Retry,
 			Timestamp: msg.Timestamp,
 		})
-		
+
 		logger.Info("Message consumed",
 			zap.String("group", group),
 			zap.String("topic", topic),
 			zap.String("message_id", msg.ID),
 			zap.Int("queue_id", queueID),
 			zap.Int64("offset", offset))
-		
+
 		resp := ConsumeResponse{
 			Message:    msg,
 			Group:      group,
@@ -145,7 +209,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			NextOffset: next,
 			State:      "processing",
 		}
-		
+
 		c.JSON(http.StatusOK, NewRespSuccess(resp))
 	}
 }
@@ -157,28 +221,28 @@ func AckHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrInvalidID)
 			return
 		}
-		
+
 		// Validate UUID format
 		if _, err := uuid.Parse(id); err != nil {
 			logger.Warn("Invalid message ID format", zap.String("message_id", id), zap.Error(err))
 			FailGin(c, ErrInvalidID)
 			return
 		}
-		
+
 		if !b.CompleteProcessing(id) {
 			logger.Error("Ack failed - message not found", zap.String("message_id", id))
 			FailGin(c, ErrNotFound)
 			return
 		}
-		
+
 		logger.Info("Message acknowledged", zap.String("message_id", id))
-		
+
 		resp := AckResponse{
 			MessageID: id,
 			Acked:     true,
 			Topic:     "", // topic not required for global message ack
 		}
-		
+
 		c.JSON(http.StatusOK, NewRespSuccess(resp))
 	}
 }
@@ -190,29 +254,29 @@ func NackHandler(b *broker.Broker) gin.HandlerFunc {
 			FailGin(c, ErrInvalidID)
 			return
 		}
-		
+
 		// Validate UUID format
 		if _, err := uuid.Parse(id); err != nil {
 			logger.Warn("Invalid message ID format for nack", zap.String("message_id", id), zap.Error(err))
 			FailGin(c, ErrInvalidID)
 			return
 		}
-		
+
 		if !b.RetryProcessing(id) {
 			logger.Error("Nack failed - message not found", zap.String("message_id", id))
 			FailGin(c, ErrNotFound)
 			return
 		}
-		
+
 		logger.Info("Message nacked for retry", zap.String("message_id", id))
-		
+
 		resp := NackResponse{
 			MessageID: id,
 			Nacked:    true,
 			Topic:     "", // topic not required for global message nack
 			Requeued:  true,
 		}
-		
+
 		c.JSON(http.StatusOK, NewRespSuccess(resp))
 	}
 }
@@ -230,28 +294,34 @@ func GetOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		topic := c.Param("topic")
 		group := c.Param("group")
-		
+
 		if topic == "" {
 			FailGin(c, ErrMissingTopic)
 			return
 		}
-		
+
 		if group == "" {
 			FailGin(c, ErrInvalidGroup)
 			return
 		}
-		
+
 		// Validate names
 		if err := validateTopicName(topic); err != nil {
 			FailGin(c, err)
 			return
 		}
-		
+
 		if err := validateGroupName(group); err != nil {
 			FailGin(c, err)
 			return
 		}
-		
+
+		// Check if topic exists
+		if _, err := b.GetTopicConfig(topic); err != nil {
+			FailGin(c, ErrTopicNotFound)
+			return
+		}
+
 		queueID := 0
 		if q := c.Query("queue_id"); q != "" {
 			v, err := strconv.Atoi(q)
@@ -261,24 +331,24 @@ func GetOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 			}
 			queueID = v
 		}
-		
+
 		offset, ok, err := b.GetOffset(group, topic, queueID)
 		if err != nil {
 			FailGin(c, ErrOffsetUnsupported)
 			return
 		}
-		
+
 		resp := OffsetResponse{
 			Group:   group,
 			Topic:   topic,
 			QueueID: queueID,
 			Offset:  nil,
 		}
-		
+
 		if ok {
 			resp.Offset = &offset
 		}
-		
+
 		c.JSON(http.StatusOK, NewRespSuccess(resp))
 	}
 }
@@ -288,53 +358,59 @@ func CommitOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		topic := c.Param("topic")
 		group := c.Param("group")
-		
+
 		if topic == "" {
 			FailGin(c, ErrMissingTopic)
 			return
 		}
-		
+
 		if group == "" {
 			FailGin(c, ErrInvalidGroup)
 			return
 		}
-		
+
 		// Validate names
 		if err := validateTopicName(topic); err != nil {
 			FailGin(c, err)
 			return
 		}
-		
+
 		if err := validateGroupName(group); err != nil {
 			FailGin(c, err)
 			return
 		}
-		
+
+		// Check if topic exists
+		if _, err := b.GetTopicConfig(topic); err != nil {
+			FailGin(c, ErrTopicNotFound)
+			return
+		}
+
 		var payload struct {
 			QueueID int   `json:"queue_id"`
 			Offset  int64 `json:"offset" binding:"required"`
 		}
-		
+
 		if err := c.ShouldBindJSON(&payload); err != nil {
 			FailGin(c, ErrInvalidOffset)
 			return
 		}
-		
+
 		if payload.Offset < 0 {
 			FailGin(c, ErrInvalidOffset)
 			return
 		}
-		
+
 		if payload.QueueID < 0 {
 			FailGin(c, ErrInvalidQueueID)
 			return
 		}
-		
+
 		if err := b.CommitOffset(group, topic, payload.QueueID, payload.Offset); err != nil {
 			FailGin(c, ErrOffsetUnsupported)
 			return
 		}
-		
+
 		resp := CommitOffsetResponse{
 			Group:     group,
 			Topic:     topic,
@@ -342,7 +418,7 @@ func CommitOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 			Offset:    payload.Offset,
 			Committed: true,
 		}
-		
+
 		c.JSON(http.StatusOK, NewRespSuccess(resp))
 	}
 }
@@ -351,7 +427,13 @@ func CommitOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 func FailGin(c *gin.Context, err error) {
 	// if RespErr, use its code/message
 	if re, ok := err.(RespErr); ok {
-		c.JSON(http.StatusBadRequest, NewRespFail(re.Code, re.Message))
+		// Determine HTTP status code based on error type
+		statusCode := http.StatusBadRequest
+		switch re.Code {
+		case ErrCodeNotFound, ErrCodeTopicNotFound:
+			statusCode = http.StatusNotFound
+		}
+		c.JSON(statusCode, NewRespFail(re.Code, re.Message))
 		return
 	}
 	c.JSON(http.StatusBadRequest, NewRespFail("error", err.Error()))
