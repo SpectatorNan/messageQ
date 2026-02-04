@@ -19,11 +19,13 @@ func AuthMiddleware(b *broker.Broker, adminAK string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if adminAK == "" {
 			FailGin(c, ErrMissingSetAdminKey)
+			c.Abort()
 			return
 		}
 		ak := strings.TrimSpace(c.GetHeader(headerAK))
 		if ak == "" {
 			FailGin(c, ErrUnauthorized)
+			c.Abort()
 			return
 		}
 		if ak == adminAK || b.IsAKValid(ak) {
@@ -31,6 +33,7 @@ func AuthMiddleware(b *broker.Broker, adminAK string) gin.HandlerFunc {
 			return
 		}
 		FailGin(c, ErrUnauthorized)
+		c.Abort()
 	}
 }
 
@@ -40,11 +43,13 @@ func AdminAuthMiddleware(adminAK string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if adminAK == "" {
 			FailGin(c, ErrMissingSetAdminKey)
+			c.Abort()
 			return
 		}
 		ak := strings.TrimSpace(c.GetHeader(headerAdminAK))
 		if ak == "" || ak != adminAK {
 			FailGin(c, ErrUnauthorized)
+			c.Abort()
 			return
 		}
 		c.Next()

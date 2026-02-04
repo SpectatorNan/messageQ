@@ -8,7 +8,7 @@ import (
 
 // Config holds application configuration.
 type Config struct {
-	AdminAK string `mapstructure:"admin_ak"`
+	AdminAK string `mapstructure:"admin_key" yaml:"admin_key"`
 }
 
 // Load loads config from file/env.
@@ -22,7 +22,7 @@ func Load() (*Config, error) {
 	v.SetEnvPrefix("MQ")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
-	v.SetDefault("admin_ak", "")
+	v.SetDefault("admin_key", "")
 
 	_ = v.ReadInConfig() // ignore missing config
 
