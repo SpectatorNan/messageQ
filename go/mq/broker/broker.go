@@ -3,6 +3,7 @@ package broker
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -60,6 +61,7 @@ type Broker struct {
 	dataDir           string                 // data directory for persistence
 	processingTimeout time.Duration          // message processing timeout
 	stopChan          chan struct{}          // channel to stop background goroutines
+	akStore           *AKStore
 }
 
 type groupStats struct {
@@ -121,6 +123,13 @@ func NewBrokerWithPersistence(store storage.Storage, queueCount int, dataDir str
 		dataDir:           dataDir,
 		processingTimeout: defaultProcessingTimeout,
 		stopChan:          make(chan struct{}),
+	}
+
+	akStore, err := newAKStore(filepath.Join(dataDir, "aks.json"))
+	if err != nil {
+		logger.Warn("Failed to load ak store", zap.Error(err))
+	} else {
+		b.akStore = akStore
 	}
 
 	// 初始化已有 topics 的 queues，确保 reclaimLoop 运行
@@ -704,6 +713,38 @@ func (b *Broker) Close() error {
 // GetDelayScheduler returns the delay scheduler for direct access
 func (b *Broker) GetDelayScheduler() *BinaryDelayScheduler {
 	return b.delayScheduler
+}
+
+// AddAK adds an access key to the store and returns its ID.
+func (b *Broker) AddAK(ak string) (string, error) {
+	if b.akStore == nil {
+		return "", fmt.Errorf("ak store not initialized")
+	}
+	return b.akStore.Add(ak)
+}
+
+// RemoveAK removes an access key by ID from the store.
+func (b *Broker) RemoveAK(id string) error {
+	if b.akStore == nil {
+		return fmt.Errorf("ak store not initialized")
+	}
+	return b.akStore.Remove(id)
+}
+
+// ListAKs returns all access key info.
+func (b *Broker) ListAKs() []AKInfo {
+	if b.akStore == nil {
+		return nil
+	}
+	return b.akStore.List()
+}
+
+// IsAKValid checks if an access key exists.
+func (b *Broker) IsAKValid(ak string) bool {
+	if b.akStore == nil {
+		return false
+	}
+	return b.akStore.Has(ak)
 }
 
 // checkProcessingTimeouts 定期检查超时的处理中消息并自动重试
