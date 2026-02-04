@@ -125,6 +125,8 @@ func NewBrokerWithPersistence(store storage.Storage, queueCount int, dataDir str
 
 	// 初始化已有 topics 的 queues，确保 reclaimLoop 运行
 	b.initializeExistingTopics()
+	// 恢复持久化的 processing 记录，避免 crash 丢失
+	b.recoverProcessingRecords()
 
 	// 启动处理超时检查
 	go b.checkProcessingTimeouts()
@@ -166,6 +168,54 @@ func (b *Broker) initializeExistingTopics() {
 		logger.Debug("Initialized queues for topic",
 			zap.String("topic", topicConfig.Name),
 			zap.Int("queue_count", queueCount))
+	}
+}
+
+// recoverProcessingRecords loads persisted processing records and schedules retries.
+func (b *Broker) recoverProcessingRecords() {
+	ps, ok := b.store.(ProcessingStore)
+	if !ok {
+		return
+	}
+	records, err := ps.LoadProcessing()
+	if err != nil {
+		logger.Warn("Failed to load processing records", zap.Error(err))
+		return
+	}
+	if len(records) == 0 {
+		return
+	}
+
+	for _, rec := range records {
+		// restore retry count baseline
+		b.retryCounts[rec.MsgID] = rec.Retry
+
+		retryTopic, err := b.ensureRetryTopic(rec.Group, rec.Topic)
+		if err != nil {
+			logger.Error("Failed to ensure retry topic on recovery",
+				zap.String("group", rec.Group),
+				zap.String("topic", rec.Topic),
+				zap.Error(err))
+			continue
+		}
+
+		// schedule retry with remaining timeout window
+		deadline := rec.UpdatedAt.Add(b.processingTimeout)
+		delay := time.Until(deadline)
+		if delay < 0 {
+			delay = 0
+		}
+		msg := storage.Message{
+			ID:        rec.MsgID,
+			Body:      rec.Body,
+			Tag:       rec.Tag,
+			Retry:     rec.Retry + 1,
+			Timestamp: time.Now(),
+		}
+		b.delayScheduler.ScheduleWithDelay(retryTopic, rec.QueueID, msg, delay)
+
+		// remove persisted processing record after scheduling
+		_ = ps.RemoveProcessing(rec.Group, rec.Topic, rec.QueueID, rec.MsgID)
 	}
 }
 
@@ -303,6 +353,13 @@ func (b *Broker) GetQueue(topic string) *queue.Queue {
 type OffsetStore interface {
 	CommitOffset(group, topic string, queueID int, offset int64) error
 	GetOffset(group, topic string, queueID int) (int64, bool, error)
+}
+
+// ProcessingStore provides persistence for in-flight processing records.
+type ProcessingStore interface {
+	SaveProcessing(rec storage.ProcessingRecord) error
+	RemoveProcessing(group, topic string, queueID int, msgID string) error
+	LoadProcessing() ([]storage.ProcessingRecord, error)
 }
 
 var ErrOffsetUnsupported = errors.New("offset store not supported")
@@ -467,6 +524,20 @@ func (b *Broker) BeginProcessing(group, topic string, queueID int, offset, nextO
 		b.stats[group] = gs
 	}
 	gs.Processing++
+
+	if ps, ok := b.store.(ProcessingStore); ok {
+		_ = ps.SaveProcessing(storage.ProcessingRecord{
+			Group:     group,
+			Topic:     topic,
+			QueueID:   queueID,
+			MsgID:     msg.ID,
+			Body:      msg.Body,
+			Tag:       msg.Tag,
+			Retry:     msg.Retry,
+			Timestamp: msg.Timestamp,
+			UpdatedAt: time.Now(),
+		})
+	}
 }
 
 // RetryProcessing schedules a retry to the group retry topic or DLQ.
@@ -494,6 +565,9 @@ func (b *Broker) RetryProcessing(msgID string) bool {
 	if retryCount > b.maxRetry {
 		b.clearRetryCount(msgID)
 		b.lock.Unlock()
+		if ps, ok := b.store.(ProcessingStore); ok {
+			_ = ps.RemoveProcessing(entry.Group, entry.Topic, entry.QueueID, msgID)
+		}
 		dlqTopic := entry.Topic + ".dlq"
 		_ = b.store.Append(dlqTopic, 0, storage.Message{
 			ID:        entry.MsgID,
@@ -516,6 +590,10 @@ func (b *Broker) RetryProcessing(msgID string) bool {
 		Timestamp: time.Now(),
 	}
 	b.lock.Unlock()
+
+	if ps, ok := b.store.(ProcessingStore); ok {
+		_ = ps.RemoveProcessing(group, topic, queueID, msgID)
+	}
 
 	retryTopic, err := b.ensureRetryTopic(group, topic)
 	if err != nil {
@@ -557,6 +635,10 @@ func (b *Broker) CompleteProcessing(msgID string) bool {
 	delete(b.processing, msgID)
 	b.clearRetryCount(msgID)
 	b.lock.Unlock()
+
+	if ps, ok := b.store.(ProcessingStore); ok {
+		_ = ps.RemoveProcessing(entry.Group, entry.Topic, entry.QueueID, msgID)
+	}
 	return true
 }
 
