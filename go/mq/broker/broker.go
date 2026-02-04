@@ -3,6 +3,7 @@ package broker
 import (
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"sync"
 	"time"
@@ -54,14 +55,17 @@ type Broker struct {
 	processing        map[string]processingEntry // msgID -> entry
 	stats             map[string]*groupStats     // group -> stats
 	retryCounts       map[string]int             // msgID -> retry count (in-memory)
-	maxRetry          int
-	consumeOffsetLock map[string]*sync.Mutex // "group:topic:queueID" -> lock for concurrent consume
-	delayScheduler    *BinaryDelayScheduler  // binary delay scheduler (CommitLog based)
-	topicManager      *TopicManager          // topic metadata manager
-	dataDir           string                 // data directory for persistence
-	processingTimeout time.Duration          // message processing timeout
-	stopChan          chan struct{}          // channel to stop background goroutines
-	akStore           *AKStore
+	maxRetry               int
+	consumeOffsetLock      map[string]*sync.Mutex // "group:topic:queueID" -> lock for concurrent consume
+	delayScheduler         *BinaryDelayScheduler  // binary delay scheduler (CommitLog based)
+	topicManager           *TopicManager          // topic metadata manager
+	dataDir                string                 // data directory for persistence
+	processingTimeout      time.Duration          // message processing timeout
+	retryBackoffBase       time.Duration          // retry backoff base delay
+	retryBackoffMultiplier float64                // retry backoff multiplier
+	retryBackoffMax        time.Duration          // retry backoff max delay
+	stopChan               chan struct{}          // channel to stop background goroutines
+	akStore                *AKStore
 }
 
 type groupStats struct {
@@ -107,22 +111,25 @@ func NewBrokerWithPersistence(store storage.Storage, queueCount int, dataDir str
 		zap.String("data_dir", dataDir))
 
 	b := &Broker{
-		queues:            make(map[string][]*queue.Queue),
-		store:             store,
-		queueCount:        queueCount,
-		rrEnq:             make(map[string]int),
-		rrDeq:             make(map[string]int),
-		inflight:          make(map[string]int),
-		processing:        make(map[string]processingEntry),
-		stats:             make(map[string]*groupStats),
-		retryCounts:       make(map[string]int),
-		maxRetry:          defaultMaxRetry,
-		consumeOffsetLock: make(map[string]*sync.Mutex),
-		delayScheduler:    scheduler,
-		topicManager:      tm,
-		dataDir:           dataDir,
-		processingTimeout: defaultProcessingTimeout,
-		stopChan:          make(chan struct{}),
+		queues:                 make(map[string][]*queue.Queue),
+		store:                  store,
+		queueCount:             queueCount,
+		rrEnq:                  make(map[string]int),
+		rrDeq:                  make(map[string]int),
+		inflight:               make(map[string]int),
+		processing:             make(map[string]processingEntry),
+		stats:                  make(map[string]*groupStats),
+		retryCounts:            make(map[string]int),
+		maxRetry:               defaultMaxRetry,
+		consumeOffsetLock:      make(map[string]*sync.Mutex),
+		delayScheduler:         scheduler,
+		topicManager:           tm,
+		dataDir:                dataDir,
+		processingTimeout:      defaultProcessingTimeout,
+		retryBackoffBase:       1 * time.Second,
+		retryBackoffMultiplier: 2.0,
+		retryBackoffMax:        60 * time.Second,
+		stopChan:               make(chan struct{}),
 	}
 
 	akStore, err := newAKStore(filepath.Join(dataDir, "aks.json"))
@@ -614,7 +621,7 @@ func (b *Broker) RetryProcessing(msgID string) bool {
 	}
 
 	// Schedule retry to group retry topic (RocketMQ-style), no offset rollback
-	delay := CalculateRetryBackoff(retryCount)
+	delay := b.calculateRetryBackoff(retryCount)
 	b.delayScheduler.ScheduleWithDelay(retryTopic, queueID, msg, delay)
 	return true
 }
@@ -781,3 +788,51 @@ func (b *Broker) checkProcessingTimeouts() {
 		}
 	}
 }
+
+// SetMaxRetry sets the maximum retry count for messages.
+func (b *Broker) SetMaxRetry(maxRetry int) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	b.maxRetry = maxRetry
+}
+
+// SetProcessingTimeout sets the message processing timeout.
+func (b *Broker) SetProcessingTimeout(timeout time.Duration) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	b.processingTimeout = timeout
+}
+
+// SetRetryBackoff sets the retry backoff parameters.
+func (b *Broker) SetRetryBackoff(base time.Duration, multiplier float64, max time.Duration) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	b.retryBackoffBase = base
+	b.retryBackoffMultiplier = multiplier
+	b.retryBackoffMax = max
+}
+
+// calculateRetryBackoff calculates retry backoff delay using configured parameters.
+func (b *Broker) calculateRetryBackoff(retryCount int) time.Duration {
+	b.lock.Lock()
+	base := b.retryBackoffBase
+	multiplier := b.retryBackoffMultiplier
+	max := b.retryBackoffMax
+	b.lock.Unlock()
+
+	if retryCount <= 0 {
+		return base
+	}
+
+	// Calculate: base * (multiplier ^ retryCount)
+	delay := float64(base) * math.Pow(multiplier, float64(retryCount))
+	duration := time.Duration(delay)
+
+	// Cap at max
+	if duration > max {
+		duration = max
+	}
+
+	return duration
+}
+

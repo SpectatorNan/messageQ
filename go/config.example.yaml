@@ -1,0 +1,59 @@
+# MessageQ 配置文件示例
+# 复制此文件为 config.yaml 并根据需要修改
+
+# 管理员密钥 - 用于访问管理接口
+admin_key: adminkey123
+
+# 服务器配置
+server:
+  port: 8080              # HTTP服务端口
+  host: ""                # 监听地址，空表示监听所有地址 (0.0.0.0)
+  shutdown_timeout: 10s   # 优雅关闭超时时间
+
+# Broker配置
+broker:
+  queue_count: 4                    # 默认队列数量（每个topic）
+  max_retry: 3                      # 消息最大重试次数
+  processing_timeout: 30s           # 消息处理超时时间
+  timeout_check_interval: 5s        # 超时检查间隔（暂不支持配置）
+  data_dir: "./data"                # 数据持久化目录
+  retry_backoff_base: 1s            # 重试退避基础延迟
+  retry_backoff_multiplier: 2.0     # 重试退避指数（每次延迟 = base * multiplier^retry_count）
+  retry_backoff_max: 60s            # 重试退避最大延迟
+
+# 存储配置 (WAL)
+storage:
+  flush_interval: 100ms             # WAL刷盘间隔
+  compact_interval: 5m              # WAL压缩检查间隔
+  compact_threshold: 10485760       # WAL压缩阈值（字节），10MB
+  max_record_size: 67108864         # 最大记录大小，64MB（暂不支持配置）
+  buffer_size: 65536                # 缓冲区大小，64KB（暂不支持配置）
+
+# 日志配置
+logging:
+  level: info                       # 日志级别: debug, info, warn, error
+  output_path: stdout               # 日志输出: stdout, stderr, 或文件路径
+  format: console                   # 日志格式: console 或 json
+
+# 常见配置场景示例：
+
+# 开发环境：
+# - level: debug
+# - output_path: stdout
+# - format: console
+# - queue_count: 2
+# - flush_interval: 100ms
+
+# 生产环境：
+# - level: info
+# - output_path: /var/log/messageq/server.log
+# - format: json
+# - queue_count: 8
+# - flush_interval: 1s
+# - compact_interval: 10m
+# - compact_threshold: 104857600 (100MB)
+
+# 测试环境：
+# - level: debug
+# - processing_timeout: 5s
+# - max_retry: 1
