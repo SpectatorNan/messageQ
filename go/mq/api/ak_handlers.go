@@ -1,60 +1,80 @@
 package api
 
 import (
-	"net/http"
-	"strings"
-
 	"messageQ/mq/broker"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
 )
-
-type akRequest struct {
-	AK string `json:"ak"`
-}
 
 // ListAKHandler lists all access keys.
 func ListAKHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		aks := b.ListAKs()
-		c.JSON(http.StatusOK, NewRespSuccess(gin.H{"aks": aks}))
+		list := make([]AccessKey, 0, len(aks))
+		for _, ak := range aks {
+			list = append(list, AccessKey{
+				ID:        ak.ID,
+				Name:      ak.Name,
+				CreatedAt: ak.CreatedAt,
+			})
+		}
+		c.JSON(http.StatusOK, NewRespList(list, len(list)))
 	}
 }
 
 // AddAKHandler adds an access key.
 func AddAKHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		var req akRequest
+		var req CreateAccessKeyRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			FailGin(c, ErrInvalidMessage)
 			return
 		}
-		req.AK = strings.TrimSpace(req.AK)
-		if req.AK == "" {
-			FailGin(c, ErrInvalidMessage)
-			return
-		}
-		id, err := b.AddAK(req.AK)
+
+		err := req.Valid()
 		if err != nil {
 			FailGin(c, ErrInvalidMessage)
 			return
 		}
-		c.JSON(http.StatusOK, NewRespSuccess(gin.H{"id": id}))
+
+		ak, err := b.AddAK(req.Name, req.AccessKey)
+		if err != nil {
+			FailGin(c, ErrInvalidMessage)
+			return
+		}
+
+		data := CreateAccessKeyResponse{
+			Id:        ak.ID,
+			Name:      ak.Name,
+			AccessKey: req.AccessKey,
+			CreatedAt: ak.CreatedAt,
+		}
+
+		c.JSON(http.StatusOK, NewRespSuccess(data))
 	}
 }
 
 // DeleteAKHandler removes an access key.
 func DeleteAKHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		id := strings.TrimSpace(c.Param("id"))
-		if id == "" {
+
+		var req DeleteAccessKeyRequest
+		if err := c.ShouldBindUri(&req); err != nil {
 			FailGin(c, ErrInvalidMessage)
 			return
 		}
-		if err := b.RemoveAK(id); err != nil {
+
+		err := req.Valid()
+		if err != nil {
 			FailGin(c, ErrInvalidMessage)
 			return
 		}
-		c.JSON(http.StatusOK, NewRespSuccess(gin.H{"id": id}))
+
+		if err := b.RemoveAK(req.ID); err != nil {
+			FailGin(c, ErrInvalidMessage)
+			return
+		}
+		c.JSON(http.StatusOK, NewRespEmpty())
 	}
 }

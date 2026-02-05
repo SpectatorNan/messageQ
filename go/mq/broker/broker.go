@@ -45,16 +45,16 @@ type processingEntry struct {
 }
 
 type Broker struct {
-	queues            map[string][]*queue.Queue
-	lock              sync.Mutex
-	store             storage.Storage
-	queueCount        int
-	rrEnq             map[string]int
-	rrDeq             map[string]int
-	inflight          map[string]int
-	processing        map[string]processingEntry // msgID -> entry
-	stats             map[string]*groupStats     // group -> stats
-	retryCounts       map[string]int             // msgID -> retry count (in-memory)
+	queues                 map[string][]*queue.Queue
+	lock                   sync.Mutex
+	store                  storage.Storage
+	queueCount             int
+	rrEnq                  map[string]int
+	rrDeq                  map[string]int
+	inflight               map[string]int
+	processing             map[string]processingEntry // msgID -> entry
+	stats                  map[string]*groupStats     // group -> stats
+	retryCounts            map[string]int             // msgID -> retry count (in-memory)
 	maxRetry               int
 	consumeOffsetLock      map[string]*sync.Mutex // "group:topic:queueID" -> lock for concurrent consume
 	delayScheduler         *BinaryDelayScheduler  // binary delay scheduler (CommitLog based)
@@ -65,7 +65,7 @@ type Broker struct {
 	retryBackoffMultiplier float64                // retry backoff multiplier
 	retryBackoffMax        time.Duration          // retry backoff max delay
 	stopChan               chan struct{}          // channel to stop background goroutines
-	akStore                *AKStore
+	akStore                *storage.AccessKeyStore
 }
 
 type groupStats struct {
@@ -132,7 +132,7 @@ func NewBrokerWithPersistence(store storage.Storage, queueCount int, dataDir str
 		stopChan:               make(chan struct{}),
 	}
 
-	akStore, err := newAKStore(filepath.Join(dataDir, "aks.json"))
+	akStore, err := storage.NewAccessKeyStore(filepath.Join(dataDir, "aks.json"))
 	if err != nil {
 		logger.Warn("Failed to load ak store", zap.Error(err))
 	} else {
@@ -356,7 +356,7 @@ func (b *Broker) DequeueTag(topic string, tag string) queue.Message {
 	b.lock.Unlock()
 	return msg
 }
- 
+
 // GetQueue returns the first queue for backward compatibility.
 func (b *Broker) GetQueue(topic string) *queue.Queue {
 	b.lock.Lock()
@@ -576,7 +576,7 @@ func (b *Broker) RetryProcessing(msgID string) bool {
 		gs.Retry++
 	}
 	delete(b.processing, msgID)
-	
+
 	// exceed max retry -> send to DLQ
 	if retryCount > b.maxRetry {
 		b.clearRetryCount(msgID)
@@ -594,7 +594,7 @@ func (b *Broker) RetryProcessing(msgID string) bool {
 		})
 		return true
 	}
-	
+
 	group := entry.Group
 	topic := entry.Topic
 	queueID := entry.QueueID
@@ -723,11 +723,15 @@ func (b *Broker) GetDelayScheduler() *BinaryDelayScheduler {
 }
 
 // AddAK adds an access key to the store and returns its ID.
-func (b *Broker) AddAK(ak string) (string, error) {
+func (b *Broker) AddAK(name string, ak string) (*storage.AccessKeyRecord, error) {
 	if b.akStore == nil {
-		return "", fmt.Errorf("ak store not initialized")
+		return nil, fmt.Errorf("ak store not initialized")
 	}
-	return b.akStore.Add(ak)
+	record, err := b.akStore.Add(name, ak)
+	if err != nil {
+		return nil, err
+	}
+	return &record, nil
 }
 
 // RemoveAK removes an access key by ID from the store.
@@ -739,7 +743,7 @@ func (b *Broker) RemoveAK(id string) error {
 }
 
 // ListAKs returns all access key info.
-func (b *Broker) ListAKs() []AKInfo {
+func (b *Broker) ListAKs() []storage.AccessKeyInfo {
 	if b.akStore == nil {
 		return nil
 	}
@@ -835,4 +839,3 @@ func (b *Broker) calculateRetryBackoff(retryCount int) time.Duration {
 
 	return duration
 }
-

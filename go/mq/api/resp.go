@@ -10,10 +10,32 @@ type Resp[T any] struct {
 	Message string `json:"message"`
 	Data    T      `json:"data,omitempty"`
 }
+type ListResp[T any] struct {
+	Items []T `json:"items"`
+	Total int `json:"total"`
+}
 
 const (
 	RespCodeOk = "ok"
 )
+
+func NewRespEmpty() Resp[string] {
+	return Resp[string]{
+		Code:    RespCodeOk,
+		Message: "success",
+	}
+}
+
+func NewRespList[T any](items []T, total int) Resp[ListResp[T]] {
+	return Resp[ListResp[T]]{
+		Code:    RespCodeOk,
+		Message: "success",
+		Data: ListResp[T]{
+			Items: items,
+			Total: total,
+		},
+	}
+}
 
 func NewRespSuccess[T any](data T) Resp[T] {
 	return Resp[T]{
@@ -44,24 +66,24 @@ type ProduceResponse struct {
 
 // ProduceDelayResponse is the response for producing a delayed message
 type ProduceDelayResponse struct {
-	ID            string    `json:"id"`
-	Topic         string    `json:"topic"`
-	Tag           string    `json:"tag"`
-	ScheduledAt   time.Time `json:"scheduled_at"`
-	ExecuteAt     time.Time `json:"execute_at"`
-	DelaySeconds  float64   `json:"delay_seconds"`
-	DelayMs       int64     `json:"delay_ms"`
+	ID           string    `json:"id"`
+	Topic        string    `json:"topic"`
+	Tag          string    `json:"tag"`
+	ScheduledAt  time.Time `json:"scheduled_at"`
+	ExecuteAt    time.Time `json:"execute_at"`
+	DelaySeconds float64   `json:"delay_seconds"`
+	DelayMs      int64     `json:"delay_ms"`
 }
 
 // ConsumeResponse is the response for consuming a message
 type ConsumeResponse struct {
-	Message      interface{} `json:"message"` // storage.Message
-	Group        string      `json:"group"`
-	Topic        string      `json:"topic"`
-	QueueID      int         `json:"queue_id"`
-	Offset       int64       `json:"offset"`
-	NextOffset   int64       `json:"next_offset"`
-	State        string      `json:"state"`
+	Message    interface{} `json:"message"` // storage.Message
+	Group      string      `json:"group"`
+	Topic      string      `json:"topic"`
+	QueueID    int         `json:"queue_id"`
+	Offset     int64       `json:"offset"`
+	NextOffset int64       `json:"next_offset"`
+	State      string      `json:"state"`
 }
 
 // AckResponse is the response for acking a message
@@ -81,10 +103,10 @@ type NackResponse struct {
 
 // OffsetResponse is the response for getting offset
 type OffsetResponse struct {
-	Group    string  `json:"group"`
-	Topic    string  `json:"topic"`
-	QueueID  int     `json:"queue_id"`
-	Offset   *int64  `json:"offset"` // pointer to distinguish between 0 and null
+	Group   string `json:"group"`
+	Topic   string `json:"topic"`
+	QueueID int    `json:"queue_id"`
+	Offset  *int64 `json:"offset"` // pointer to distinguish between 0 and null
 }
 
 // CommitOffsetResponse is the response for committing offset

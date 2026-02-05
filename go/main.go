@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -54,7 +55,7 @@ func main() {
 			logger.Error("Failed to close storage", zap.Error(err))
 		}
 	}()
-	
+
 	b := broker.NewBrokerWithStorage(store, cfg.Broker.QueueCount)
 	b.SetMaxRetry(cfg.Broker.MaxRetry)
 	b.SetProcessingTimeout(cfg.Broker.ProcessingTimeout)
@@ -68,7 +69,7 @@ func main() {
 		zap.Duration("retry_backoff_max", cfg.Broker.RetryBackoffMax))
 
 	r := api.NewRouter(b)
-	
+
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	srv := &http.Server{
 		Addr:    addr,
@@ -78,7 +79,7 @@ func main() {
 	// Start server
 	go func() {
 		logger.Info("HTTP server listening", zap.String("addr", addr))
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Fatal("Server failed to start", zap.Error(err))
 		}
 	}()
