@@ -197,7 +197,13 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			zap.Int64("offset", offset))
 
 		resp := ConsumeMessageResponse{
-			Message:    msg,
+			Message: ConsumeMessage{
+				ID:        msg.ID,
+				Body:      msg.Body,
+				Tag:       msg.Tag,
+				Retry:     msg.Retry,
+				Timestamp: msg.Timestamp,
+			},
 			Group:      req.GroupName,
 			Topic:      req.Topic,
 			QueueID:    queueID,

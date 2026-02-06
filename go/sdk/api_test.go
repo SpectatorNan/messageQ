@@ -107,6 +107,18 @@ func (suite *APITestSuite) TestProduceMessage() {
 	suite.Equal(topic, produceResp.Data.Topic)
 }
 
+func (suite *APITestSuite) TestConsumeMessages() {
+	topic := "test-topic"
+	group := "test-group"
+	tag := "test-tag"
+	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, group, tag)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(consumeResp)
+	suite.Equal("ok", consumeResp.Code)
+	suite.NotNil(consumeResp.Data)
+}
+
 func TestAPITestSuite(t *testing.T) {
 	suite.Run(t, new(APITestSuite))
 }

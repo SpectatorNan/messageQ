@@ -4,6 +4,7 @@ import (
 	"messageQ/mq/logger"
 	client "messageQ/sdk"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 )
@@ -22,13 +23,20 @@ type (
 	}
 	// ConsumeMessageResponse is the response for consuming a message
 	ConsumeMessageResponse struct {
-		Message    interface{} `json:"message"` // storage.Message
-		Group      string      `json:"group"`
-		Topic      string      `json:"topic"`
-		QueueID    int         `json:"queue_id"`
-		Offset     int64       `json:"offset"`
-		NextOffset int64       `json:"next_offset"`
-		State      string      `json:"state"`
+		Message    ConsumeMessage `json:"message"` // storage.Message
+		Group      string         `json:"group"`
+		Topic      string         `json:"topic"`
+		QueueID    int            `json:"queue_id"`
+		Offset     int64          `json:"offset"`
+		NextOffset int64          `json:"next_offset"`
+		State      string         `json:"state"`
+	}
+	ConsumeMessage struct {
+		ID        string    `json:"id"`
+		Body      string    `json:"body"`
+		Tag       string    `json:"tag,omitempty"`
+		Retry     int       `json:"retry"`
+		Timestamp time.Time `json:"timestamp"`
 	}
 )
 

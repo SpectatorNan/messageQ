@@ -75,3 +75,26 @@ type DeleteTopicResponse struct {
 	Topic   string `json:"topic"`
 	Deleted bool   `json:"deleted"`
 }
+
+type (
+	ConsumeMessageRequest struct {
+		Tag     string `form:"tag"`
+		QueueId *int   `form:"queue_id"`
+	}
+	ConsumeMessageResponse struct {
+		Message    ConsumeMessage `json:"message"` // storage.Message
+		Group      string         `json:"group"`
+		Topic      string         `json:"topic"`
+		QueueID    int            `json:"queue_id"`
+		Offset     int64          `json:"offset"`
+		NextOffset int64          `json:"next_offset"`
+		State      string         `json:"state"`
+	}
+	ConsumeMessage struct {
+		ID        string    `json:"id"`
+		Body      string    `json:"body"`
+		Tag       string    `json:"tag,omitempty"`
+		Retry     int       `json:"retry"`
+		Timestamp time.Time `json:"timestamp"`
+	}
+)

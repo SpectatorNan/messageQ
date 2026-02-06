@@ -216,3 +216,32 @@ func (h *API) ProduceMessage(topic string, tag string, body string, options ...P
 	}
 	return result, errResp, nil
 }
+
+type ConsumeMessageOption func(*ConsumeMessageRequest)
+
+func WithQueueId(queueId int) ConsumeMessageOption {
+	return func(r *ConsumeMessageRequest) {
+		r.QueueId = &queueId
+	}
+}
+func (h *API) ConsumeMessages(topic string, group string, tag string, options ...ConsumeMessageOption) (*Resp[ConsumeMessageResponse], *ErrResp, error) {
+
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	req := ConsumeMessageRequest{
+		Tag: tag,
+	}
+	for _, option := range options {
+		option(&req)
+	}
+
+	var result *Resp[ConsumeMessageResponse]
+	errResp, err := h.Post(r.SetBody(req).SetResult(&result), h.endpoint.ConsumeMessages(topic, group))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
