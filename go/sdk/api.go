@@ -1,6 +1,8 @@
 package client
 
 import (
+	"messageQ/mq/broker"
+
 	"resty.dev/v3"
 )
 
@@ -75,13 +77,7 @@ func (h *API) ListAccessKeys() (*Resp[ListResp[AccessKey]], *ErrResp, error) {
 
 	var results *Resp[ListResp[AccessKey]]
 
-	//r, err := h.authRequest()
-	//if err != nil {
-	//	return nil, nil, err
-	//}
-
 	r := h.adminRequest()
-
 	errResp, err := h.Get(r.SetResult(&results), h.endpoint.ListAccessKeys())
 	if err != nil {
 		return nil, nil, err
@@ -99,7 +95,8 @@ func (h *API) CreateAccessKey(name string, accessKey string) (*Resp[CreateAccess
 	r := h.adminRequest()
 	var result *Resp[CreateAccessKeyResponse]
 
-	errResp, err := h.Post(r.SetBody(req).SetResult(&result), h.endpoint.CreateAccessKey()if err != nil {
+	errResp, err := h.Post(r.SetBody(req).SetResult(&result), h.endpoint.CreateAccessKey())
+	if err != nil {
 		return nil, nil, err
 	}
 	return result, errResp, nil
@@ -112,6 +109,108 @@ func (h *API) DeleteAccessKey(id string) (*Resp[string], *ErrResp, error) {
 	var result *Resp[string]
 
 	errResp, err := h.Del(r.SetResult(&result), h.endpoint.DeleteAccessKey(id))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
+func (h *API) CreateTopic(name string, topicType broker.TopicType, queueCount int) (*Resp[TopicResponse], *ErrResp, error) {
+
+	req := CreateTopicRequest{
+		Name:       name,
+		Type:       topicType,
+		QueueCount: queueCount,
+	}
+
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var result *Resp[TopicResponse]
+	errResp, err := h.Post(r.SetBody(req).SetResult(&result), h.endpoint.CreateTopic())
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
+func (h *API) GetTopic(topic string) (*Resp[TopicResponse], *ErrResp, error) {
+
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var result *Resp[TopicResponse]
+	errResp, err := h.Get(r.SetResult(&result), h.endpoint.GetTopic(topic))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
+func (h *API) ListTopics() (*Resp[ListResp[TopicResponse]], *ErrResp, error) {
+
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var result *Resp[ListResp[TopicResponse]]
+	errResp, err := h.Get(r.SetResult(&result), h.endpoint.ListTopics())
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
+func (h *API) DelTopic(topic string) (*Resp[DeleteTopicResponse], *ErrResp, error) {
+
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var result *Resp[DeleteTopicResponse]
+	errResp, err := h.Del(r.SetResult(&result), h.endpoint.DeleteTopic(topic))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
+type ProduceDelayOption func(*ProduceMessageRequest)
+
+func WithDelaySeconds(delaySec int64) ProduceDelayOption {
+	return func(r *ProduceMessageRequest) {
+		r.DelaySec = delaySec
+	}
+}
+func WithDelayMilliseconds(delayMs int64) ProduceDelayOption {
+	return func(r *ProduceMessageRequest) {
+		r.DelayMs = delayMs
+	}
+}
+
+func (h *API) ProduceMessage(topic string, tag string, body string, options ...ProduceDelayOption) (*Resp[ProduceMessageResponse], *ErrResp, error) {
+
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	req := ProduceMessageRequest{
+		Tag:  tag,
+		Body: body,
+	}
+	for _, option := range options {
+		option(&req)
+	}
+
+	var result *Resp[ProduceMessageResponse]
+	errResp, err := h.Post(r.SetBody(req).SetResult(&result), h.endpoint.ProduceMessage(topic))
 	if err != nil {
 		return nil, nil, err
 	}

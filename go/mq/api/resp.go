@@ -75,17 +75,6 @@ type ProduceDelayResponse struct {
 	DelayMs      int64     `json:"delay_ms"`
 }
 
-// ConsumeResponse is the response for consuming a message
-type ConsumeResponse struct {
-	Message    interface{} `json:"message"` // storage.Message
-	Group      string      `json:"group"`
-	Topic      string      `json:"topic"`
-	QueueID    int         `json:"queue_id"`
-	Offset     int64       `json:"offset"`
-	NextOffset int64       `json:"next_offset"`
-	State      string      `json:"state"`
-}
-
 // AckResponse is the response for acking a message
 type AckResponse struct {
 	MessageID string `json:"message_id"`
@@ -118,24 +107,10 @@ type CommitOffsetResponse struct {
 	Committed bool   `json:"committed"`
 }
 
-// TopicResponse is the response for topic operations
-type TopicResponse struct {
-	Name       string           `json:"name"`
-	Type       broker.TopicType `json:"type"`
-	QueueCount int              `json:"queue_count"`
-	CreatedAt  int64            `json:"created_at,omitempty"`
-}
-
 // ListTopicsResponse is the response for listing topics
 type ListTopicsResponse struct {
 	Topics []*broker.TopicConfig `json:"topics"`
-	Count  int                   `json:"count"`
-}
-
-// DeleteTopicResponse is the response for deleting a topic
-type DeleteTopicResponse struct {
-	Topic   string `json:"topic"`
-	Deleted bool   `json:"deleted"`
+	Total  int                   `json:"total"`
 }
 
 // StatsResponse is the response for stats endpoint

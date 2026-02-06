@@ -64,9 +64,18 @@ func (s *AccessKeyStore) List() []AccessKeyInfo {
 
 func (s *AccessKeyStore) Add(name, ak string) (AccessKeyRecord, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	id := uuid.New().String()
 	hash := s.hashKey(ak)
+	for _, rec := range s.aks {
+		if name != "" && rec.Name == name {
+			s.mu.Unlock()
+			return AccessKeyRecord{}, errors.New("access key name already exists")
+		}
+		if ak != "" && rec.Hash == hash {
+			s.mu.Unlock()
+			return AccessKeyRecord{}, errors.New("access key already exists")
+		}
+	}
+	id := uuid.New().String() 
 	record := AccessKeyRecord{
 		ID:        id,
 		Name:      name,
@@ -74,6 +83,7 @@ func (s *AccessKeyStore) Add(name, ak string) (AccessKeyRecord, error) {
 		CreatedAt: time.Now().Unix(),
 	}
 	s.aks[id] = record
+	s.mu.Unlock()
 	return record, s.persist()
 }
 
@@ -82,8 +92,8 @@ func (s *AccessKeyStore) Remove(id string) error {
 		return errors.New("empty id")
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.aks, id)
+	s.mu.Unlock()
 	return s.persist()
 }
 

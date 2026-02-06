@@ -9,7 +9,7 @@ import (
 type CreateAccessKeyRequest client.CreateAccessKeyRequest
 type CreateAccessKeyResponse client.CreateAccessKeyResponse
 
-func (r *CreateAccessKeyRequest) Valid() error {
+func (r *CreateAccessKeyRequest) Validate() error {
 	name := strings.TrimSpace(r.Name)
 	accessKey := strings.TrimSpace(r.AccessKey)
 	if name == "" {
@@ -25,7 +25,7 @@ type DeleteAccessKeyRequest struct {
 	ID string `uri:"id" binding:"required"`
 }
 
-func (r *DeleteAccessKeyRequest) Valid() error {
+func (r *DeleteAccessKeyRequest) Validate() error {
 	id := strings.TrimSpace(r.ID)
 	if id == "" {
 		return errors.New("id is required")

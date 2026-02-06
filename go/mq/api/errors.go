@@ -18,6 +18,7 @@ var (
 	ErrInvalidTopicName   = NewRespErr(ErrCodeInvalidTopicName, "invalid topic name")
 	ErrUnauthorized       = NewRespErr(ErrCodeUnauthorized, "unauthorized")
 	ErrMissingSetAdminKey = NewRespErr(ErrCodeMissingSetAdminKey, "missing set admin access key")
+	ErrInvalidQueueCount  = NewRespErr(ErrCodeInvalidQueueCount, "queue_count must be between 1 and 128")
 )
 
 // Optionally define error codes for API responses
@@ -39,6 +40,7 @@ const (
 	ErrCodeInvalidTopicName   = "invalid_topic_name"
 	ErrCodeUnauthorized       = "unauthorized"
 	ErrCodeMissingSetAdminKey = "missing_set_admin_key"
+	ErrCodeInvalidQueueCount  = "invalid_queue_count"
 )
 
 // RespErr is an error that carries an API error code and message and implements error

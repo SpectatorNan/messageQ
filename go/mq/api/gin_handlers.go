@@ -3,7 +3,6 @@ package api
 import (
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -21,90 +20,75 @@ import (
 
 func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		topic := c.Param("topic")
-		if topic == "" {
-			FailGin(c, ErrMissingTopic)
+
+		var req ProduceMessageRequest
+		if err := c.ShouldBindUri(&req); err != nil {
+			FailGin(c, err)
+			return
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			FailGin(c, err)
 			return
 		}
 
-		// Validate topic name
-		if err := validateTopicName(topic); err != nil {
-			logger.Warn("Invalid topic name", zap.String("topic", topic))
+		err := req.Validate()
+		if err != nil {
 			FailGin(c, err)
 			return
 		}
 
 		// Check if topic exists
-		topicConfig, err := b.GetTopicConfig(topic)
+		topicConfig, err := b.GetTopicConfig(req.Topic)
 		if err != nil {
-			logger.Warn("Topic not found", zap.String("topic", topic))
+			logger.Warn("Topic not found", zap.String("topic", req.Topic))
 			FailGin(c, ErrTopicNotFound)
-			return
-		}
-
-		var payload struct {
-			Body     string `json:"body" binding:"required"`
-			Tag      string `json:"tag" binding:"required"`
-			DelayMs  int64  `json:"delay_ms"`  // optional: delay in milliseconds
-			DelaySec int64  `json:"delay_sec"` // optional: delay in seconds
-		}
-
-		if err := c.ShouldBindJSON(&payload); err != nil {
-			logger.Warn("Invalid message payload", zap.Error(err))
-			FailGin(c, ErrInvalidMessage)
-			return
-		}
-
-		// Validate body not empty after trim
-		if strings.TrimSpace(payload.Body) == "" {
-			FailGin(c, ErrInvalidMessage)
 			return
 		}
 
 		// Check if this is a delay topic and if delay parameters are provided
 		isDelayTopic := topicConfig.Type == broker.TopicTypeDelay
-		 
+
 		if isDelayTopic {
-			hasDelay := payload.DelayMs > 0 || payload.DelaySec > 0
-			
+			hasDelay := req.DelayMs > 0 || req.DelaySec > 0
+
 			// Validate delay parameters
-			if payload.DelayMs > 0 && payload.DelaySec > 0 {
+			if req.DelayMs > 0 && req.DelaySec > 0 {
 				// Can't specify both
 				FailGin(c, ErrInvalidDelay)
 				return
 			}
-			
+
 			if !hasDelay {
 				// Use default delay of 1 second for delay topic
-				payload.DelaySec = 1 
+				req.DelaySec = 1
 			}
-			
+
 			var delay time.Duration
-			if payload.DelayMs > 0 {
-				if payload.DelayMs < 0 || payload.DelayMs > 86400000*30 { // max 30 days
+			if req.DelayMs > 0 {
+				if req.DelayMs < 0 || req.DelayMs > 86400000*30 { // max 30 days
 					FailGin(c, ErrInvalidDelay)
 					return
 				}
-				delay = time.Duration(payload.DelayMs) * time.Millisecond
+				delay = time.Duration(req.DelayMs) * time.Millisecond
 			} else {
-				if payload.DelaySec < 1 || payload.DelaySec > 86400*30 { // max 30 days, min 1 second
+				if req.DelaySec < 1 || req.DelaySec > 86400*30 { // max 30 days, min 1 second
 					FailGin(c, ErrInvalidDelay)
 					return
 				}
-				delay = time.Duration(payload.DelaySec) * time.Second
+				delay = time.Duration(req.DelaySec) * time.Second
 			}
 
 			// Produce delayed message
-			msg := b.EnqueueWithDelay(topic, payload.Body, payload.Tag, delay)
+			msg := b.EnqueueWithDelay(req.Topic, req.Body, req.Tag, delay)
 			logger.Info("Delayed message produced",
-				zap.String("topic", topic),
+				zap.String("topic", req.Topic),
 				zap.String("message_id", msg.ID),
-				zap.String("tag", payload.Tag),
+				zap.String("tag", req.Tag),
 				zap.Duration("delay", delay))
 
 			resp := ProduceDelayResponse{
 				ID:           msg.ID,
-				Topic:        topic,
+				Topic:        req.Topic,
 				Tag:          msg.Tag,
 				ScheduledAt:  msg.Timestamp,
 				ExecuteAt:    msg.Timestamp.Add(delay),
@@ -117,15 +101,15 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 		}
 
 		// Produce normal message
-		msg := b.Enqueue(topic, payload.Body, payload.Tag)
+		msg := b.Enqueue(req.Topic, req.Body, req.Tag)
 		logger.Info("Message produced",
-			zap.String("topic", topic),
+			zap.String("topic", req.Topic),
 			zap.String("message_id", msg.ID),
-			zap.String("tag", payload.Tag))
+			zap.String("tag", req.Tag))
 
 		resp := ProduceResponse{
 			ID:        msg.ID,
-			Topic:     topic,
+			Topic:     req.Topic,
 			Tag:       msg.Tag,
 			Body:      msg.Body,
 			Timestamp: msg.Timestamp,
@@ -138,83 +122,66 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 
 func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		topic := c.Param("topic")
-		if topic == "" {
-			FailGin(c, ErrMissingTopic)
+
+		var req ConsumeMessageRequest
+		if err := c.ShouldBindUri(&req); err != nil {
+			FailGin(c, err)
 			return
 		}
-
-		// Validate topic name
-		if err := validateTopicName(topic); err != nil {
+		if err := c.ShouldBindJSON(&req); err != nil {
 			FailGin(c, err)
 			return
 		}
 
-		// Check if topic exists
-		if _, err := b.GetTopicConfig(topic); err != nil {
-			logger.Warn("Topic not found for consumption", zap.String("topic", topic))
+		err := req.Validate()
+		if err != nil {
+			FailGin(c, err)
+			return
+		}
+
+		if _, err := b.GetTopicConfig(req.Topic); err != nil {
+			logger.Warn("Topic not found for consumption", zap.String("topic", req.Topic))
 			FailGin(c, ErrTopicNotFound)
 			return
 		}
 
-		// Get group from URL parameter
-		group := c.Param("group")
-		if group == "" {
-			FailGin(c, ErrInvalidGroup)
-			return
-		}
-
-		// Validate group name
-		if err := validateGroupName(group); err != nil {
-			FailGin(c, err)
-			return
-		}
-
-		tag := c.Query("tag")
-		
-		// 如果指定了 queue_id，直接使用
+		tag := req.Tag
 		var msgs []storage.Message
 		var offset, next int64
-		var err error
 		var queueID int
-		
-		if q := c.Query("queue_id"); q != "" {
-			v, parseErr := strconv.Atoi(q)
-			if parseErr != nil || v < 0 {
-				FailGin(c, ErrInvalidQueueID)
-				return
-			}
-			queueID = v
-			// 使用指定的 queue_id，优先消费重试队列
-			msgs, offset, next, err = b.ConsumeWithRetry(group, topic, queueID, tag, 1)
+
+		if req.QueueId != nil {
+
+			queueID = *req.QueueId
+			msgs, offset, next, err = b.ConsumeWithRetry(req.GroupName, req.Topic, queueID, tag, 1)
 			if err != nil {
-				logger.Error("Consume error", zap.String("group", group), zap.String("topic", topic), zap.Error(err))
+				logger.Error("Consume error", zap.String("group", req.GroupName), zap.String("topic", req.Topic), zap.Error(err))
 				FailGin(c, ErrOffsetUnsupported)
 				return
 			}
 		} else {
 			// 没有指定 queue_id，轮询所有队列
-			queueCount := b.GetQueueCount(topic)
+			queueCount := b.GetQueueCount(req.Topic)
 			for i := 0; i < queueCount; i++ {
-				msgs, offset, next, err = b.ConsumeWithRetry(group, topic, i, tag, 1)
+				msgs, offset, next, err = b.ConsumeWithRetry(req.GroupName, req.Topic, i, tag, 1)
 				if err != nil {
 					continue // 跳过出错的队列
 				}
 				if len(msgs) > 0 {
 					queueID = i
-					break // 找到消息，退出循环
+					break
 				}
 			}
 		}
-		
+
 		if len(msgs) == 0 {
-			logger.Debug("No messages available", zap.String("group", group), zap.String("topic", topic))
+			logger.Debug("No messages available", zap.String("group", req.GroupName), zap.String("topic", req.Topic))
 			FailGin(c, ErrNotFound)
 			return
 		}
 
 		msg := msgs[0]
-		b.BeginProcessing(group, topic, queueID, offset, next, queue.Message{
+		b.BeginProcessing(req.GroupName, req.Topic, queueID, offset, next, queue.Message{
 			ID:        msg.ID,
 			Body:      msg.Body,
 			Tag:       msg.Tag,
@@ -223,16 +190,16 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 		})
 
 		logger.Info("Message consumed",
-			zap.String("group", group),
-			zap.String("topic", topic),
+			zap.String("group", req.GroupName),
+			zap.String("topic", req.Topic),
 			zap.String("message_id", msg.ID),
 			zap.Int("queue_id", queueID),
 			zap.Int64("offset", offset))
 
-		resp := ConsumeResponse{
+		resp := ConsumeMessageResponse{
 			Message:    msg,
-			Group:      group,
-			Topic:      topic,
+			Group:      req.GroupName,
+			Topic:      req.Topic,
 			QueueID:    queueID,
 			Offset:     offset,
 			NextOffset: next,
@@ -469,31 +436,3 @@ func FailGin(c *gin.Context, err error) {
 }
 
 // Validation helpers
-
-func validateTopicName(topic string) error {
-	if topic == "" {
-		return ErrMissingTopic
-	}
-	if len(topic) > 255 {
-		return ErrInvalidTopicName
-	}
-	// Topic name should not contain special characters
-	if strings.ContainsAny(topic, " \t\n\r/\\") {
-		return ErrInvalidTopicName
-	}
-	return nil
-}
-
-func validateGroupName(group string) error {
-	if group == "" {
-		return ErrInvalidGroup
-	}
-	if len(group) > 255 {
-		return ErrInvalidGroup
-	}
-	// Group name should not contain special characters
-	if strings.ContainsAny(group, " \t\n\r/\\") {
-		return ErrInvalidGroup
-	}
-	return nil
-}

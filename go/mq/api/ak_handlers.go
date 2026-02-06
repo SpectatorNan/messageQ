@@ -28,19 +28,19 @@ func AddAKHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req CreateAccessKeyRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
-			FailGin(c, ErrInvalidMessage)
+			FailGin(c, err)
 			return
 		}
 
-		err := req.Valid()
+		err := req.Validate()
 		if err != nil {
-			FailGin(c, ErrInvalidMessage)
+			FailGin(c, err)
 			return
 		}
 
 		ak, err := b.AddAK(req.Name, req.AccessKey)
 		if err != nil {
-			FailGin(c, ErrInvalidMessage)
+			FailGin(c, err)
 			return
 		}
 
@@ -61,18 +61,18 @@ func DeleteAKHandler(b *broker.Broker) gin.HandlerFunc {
 
 		var req DeleteAccessKeyRequest
 		if err := c.ShouldBindUri(&req); err != nil {
-			FailGin(c, ErrInvalidMessage)
+			FailGin(c, err)
 			return
 		}
 
-		err := req.Valid()
+		err := req.Validate()
 		if err != nil {
-			FailGin(c, ErrInvalidMessage)
+			FailGin(c, err)
 			return
 		}
 
 		if err := b.RemoveAK(req.ID); err != nil {
-			FailGin(c, ErrInvalidMessage)
+			FailGin(c, err)
 			return
 		}
 		c.JSON(http.StatusOK, NewRespEmpty())
