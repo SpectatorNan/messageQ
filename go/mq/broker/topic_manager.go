@@ -22,6 +22,7 @@ type TopicConfig struct {
 	Type       TopicType `json:"type"`
 	QueueCount int       `json:"queue_count"`
 	CreatedAt  int64     `json:"created_at"`
+	Internal   bool      `json:"internal,omitempty"`
 }
 
 // TopicManager manages topic metadata and persistence
@@ -49,8 +50,17 @@ func NewTopicManager(dataDir string) (*TopicManager, error) {
 	return tm, nil
 }
 
-// CreateTopic creates a new topic with specified type
+// CreateTopic creates a new user topic with specified type
 func (tm *TopicManager) CreateTopic(name string, topicType TopicType, queueCount int) error {
+	return tm.createTopic(name, topicType, queueCount, false)
+}
+
+// CreateInternalTopic creates a system/internal topic
+func (tm *TopicManager) CreateInternalTopic(name string, topicType TopicType, queueCount int) error {
+	return tm.createTopic(name, topicType, queueCount, true)
+}
+
+func (tm *TopicManager) createTopic(name string, topicType TopicType, queueCount int, internal bool) error {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -63,6 +73,7 @@ func (tm *TopicManager) CreateTopic(name string, topicType TopicType, queueCount
 		Type:       topicType,
 		QueueCount: queueCount,
 		CreatedAt:  now().Unix(),
+		Internal:   internal,
 	}
 
 	tm.topics[name] = config
@@ -89,6 +100,21 @@ func (tm *TopicManager) ListTopics() []*TopicConfig {
 
 	topics := make([]*TopicConfig, 0, len(tm.topics))
 	for _, config := range tm.topics {
+		topics = append(topics, config)
+	}
+	return topics
+}
+
+// ListUserTopics returns only user-created topics (non-internal).
+func (tm *TopicManager) ListUserTopics() []*TopicConfig {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	topics := make([]*TopicConfig, 0, len(tm.topics))
+	for _, config := range tm.topics {
+		if config.Internal {
+			continue
+		}
 		topics = append(topics, config)
 	}
 	return topics

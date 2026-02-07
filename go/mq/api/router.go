@@ -38,11 +38,10 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 				consumers.GET("/topics/:topic/messages", ConsumeHandler(b))
 				consumers.GET("/topics/:topic/offsets", GetOffsetHandler(b))
 				consumers.POST("/topics/:topic/offsets", CommitOffsetHandler(b))
-			}
 
-			// Message acknowledgment (message-centric)
-			protected.POST("/messages/:id/ack", AckHandler(b))
-			protected.POST("/messages/:id/nack", NackHandler(b))
+				consumers.POST("/topics/:topic/messages/:id/ack", AckHandler(b))
+				consumers.POST("/topics/:topic/messages/:id/nack", NackHandler(b))
+			}
 
 			// Monitoring
 			protected.GET("/stats", DelayStatsHandler(b))

@@ -245,3 +245,33 @@ func (h *API) ConsumeMessages(topic string, group string, tag string, options ..
 	}
 	return result, errResp, nil
 }
+
+func (h *API) AckMessage(topic string, group string, id string) (*Resp[AckMessageResponse], *ErrResp, error) {
+
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var result *Resp[AckMessageResponse]
+	errResp, err := h.Post(r.SetResult(&result), h.endpoint.AckMessage(topic, group, id))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
+func (h *API) NackMessage(topic string, group string, id string) (*Resp[NackMessageResponse], *ErrResp, error) {
+
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var result *Resp[NackMessageResponse]
+	errResp, err := h.Post(r.SetResult(&result), h.endpoint.NackMessage(topic, group, id))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}

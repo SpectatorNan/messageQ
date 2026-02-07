@@ -97,4 +97,15 @@ type (
 		Retry     int       `json:"retry"`
 		Timestamp time.Time `json:"timestamp"`
 	}
+	AckMessageResponse struct {
+		MessageID string `json:"message_id"`
+		Acked     bool   `json:"acked"`
+		Topic     string `json:"topic"`
+	}
+	NackMessageResponse struct {
+		MessageID string `json:"message_id"`
+		Nacked    bool   `json:"nacked"`
+		Topic     string `json:"topic"`
+		Requeued  bool   `json:"requeued"`
+	}
 )

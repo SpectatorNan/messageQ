@@ -55,9 +55,9 @@ func (e *Endpoint) GetOffsets(topic, group string) string {
 func (e *Endpoint) CommitOffsets(topic, group string) string {
 	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/offsets", e.baseUrl, group, topic)
 }
-func (e *Endpoint) AckMessage(id string) string {
-	return fmt.Sprintf("%s/api/v1/messages/%s/ack", e.baseUrl, id)
+func (e *Endpoint) AckMessage(topic, group string, id string) string {
+	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/messages/%s/ack", e.baseUrl, group, topic, id)
 }
-func (e *Endpoint) NackMessage(id string) string {
-	return fmt.Sprintf("%s/api/v1/messages/%s/nack", e.baseUrl, id)
+func (e *Endpoint) NackMessage(topic, group string, id string) string {
+	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/messages/%s/nack", e.baseUrl, group, topic, id)
 }

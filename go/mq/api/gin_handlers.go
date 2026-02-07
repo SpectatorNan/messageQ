@@ -13,7 +13,6 @@ import (
 	"messageQ/mq/storage"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 )
 
 // Handler constructors that accept a broker and return gin.HandlerFunc.
@@ -218,31 +217,37 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 
 func AckHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		id := c.Param("id")
-		if id == "" {
-			FailGin(c, ErrInvalidID)
+		var req AckMessageRequest
+		if err := c.ShouldBindUri(&req); err != nil {
+			FailGin(c, err)
+			return
+		}
+		if err := req.Validate(); err != nil {
+			FailGin(c, err)
 			return
 		}
 
-		// Validate UUID format
-		if _, err := uuid.Parse(id); err != nil {
-			logger.Warn("Invalid message ID format", zap.String("message_id", id), zap.Error(err))
-			FailGin(c, ErrInvalidID)
-			return
-		}
-
-		if !b.CompleteProcessing(id) {
-			logger.Error("Ack failed - message not found", zap.String("message_id", id))
+		if !b.ValidateProcessing(req.ID, req.GroupName, req.Topic) {
+			logger.Error("Ack failed - message mismatch", zap.String("message_id", req.ID))
 			FailGin(c, ErrNotFound)
 			return
 		}
 
-		logger.Info("Message acknowledged", zap.String("message_id", id))
+		if !b.CompleteProcessing(req.ID) {
+			logger.Error("Ack failed - message not found", zap.String("message_id", req.ID))
+			FailGin(c, ErrNotFound)
+			return
+		}
+
+		logger.Info("Message acknowledged",
+			zap.String("message_id", req.ID),
+			zap.String("group", req.GroupName),
+			zap.String("topic", req.Topic))
 
 		resp := AckResponse{
-			MessageID: id,
+			MessageID: req.ID,
 			Acked:     true,
-			Topic:     "", // topic not required for global message ack
+			Topic:     req.Topic,
 		}
 
 		c.JSON(http.StatusOK, NewRespSuccess(resp))
@@ -251,31 +256,37 @@ func AckHandler(b *broker.Broker) gin.HandlerFunc {
 
 func NackHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		id := c.Param("id")
-		if id == "" {
-			FailGin(c, ErrInvalidID)
+		var req NackMessageRequest
+		if err := c.ShouldBindUri(&req); err != nil {
+			FailGin(c, err)
+			return
+		}
+		if err := req.Validate(); err != nil {
+			FailGin(c, err)
 			return
 		}
 
-		// Validate UUID format
-		if _, err := uuid.Parse(id); err != nil {
-			logger.Warn("Invalid message ID format for nack", zap.String("message_id", id), zap.Error(err))
-			FailGin(c, ErrInvalidID)
-			return
-		}
-
-		if !b.RetryProcessing(id) {
-			logger.Error("Nack failed - message not found", zap.String("message_id", id))
+		if !b.ValidateProcessing(req.ID, req.GroupName, req.Topic) {
+			logger.Error("Nack failed - message mismatch", zap.String("message_id", req.ID))
 			FailGin(c, ErrNotFound)
 			return
 		}
 
-		logger.Info("Message nacked for retry", zap.String("message_id", id))
+		if !b.RetryProcessing(req.ID) {
+			logger.Error("Nack failed - message not found", zap.String("message_id", req.ID))
+			FailGin(c, ErrNotFound)
+			return
+		}
+
+		logger.Info("Message nacked for retry",
+			zap.String("message_id", req.ID),
+			zap.String("group", req.GroupName),
+			zap.String("topic", req.Topic))
 
 		resp := NackResponse{
-			MessageID: id,
+			MessageID: req.ID,
 			Nacked:    true,
-			Topic:     "", // topic not required for global message nack
+			Topic:     req.Topic,
 			Requeued:  true,
 		}
 

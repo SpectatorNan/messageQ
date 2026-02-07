@@ -439,7 +439,7 @@ func (b *Broker) ensureRetryTopic(group, topic string) (string, error) {
 		}
 	}
 
-	if err := b.topicManager.CreateTopic(retryTopic, TopicTypeNormal, queueCount); err != nil {
+	if err := b.topicManager.CreateInternalTopic(retryTopic, TopicTypeNormal, queueCount); err != nil {
 		// If it was created concurrently, treat as success
 		if _, getErr := b.topicManager.GetTopicConfig(retryTopic); getErr == nil {
 			return retryTopic, nil
@@ -683,7 +683,24 @@ func (b *Broker) GetTopicConfig(name string) (*TopicConfig, error) {
 
 // ListTopics returns all topics
 func (b *Broker) ListTopics() []*TopicConfig {
-	return b.topicManager.ListTopics()
+	return b.topicManager.ListUserTopics()
+}
+
+// ValidateProcessing checks whether a message is currently processing and matches optional group/topic.
+func (b *Broker) ValidateProcessing(msgID, group, topic string) bool {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	entry, ok := b.processing[msgID]
+	if !ok || entry.State != stateProcessing {
+		return false
+	}
+	if group != "" && entry.Group != group {
+		return false
+	}
+	if topic != "" && entry.Topic != topic {
+		return false
+	}
+	return true
 }
 
 // DeleteTopic deletes a topic
