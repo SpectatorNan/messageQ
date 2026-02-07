@@ -8,7 +8,7 @@
 
 ## 核心组件
 
-### DelayScheduler ([delay_scheduler.go](mq/broker/delay_scheduler.go))
+### DelayScheduler ([delay_scheduler.go](../mq/broker/delay_scheduler.go))
 
 基于最小堆的优先级队列调度器：
 

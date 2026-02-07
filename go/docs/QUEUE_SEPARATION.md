@@ -22,7 +22,7 @@
 ```
 
 ### 实现文件
-- **调度器**: [mq/broker/delay_scheduler.go](mq/broker/delay_scheduler.go)
+- **调度器**: [mq/broker/delay_scheduler.go](../mq/broker/delay_scheduler.go)
 - **使用**: 延迟消息到期后 `Append(topic, queueID, msg)` 写入原队列
 
 ### 代码示例
@@ -80,8 +80,8 @@ msgs := b.ConsumeWithLock("orders", "g1", 0, 10)
 ```
 
 ### 实现文件
-- **调度器**: [mq/broker/delay_scheduler_separate.go](mq/broker/delay_scheduler_separate.go) ⭐ 新增
-- **合并消费**: [mq/broker/consume_merge.go](mq/broker/consume_merge.go) ⭐ 新增
+- **调度器**: [mq/broker/delay_scheduler_separate.go](../mq/broker/delay_scheduler_separate.go) ⭐ 新增
+- **合并消费**: [mq/broker/consume_merge.go](../mq/broker/consume_merge.go) ⭐ 新增
 - **使用**: 延迟消息到期后写入 `topic.delay`
 
 ### 代码示例

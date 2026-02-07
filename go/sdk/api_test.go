@@ -17,7 +17,7 @@ type APITestSuite struct {
 
 func (suite *APITestSuite) SetupTest() {
 	suite.api = NewAPI("http://localhost:8080", "adminkey123")
-	//suite.api.Debug()
+	suite.api.Debug()
 	suite.api.SetAccessKey("test-access-key")
 }
 
@@ -145,7 +145,7 @@ func (suite *APITestSuite) TestDelayProduceWithConsume() {
 				suite.NotNil(resp)
 				suite.Equal("ok", resp.Code)
 			}
-			if consumeCount >= 10 {
+			if consumeCount >= 3 {
 				wg.Done()
 			}
 

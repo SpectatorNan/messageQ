@@ -13,13 +13,13 @@
 
 ### 核心改动
 
-1. **添加消费锁机制** ([broker.go](mq/broker/broker.go#L52))
+1. **添加消费锁机制** ([broker.go](../mq/broker/broker.go#L52))
    ```go
    consumeOffsetLock map[string]*sync.Mutex // "group:topic:queueID" -> lock
    ```
    为每个`group:topic:queueID`组合维护独立的锁。
 
-2. **新增线程安全的消费方法** ([broker.go](mq/broker/broker.go#L238-L275))
+2. **新增线程安全的消费方法** ([broker.go](../mq/broker/broker.go#L238-L275))
    ```go
    func (b *Broker) ConsumeWithLock(group, topic string, queueID int, tag string, maxMessages int) 
        ([]storage.Message, int64, int64, error)
@@ -34,7 +34,7 @@
    - HTTP接口使用`ConsumeWithLock`替代原有逻辑
    - 自动处理offset管理，防止并发冲突
 
-4. **调整重试语义** ([broker.go](mq/broker/broker.go#L343-L348))
+4. **调整重试语义** ([broker.go](../mq/broker/broker.go#L343-L348))
    - NACK后不再期望原地重试（offset已提交）
    - 将重试消息追加到队列末尾，保留原MessageID
    - 符合主流消息队列的重试语义
@@ -52,7 +52,7 @@
 
 新增两个并发测试：
 
-### 1. 单队列多consumer测试 ([concurrent_consume_test.go#L14-L119](example/concurrent_consume_test.go))
+### 1. 单队列多consumer测试 ([concurrent_consume_test.go#L14-L119](../example/concurrent_consume_test.go))
 ```go
 func TestConcurrentConsume(t *testing.T)
 ```
@@ -60,7 +60,7 @@ func TestConcurrentConsume(t *testing.T)
 - 验证10条消息无重复、无遗漏
 - ✅ 测试通过
 
-### 2. 多队列多consumer测试 ([concurrent_consume_test.go#L122-L211](example/concurrent_consume_test.go))
+### 2. 多队列多consumer测试 ([concurrent_consume_test.go#L122-L211](../example/concurrent_consume_test.go))
 ```go
 func TestConcurrentConsumeMultipleQueues(t *testing.T)
 ```
@@ -137,10 +137,10 @@ if len(msgs) > 0 {
 
 ## 相关文件
 
-- [mq/broker/broker.go](mq/broker/broker.go) - 核心修改
+- [mq/broker/broker.go](../mq/broker/broker.go) - 核心修改
 - [mq/api/gin_handlers.go](mq/api/gin_handlers.go) - API层适配
-- [example/concurrent_consume_test.go](example/concurrent_consume_test.go) - 新增测试
-- [example/stateful_retry_order_test.go](example/stateful_retry_order_test.go) - 测试更新
+- [example/concurrent_consume_test.go](../example/concurrent_consume_test.go) - 新增测试
+- [example/stateful_retry_order_test.go](../example/stateful_retry_order_test.go) - 测试更新
 
 ## 总结
 

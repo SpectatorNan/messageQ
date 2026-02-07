@@ -38,7 +38,7 @@ See [API documentation](mq/api/ROUTE_OPTIMIZATION.md) for complete endpoint refe
 
 MessageQ uses [zap](https://github.com/uber-go/zap) for structured, high-performance logging.
 
-See [LOGGING.md](LOGGING.md) for detailed documentation.
+See [LOGGING.md](docs/LOGGING.md) for detailed documentation.
 
 **Quick configuration:**
 

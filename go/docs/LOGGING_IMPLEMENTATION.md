@@ -72,7 +72,7 @@ logger.Error("Failed to persist retry message",
 
 ### 6. Documentation
 - [LOGGING.md](LOGGING.md) - Comprehensive logging documentation
-- [README.md](README.md) - Updated with logging features
+- [README.md](../README.md) - Updated with logging features
 - [examples/logging_example.go](examples/logging_example.go) - Usage examples
 
 ## Log Output Examples
