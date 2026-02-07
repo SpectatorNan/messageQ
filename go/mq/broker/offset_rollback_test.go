@@ -86,7 +86,7 @@ func TestOffsetRollbackIsolation(t *testing.T) {
 		group2IDs[msgs[0].ID] = true
 		// 立即 ack
 		b.BeginProcessing(group2, topicName, 0, offset, next, toQueueMessage(msgs[0]))
-		b.CompleteProcessing(msgs[0].ID)
+		b.CompleteProcessing(msgs[0].ID, group2, topicName)
 		logger.Info("Group2 consumed", zap.Int("index", i), zap.String("id", msgs[0].ID))
 	}
 
@@ -125,7 +125,7 @@ func TestOffsetRollbackIsolation(t *testing.T) {
 		retriedCount++
 		// 这次 ack
 		b.BeginProcessing(group1, topicName, 0, offset, next, toQueueMessage(msgs[0]))
-		b.CompleteProcessing(msgs[0].ID)
+		b.CompleteProcessing(msgs[0].ID, group1, topicName)
 		logger.Info("Group1 retried", zap.Int("index", i), zap.String("id", msgs[0].ID))
 	}
 

@@ -233,7 +233,7 @@ func AckHandler(b *broker.Broker) gin.HandlerFunc {
 			return
 		}
 
-		if !b.CompleteProcessing(req.ID) {
+		if !b.CompleteProcessing(req.ID, req.GroupName, req.Topic) {
 			logger.Error("Ack failed - message not found", zap.String("message_id", req.ID))
 			FailGin(c, ErrNotFound)
 			return
@@ -272,7 +272,7 @@ func NackHandler(b *broker.Broker) gin.HandlerFunc {
 			return
 		}
 
-		if !b.RetryProcessing(req.ID) {
+		if !b.RetryProcessing(req.ID, req.GroupName, req.Topic) {
 			logger.Error("Nack failed - message not found", zap.String("message_id", req.ID))
 			FailGin(c, ErrNotFound)
 			return

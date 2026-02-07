@@ -136,7 +136,7 @@ func TestMessageProcessingTimeout(t *testing.T) {
 		})
 
 		// Ack the message immediately
-		if !b.CompleteProcessing(consumedMsg.ID) {
+		if !b.CompleteProcessing(consumedMsg.ID, group, topicName) {
 			t.Error("Failed to ack message")
 		}
 

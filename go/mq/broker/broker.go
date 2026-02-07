@@ -52,7 +52,7 @@ type Broker struct {
 	rrEnq                  map[string]int
 	rrDeq                  map[string]int
 	inflight               map[string]int
-	processing             map[string]processingEntry // msgID -> entry
+	processing             map[string]processingEntry // group:topic:msgID -> entry
 	stats                  map[string]*groupStats     // group -> stats
 	retryCounts            map[string]int             // msgID -> retry count (in-memory)
 	maxRetry               int
@@ -237,6 +237,10 @@ func (b *Broker) recoverProcessingRecords() {
 
 // now returns current time (can be mocked in tests)
 var now = time.Now
+
+func processingKey(group, topic, msgID string) string {
+	return group + ":" + topic + ":" + msgID
+}
 
 // getQueues ensures queues exist for a topic.
 func (b *Broker) getQueues(topic string) []*queue.Queue {
@@ -532,7 +536,7 @@ func (b *Broker) BeginProcessing(group, topic string, queueID int, offset, nextO
 		State:      stateProcessing,
 		UpdatedAt:  time.Now(),
 	}
-	b.processing[msg.ID] = entry
+	b.processing[processingKey(group, topic, msg.ID)] = entry
 	// fmt.Printf("[DEBUG] BeginProcessing: added %s to processing map (total: %d)\n", msg.ID, len(b.processing))
 	gs := b.stats[group]
 	if gs == nil {
@@ -557,9 +561,14 @@ func (b *Broker) BeginProcessing(group, topic string, queueID int, offset, nextO
 }
 
 // RetryProcessing schedules a retry to the group retry topic or DLQ.
-func (b *Broker) RetryProcessing(msgID string) bool {
+// RetryProcessing schedules a retry to the group retry topic or DLQ.
+func (b *Broker) RetryProcessing(msgID, group, topic string) bool {
+	if group == "" || topic == "" {
+		return false
+	}
+	key := processingKey(group, topic, msgID)
 	b.lock.Lock()
-	entry, ok := b.processing[msgID]
+	entry, ok := b.processing[key]
 	if !ok || entry.State != stateProcessing {
 		b.lock.Unlock()
 		return false
@@ -575,7 +584,7 @@ func (b *Broker) RetryProcessing(msgID string) bool {
 		gs.Processing--
 		gs.Retry++
 	}
-	delete(b.processing, msgID)
+	delete(b.processing, key)
 
 	// exceed max retry -> send to DLQ
 	if retryCount > b.maxRetry {
@@ -627,9 +636,14 @@ func (b *Broker) RetryProcessing(msgID string) bool {
 }
 
 // CompleteProcessing marks a message completed (offset already committed in ConsumeWithLock).
-func (b *Broker) CompleteProcessing(msgID string) bool {
+// CompleteProcessing marks a message completed (offset already committed in ConsumeWithLock).
+func (b *Broker) CompleteProcessing(msgID, group, topic string) bool {
+	if group == "" || topic == "" {
+		return false
+	}
+	key := processingKey(group, topic, msgID)
 	b.lock.Lock()
-	entry, ok := b.processing[msgID]
+	entry, ok := b.processing[key]
 	if !ok {
 		// fmt.Printf("[DEBUG] CompleteProcessing: msgID %s not found in processing map (total: %d)\n", msgID, len(b.processing))
 		b.lock.Unlock()
@@ -648,7 +662,7 @@ func (b *Broker) CompleteProcessing(msgID string) bool {
 		gs.Processing--
 		gs.Completed++
 	}
-	delete(b.processing, msgID)
+	delete(b.processing, key)
 	b.clearRetryCount(msgID)
 	b.lock.Unlock()
 
@@ -690,14 +704,11 @@ func (b *Broker) ListTopics() []*TopicConfig {
 func (b *Broker) ValidateProcessing(msgID, group, topic string) bool {
 	b.lock.Lock()
 	defer b.lock.Unlock()
-	entry, ok := b.processing[msgID]
+	if group == "" || topic == "" {
+		return false
+	}
+	entry, ok := b.processing[processingKey(group, topic, msgID)]
 	if !ok || entry.State != stateProcessing {
-		return false
-	}
-	if group != "" && entry.Group != group {
-		return false
-	}
-	if topic != "" && entry.Topic != topic {
 		return false
 	}
 	return true
@@ -787,14 +798,14 @@ func (b *Broker) checkProcessingTimeouts() {
 		case <-ticker.C:
 			b.lock.Lock()
 			now := time.Now()
-			var timeoutMsgIDs []string
+			var timeoutEntries []processingEntry
 
 			// 查找超时的消息
-			for msgID, entry := range b.processing {
+			for _, entry := range b.processing {
 				if entry.State == stateProcessing && now.Sub(entry.UpdatedAt) > b.processingTimeout {
-					timeoutMsgIDs = append(timeoutMsgIDs, msgID)
+					timeoutEntries = append(timeoutEntries, entry)
 					logger.Warn("Message processing timeout",
-						zap.String("message_id", msgID),
+						zap.String("message_id", entry.MsgID),
 						zap.String("group", entry.Group),
 						zap.String("topic", entry.Topic),
 						zap.Duration("elapsed", now.Sub(entry.UpdatedAt)))
@@ -803,8 +814,8 @@ func (b *Broker) checkProcessingTimeouts() {
 			b.lock.Unlock()
 
 			// 对超时的消息执行重试
-			for _, msgID := range timeoutMsgIDs {
-				b.RetryProcessing(msgID)
+			for _, entry := range timeoutEntries {
+				b.RetryProcessing(entry.MsgID, entry.Group, entry.Topic)
 			}
 		}
 	}

@@ -72,7 +72,7 @@ func TestGroupIsolationWithAck(t *testing.T) {
 		g1ConsumedIDs = append(g1ConsumedIDs, msgs[0].ID)
 		// BeginProcessing 并立即 ack
 		b.BeginProcessing(group1, topicName, 0, offset, next, toQueueMessage(msgs[0]))
-		b.CompleteProcessing(msgs[0].ID)
+		b.CompleteProcessing(msgs[0].ID, group1, topicName)
 		logger.Info("Group1 consumed and acked", zap.Int("index", i), zap.String("id", msgs[0].ID))
 	}
 
@@ -108,7 +108,7 @@ func TestGroupIsolationWithAck(t *testing.T) {
 		g2ConsumedIDs = append(g2ConsumedIDs, msgs[0].ID)
 		// 立即 ack
 		b.BeginProcessing(group2, topicName, 0, offset, next, toQueueMessage(msgs[0]))
-		b.CompleteProcessing(msgs[0].ID)
+		b.CompleteProcessing(msgs[0].ID, group2, topicName)
 		logger.Info("Group2 consumed and acked", zap.Int("index", i), zap.String("id", msgs[0].ID))
 	}
 
@@ -203,7 +203,7 @@ func TestGroupIsolationWithTimeout(t *testing.T) {
 		
 		g2ConsumedIDs = append(g2ConsumedIDs, msgs[0].ID)
 		b.BeginProcessing(group2, topicName, 0, offset, next, toQueueMessage(msgs[0]))
-		b.CompleteProcessing(msgs[0].ID)
+		b.CompleteProcessing(msgs[0].ID, group2, topicName)
 		logger.Info("Group2 consumed and acked", zap.Int("index", i), zap.String("id", msgs[0].ID))
 	}
 
@@ -256,7 +256,7 @@ func TestGroupIsolationWithTimeout(t *testing.T) {
 		g1RetryConsumedIDs = append(g1RetryConsumedIDs, msgs[0].ID)
 		// 这次 ack
 		b.BeginProcessing(group1, topicName, 0, offset, next, toQueueMessage(msgs[0]))
-		b.CompleteProcessing(msgs[0].ID)
+		b.CompleteProcessing(msgs[0].ID, group1, topicName)
 		logger.Info("Group1 retried and acked", zap.Int("index", i), zap.String("id", msgs[0].ID))
 	}
 
