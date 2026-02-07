@@ -2,6 +2,7 @@ package api
 
 import (
 	"messageQ/mq/broker"
+	"messageQ/mq/errx"
 	client "messageQ/sdk"
 )
 
@@ -53,10 +54,10 @@ func (r *CreateTopicRequest) Validate() error {
 		return err
 	}
 	if r.Type != broker.TopicTypeNormal && r.Type != broker.TopicTypeDelay {
-		return ErrInvalidTopicType
+		return errx.ErrInvalidTopicType
 	}
 	if r.QueueCount < 0 || r.QueueCount > 128 {
-		return ErrInvalidQueueCount
+		return errx.ErrInvalidQueueCount
 	}
 	return nil
 }

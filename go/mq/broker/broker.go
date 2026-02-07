@@ -604,8 +604,8 @@ func (b *Broker) RetryProcessing(msgID, group, topic string) bool {
 		return true
 	}
 
-	group := entry.Group
-	topic := entry.Topic
+	group = entry.Group
+	topic = entry.Topic
 	queueID := entry.QueueID
 	msg := storage.Message{
 		ID:        entry.MsgID,
@@ -635,7 +635,6 @@ func (b *Broker) RetryProcessing(msgID, group, topic string) bool {
 	return true
 }
 
-// CompleteProcessing marks a message completed (offset already committed in ConsumeWithLock).
 // CompleteProcessing marks a message completed (offset already committed in ConsumeWithLock).
 func (b *Broker) CompleteProcessing(msgID, group, topic string) bool {
 	if group == "" || topic == "" {

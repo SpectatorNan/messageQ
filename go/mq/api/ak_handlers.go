@@ -2,6 +2,7 @@ package api
 
 import (
 	"messageQ/mq/broker"
+	"messageQ/mq/respx"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -19,7 +20,7 @@ func ListAKHandler(b *broker.Broker) gin.HandlerFunc {
 				CreatedAt: ak.CreatedAt,
 			})
 		}
-		c.JSON(http.StatusOK, NewRespList(list, len(list)))
+		c.JSON(http.StatusOK, respx.NewRespList(list, len(list)))
 	}
 }
 
@@ -28,19 +29,19 @@ func AddAKHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req CreateAccessKeyRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		err := req.Validate()
 		if err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		ak, err := b.AddAK(req.Name, req.AccessKey)
 		if err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
@@ -51,7 +52,7 @@ func AddAKHandler(b *broker.Broker) gin.HandlerFunc {
 			CreatedAt: ak.CreatedAt,
 		}
 
-		c.JSON(http.StatusOK, NewRespSuccess(data))
+		c.JSON(http.StatusOK, respx.NewRespSuccess(data))
 	}
 }
 
@@ -61,20 +62,20 @@ func DeleteAKHandler(b *broker.Broker) gin.HandlerFunc {
 
 		var req DeleteAccessKeyRequest
 		if err := c.ShouldBindUri(&req); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		err := req.Validate()
 		if err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		if err := b.RemoveAK(req.ID); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
-		c.JSON(http.StatusOK, NewRespEmpty())
+		c.JSON(http.StatusOK, respx.NewRespEmpty())
 	}
 }

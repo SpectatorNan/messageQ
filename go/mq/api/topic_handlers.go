@@ -2,6 +2,8 @@ package api
 
 import (
 	"messageQ/mq/broker"
+	"messageQ/mq/errx"
+	"messageQ/mq/respx"
 	"net/http"
 	"strings"
 	"time"
@@ -14,23 +16,23 @@ func CreateTopicHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req CreateTopicRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
-			FailGin(c, ErrInvalidMessage)
+			respx.FailGin(c, errx.ErrInvalidMessage)
 			return
 		}
 
 		err := req.Validate()
 		if err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		if err := b.CreateTopic(req.Name, req.Type, req.QueueCount); err != nil {
 			// Check if topic already exists
 			if strings.Contains(err.Error(), "already exists") {
-				FailGin(c, ErrTopicExists)
+				respx.FailGin(c, errx.ErrTopicExists)
 				return
 			}
-			c.JSON(http.StatusBadRequest, NewRespFail("400", err.Error()))
+			c.JSON(http.StatusBadRequest, respx.NewRespFail("400", err.Error()))
 			return
 		}
 
@@ -42,7 +44,7 @@ func CreateTopicHandler(b *broker.Broker) gin.HandlerFunc {
 			CreatedAt:  now.Unix(),
 		}
 
-		c.JSON(http.StatusCreated, NewRespSuccess(resp))
+		c.JSON(http.StatusCreated, respx.NewRespSuccess(resp))
 	}
 }
 
@@ -52,13 +54,13 @@ func GetTopicHandler(b *broker.Broker) gin.HandlerFunc {
 
 		var req GetTopicRequest
 		if err := c.ShouldBindUri(&req); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		config, err := b.GetTopicConfig(req.Topic)
 		if err != nil {
-			FailGin(c, ErrTopicNotFound)
+			respx.FailGin(c, errx.ErrTopicNotFound)
 			return
 		}
 
@@ -69,7 +71,7 @@ func GetTopicHandler(b *broker.Broker) gin.HandlerFunc {
 			CreatedAt:  config.CreatedAt,
 		}
 
-		c.JSON(http.StatusOK, NewRespSuccess(resp))
+		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
 	}
 }
 
@@ -83,7 +85,7 @@ func ListTopicsHandler(b *broker.Broker) gin.HandlerFunc {
 			Total:  len(topics),
 		}
 
-		c.JSON(http.StatusOK, NewRespSuccess(resp))
+		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
 	}
 }
 
@@ -93,20 +95,20 @@ func DeleteTopicHandler(b *broker.Broker) gin.HandlerFunc {
 
 		var req DeleteTopicRequest
 		if err := c.ShouldBindUri(&req); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		err := req.Validate()
 		if err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		topic := req.Topic
 
 		if err := b.DeleteTopic(topic); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
@@ -115,6 +117,6 @@ func DeleteTopicHandler(b *broker.Broker) gin.HandlerFunc {
 			Deleted: true,
 		}
 
-		c.JSON(http.StatusOK, NewRespSuccess(resp))
+		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
 	}
 }

@@ -1,9 +1,10 @@
 //go:build ignore
 // +build ignore
 
-package broker
+package example
 
 import (
+	"messageQ/mq/broker"
 	"os"
 	"testing"
 	"time"
@@ -34,7 +35,7 @@ func TestGroupIsolationWithAck(t *testing.T) {
 	store := storage.NewWALStorage(dataDir, 10*time.Millisecond)
 	defer store.Close()
 
-	b := NewBrokerWithPersistence(store, 1, dataDir)
+	b := broker.NewBrokerWithPersistence(store, 1, dataDir)
 	defer b.Close()
 
 	topicName := "test-ack-isolation"
@@ -42,7 +43,7 @@ func TestGroupIsolationWithAck(t *testing.T) {
 	group2 := "group2"
 
 	// 创建 topic
-	err := b.CreateTopic(topicName, TopicTypeNormal, 1)
+	err := b.CreateTopic(topicName, broker.TopicTypeNormal, 1)
 	if err != nil {
 		t.Fatalf("Failed to create topic: %v", err)
 	}
@@ -68,7 +69,7 @@ func TestGroupIsolationWithAck(t *testing.T) {
 		if len(msgs) == 0 {
 			t.Fatalf("Group1 expected message %d, got none", i)
 		}
-		
+
 		g1ConsumedIDs = append(g1ConsumedIDs, msgs[0].ID)
 		// BeginProcessing 并立即 ack
 		b.BeginProcessing(group1, topicName, 0, offset, next, toQueueMessage(msgs[0]))
@@ -104,7 +105,7 @@ func TestGroupIsolationWithAck(t *testing.T) {
 		if len(msgs) == 0 {
 			break // 没有更多消息
 		}
-		
+
 		g2ConsumedIDs = append(g2ConsumedIDs, msgs[0].ID)
 		// 立即 ack
 		b.BeginProcessing(group2, topicName, 0, offset, next, toQueueMessage(msgs[0]))
@@ -119,7 +120,7 @@ func TestGroupIsolationWithAck(t *testing.T) {
 
 	// 验证 group1 和 group2 消费到的是同样的消息
 	if len(g1ConsumedIDs) != len(g2ConsumedIDs) {
-		t.Errorf("Group1 and Group2 consumed different number of messages: %d vs %d", 
+		t.Errorf("Group1 and Group2 consumed different number of messages: %d vs %d",
 			len(g1ConsumedIDs), len(g2ConsumedIDs))
 	}
 
@@ -141,7 +142,7 @@ func TestGroupIsolationWithTimeout(t *testing.T) {
 	defer store.Close()
 
 	// 创建 broker，2 秒超时
-	b := NewBrokerWithPersistence(store, 1, dataDir)
+	b := broker.NewBrokerWithPersistence(store, 1, dataDir)
 	b.processingTimeout = 2 * time.Second
 	defer b.Close()
 
@@ -150,7 +151,7 @@ func TestGroupIsolationWithTimeout(t *testing.T) {
 	group2 := "group2"
 
 	// 创建 topic
-	err := b.CreateTopic(topicName, TopicTypeNormal, 1)
+	err := b.CreateTopic(topicName, broker.TopicTypeNormal, 1)
 	if err != nil {
 		t.Fatalf("Failed to create topic: %v", err)
 	}
@@ -176,7 +177,7 @@ func TestGroupIsolationWithTimeout(t *testing.T) {
 		if len(msgs) == 0 {
 			t.Fatalf("Group1 expected message %d, got none", i)
 		}
-		
+
 		g1FirstConsumedIDs = append(g1FirstConsumedIDs, msgs[0].ID)
 		// BeginProcessing 但不 ack
 		b.BeginProcessing(group1, topicName, 0, offset, next, toQueueMessage(msgs[0]))
@@ -200,7 +201,7 @@ func TestGroupIsolationWithTimeout(t *testing.T) {
 		if len(msgs) == 0 {
 			break
 		}
-		
+
 		g2ConsumedIDs = append(g2ConsumedIDs, msgs[0].ID)
 		b.BeginProcessing(group2, topicName, 0, offset, next, toQueueMessage(msgs[0]))
 		b.CompleteProcessing(msgs[0].ID, group2, topicName)
@@ -218,7 +219,7 @@ func TestGroupIsolationWithTimeout(t *testing.T) {
 	// 验证消息 ID 匹配
 	for i := 0; i < len(messageIDs); i++ {
 		if i < len(g2ConsumedIDs) && g2ConsumedIDs[i] != messageIDs[i] {
-			t.Errorf("Group2 message %d ID mismatch: expected %s, got %s", 
+			t.Errorf("Group2 message %d ID mismatch: expected %s, got %s",
 				i, messageIDs[i], g2ConsumedIDs[i])
 		}
 	}
@@ -252,7 +253,7 @@ func TestGroupIsolationWithTimeout(t *testing.T) {
 			t.Logf("Group1 no message at retry attempt %d", i)
 			break
 		}
-		
+
 		g1RetryConsumedIDs = append(g1RetryConsumedIDs, msgs[0].ID)
 		// 这次 ack
 		b.BeginProcessing(group1, topicName, 0, offset, next, toQueueMessage(msgs[0]))
@@ -267,7 +268,7 @@ func TestGroupIsolationWithTimeout(t *testing.T) {
 
 	for i := 0; i < len(g1FirstConsumedIDs) && i < len(g1RetryConsumedIDs); i++ {
 		if g1FirstConsumedIDs[i] != g1RetryConsumedIDs[i] {
-			t.Errorf("Group1 retry message %d mismatch: first=%s, retry=%s", 
+			t.Errorf("Group1 retry message %d mismatch: first=%s, retry=%s",
 				i, g1FirstConsumedIDs[i], g1RetryConsumedIDs[i])
 		}
 	}

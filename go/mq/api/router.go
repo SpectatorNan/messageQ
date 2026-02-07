@@ -1,6 +1,7 @@
 package api
 
 import (
+	"messageQ/mq/auth"
 	"messageQ/mq/broker"
 	"messageQ/mq/config"
 
@@ -21,7 +22,7 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 	v1 := r.Group("/api/v1")
 	{
 		protected := v1.Group("/")
-		protected.Use(AuthMiddleware(b, adminAK))
+		protected.Use(auth.AuthMiddleware(b, adminAK))
 		{
 			// Topic management
 			protected.POST("/topics", CreateTopicHandler(b))
@@ -48,7 +49,7 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 		}
 
 		admin := v1.Group("/admin")
-		admin.Use(AdminAuthMiddleware(adminAK))
+		admin.Use(auth.AdminAuthMiddleware(adminAK))
 		{
 			admin.GET("/aks", ListAKHandler(b))
 			admin.POST("/aks", AddAKHandler(b))

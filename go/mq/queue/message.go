@@ -9,5 +9,3 @@ type Message struct {
 	Retry     int       `json:"retry"`
 	Timestamp time.Time `json:"timestamp"`
 }
-
-// InflightMsg is deprecated - inflight tracking is now handled at broker level

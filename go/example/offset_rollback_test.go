@@ -1,9 +1,10 @@
 //go:build ignore
 // +build ignore
 
-package broker
+package example
 
 import (
+	"messageQ/mq/broker"
 	"os"
 	"testing"
 	"time"
@@ -23,7 +24,7 @@ func TestOffsetRollbackIsolation(t *testing.T) {
 	defer store.Close()
 
 	// 创建 broker，1 秒超时（方便测试）
-	b := NewBrokerWithPersistence(store, 1, dataDir)
+	b := broker.NewBrokerWithPersistence(store, 1, dataDir)
 	b.processingTimeout = 2 * time.Second
 	defer b.Close()
 
@@ -32,7 +33,7 @@ func TestOffsetRollbackIsolation(t *testing.T) {
 	group2 := "group2"
 
 	// 创建 topic
-	err := b.CreateTopic(topicName, TopicTypeNormal, 1)
+	err := b.CreateTopic(topicName, broker.TopicTypeNormal, 1)
 	if err != nil {
 		t.Fatalf("Failed to create topic: %v", err)
 	}
@@ -57,7 +58,7 @@ func TestOffsetRollbackIsolation(t *testing.T) {
 		if len(msgs) == 0 {
 			t.Fatalf("Group1 expected message %d, got none", i)
 		}
-		
+
 		// BeginProcessing 但不 ack
 		b.BeginProcessing(group1, topicName, 0, offset, next, toQueueMessage(msgs[0]))
 		logger.Info("Group1 consumed", zap.Int("index", i), zap.String("id", msgs[0].ID))
@@ -81,7 +82,7 @@ func TestOffsetRollbackIsolation(t *testing.T) {
 		if len(msgs) == 0 {
 			break // 没有更多消息
 		}
-		
+
 		group2Count++
 		group2IDs[msgs[0].ID] = true
 		// 立即 ack
@@ -121,7 +122,7 @@ func TestOffsetRollbackIsolation(t *testing.T) {
 			t.Logf("Group1 no message at attempt %d", i)
 			break
 		}
-		
+
 		retriedCount++
 		// 这次 ack
 		b.BeginProcessing(group1, topicName, 0, offset, next, toQueueMessage(msgs[0]))

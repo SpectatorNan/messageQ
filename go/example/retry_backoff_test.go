@@ -1,88 +1,89 @@
-package broker
+package example
 
 import (
+	"messageQ/mq/broker"
 	"testing"
 	"time"
 )
 
 func TestCalculateRetryBackoff(t *testing.T) {
-	b := &Broker{
+	b := &broker.Broker{
 		retryBackoffBase:       1 * time.Second,
 		retryBackoffMultiplier: 2.0,
 		retryBackoffMax:        60 * time.Second,
 	}
-	
+
 	tests := []struct {
-		name         string
-		base         time.Duration
-		multiplier   float64
-		max          time.Duration
-		retryCount   int
-		expectedMin  time.Duration
-		expectedMax  time.Duration
+		name        string
+		base        time.Duration
+		multiplier  float64
+		max         time.Duration
+		retryCount  int
+		expectedMin time.Duration
+		expectedMax time.Duration
 	}{
 		{
-			name:         "Default exponential backoff - retry 1",
-			base:         1 * time.Second,
-			multiplier:   2.0,
-			max:          60 * time.Second,
-			retryCount:   1,
-			expectedMin:  2 * time.Second,
-			expectedMax:  2 * time.Second,
+			name:        "Default exponential backoff - retry 1",
+			base:        1 * time.Second,
+			multiplier:  2.0,
+			max:         60 * time.Second,
+			retryCount:  1,
+			expectedMin: 2 * time.Second,
+			expectedMax: 2 * time.Second,
 		},
 		{
-			name:         "Default exponential backoff - retry 2",
-			base:         1 * time.Second,
-			multiplier:   2.0,
-			max:          60 * time.Second,
-			retryCount:   2,
-			expectedMin:  4 * time.Second,
-			expectedMax:  4 * time.Second,
+			name:        "Default exponential backoff - retry 2",
+			base:        1 * time.Second,
+			multiplier:  2.0,
+			max:         60 * time.Second,
+			retryCount:  2,
+			expectedMin: 4 * time.Second,
+			expectedMax: 4 * time.Second,
 		},
 		{
-			name:         "Default exponential backoff - retry 3",
-			base:         1 * time.Second,
-			multiplier:   2.0,
-			max:          60 * time.Second,
-			retryCount:   3,
-			expectedMin:  8 * time.Second,
-			expectedMax:  8 * time.Second,
+			name:        "Default exponential backoff - retry 3",
+			base:        1 * time.Second,
+			multiplier:  2.0,
+			max:         60 * time.Second,
+			retryCount:  3,
+			expectedMin: 8 * time.Second,
+			expectedMax: 8 * time.Second,
 		},
 		{
-			name:         "Capped at max",
-			base:         1 * time.Second,
-			multiplier:   2.0,
-			max:          10 * time.Second,
-			retryCount:   10,
-			expectedMin:  10 * time.Second,
-			expectedMax:  10 * time.Second,
+			name:        "Capped at max",
+			base:        1 * time.Second,
+			multiplier:  2.0,
+			max:         10 * time.Second,
+			retryCount:  10,
+			expectedMin: 10 * time.Second,
+			expectedMax: 10 * time.Second,
 		},
 		{
-			name:         "Linear backoff",
-			base:         5 * time.Second,
-			multiplier:   1.0,
-			max:          60 * time.Second,
-			retryCount:   5,
-			expectedMin:  5 * time.Second,
-			expectedMax:  5 * time.Second,
+			name:        "Linear backoff",
+			base:        5 * time.Second,
+			multiplier:  1.0,
+			max:         60 * time.Second,
+			retryCount:  5,
+			expectedMin: 5 * time.Second,
+			expectedMax: 5 * time.Second,
 		},
 		{
-			name:         "Fast retry for development",
-			base:         100 * time.Millisecond,
-			multiplier:   1.5,
-			max:          10 * time.Second,
-			retryCount:   3,
-			expectedMin:  330 * time.Millisecond,
-			expectedMax:  340 * time.Millisecond,
+			name:        "Fast retry for development",
+			base:        100 * time.Millisecond,
+			multiplier:  1.5,
+			max:         10 * time.Second,
+			retryCount:  3,
+			expectedMin: 330 * time.Millisecond,
+			expectedMax: 340 * time.Millisecond,
 		},
 		{
-			name:         "Zero retry count returns base",
-			base:         2 * time.Second,
-			multiplier:   2.0,
-			max:          60 * time.Second,
-			retryCount:   0,
-			expectedMin:  2 * time.Second,
-			expectedMax:  2 * time.Second,
+			name:        "Zero retry count returns base",
+			base:        2 * time.Second,
+			multiplier:  2.0,
+			max:         60 * time.Second,
+			retryCount:  0,
+			expectedMin: 2 * time.Second,
+			expectedMax: 2 * time.Second,
 		},
 	}
 
@@ -90,7 +91,7 @@ func TestCalculateRetryBackoff(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			b.SetRetryBackoff(tt.base, tt.multiplier, tt.max)
 			delay := b.calculateRetryBackoff(tt.retryCount)
-			
+
 			if delay < tt.expectedMin || delay > tt.expectedMax {
 				t.Errorf("calculateRetryBackoff() = %v, want between %v and %v",
 					delay, tt.expectedMin, tt.expectedMax)
@@ -102,7 +103,7 @@ func TestCalculateRetryBackoff(t *testing.T) {
 }
 
 func TestRetryBackoffProgression(t *testing.T) {
-	b := &Broker{
+	b := &broker.Broker{
 		retryBackoffBase:       1 * time.Second,
 		retryBackoffMultiplier: 2.0,
 		retryBackoffMax:        60 * time.Second,
@@ -130,7 +131,7 @@ func TestRetryBackoffProgression(t *testing.T) {
 }
 
 func TestRetryBackoffConcurrency(t *testing.T) {
-	b := &Broker{
+	b := &broker.Broker{
 		retryBackoffBase:       1 * time.Second,
 		retryBackoffMultiplier: 2.0,
 		retryBackoffMax:        60 * time.Second,

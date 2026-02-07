@@ -1,6 +1,7 @@
 package api
 
 import (
+	"messageQ/mq/errx"
 	"messageQ/mq/logger"
 	client "messageQ/sdk"
 	"strings"
@@ -15,6 +16,16 @@ type (
 		Topic string `uri:"topic" binding:"required"`
 		client.ProduceMessageRequest
 	}
+	ProduceMessageResponse struct {
+		ID          string     `json:"id"`
+		Topic       string     `json:"topic"`
+		Tag         string     `json:"tag"`
+		Body        string     `json:"body"`
+		Timestamp   time.Time  `json:"timestamp"`
+		Retry       int        `json:"retry"`
+		ScheduledAt time.Time  `json:"scheduled_at"`
+		ExecutedAt  *time.Time `json:"executed_at"`
+	}
 
 	ConsumeMessageRequest struct {
 		Topic     string `uri:"topic" binding:"required"`
@@ -27,10 +38,21 @@ type (
 		Topic     string `uri:"topic" binding:"required"`
 		GroupName string `uri:"group" binding:"required"`
 	}
+	AckResponse struct {
+		MessageID string `json:"message_id"`
+		Acked     bool   `json:"acked"`
+		Topic     string `json:"topic"`
+	}
 	NackMessageRequest struct {
 		ID        string `uri:"id" binding:"required"`
 		Topic     string `uri:"topic" binding:"required"`
 		GroupName string `uri:"group" binding:"required"`
+	}
+	NackResponse struct {
+		MessageID string `json:"message_id"`
+		Nacked    bool   `json:"nacked"`
+		Topic     string `json:"topic"`
+		Requeued  bool   `json:"requeued"`
 	}
 	// ConsumeMessageResponse is the response for consuming a message
 	ConsumeMessageResponse struct {
@@ -59,7 +81,7 @@ func (r *ProduceMessageRequest) Validate() error {
 	}
 	body := strings.TrimSpace(r.Body)
 	if body == "" {
-		return ErrInvalidMessage
+		return errx.ErrInvalidMessage
 	}
 
 	return nil
@@ -89,7 +111,7 @@ func (r *AckMessageRequest) Validate() error {
 	}
 	if _, err := uuid.Parse(r.ID); err != nil {
 		logger.Warn("Invalid message ID format", zap.String("message_id", r.ID), zap.Error(err))
-		return ErrInvalidID
+		return errx.ErrInvalidID
 	}
 	return nil
 }
@@ -105,35 +127,35 @@ func (r *NackMessageRequest) Validate() error {
 	}
 	if _, err := uuid.Parse(r.ID); err != nil {
 		logger.Warn("Invalid message ID format", zap.String("message_id", r.ID), zap.Error(err))
-		return ErrInvalidID
+		return errx.ErrInvalidID
 	}
 	return nil
 }
 
 func validateTopicName(topic string) error {
 	if topic == "" {
-		return ErrMissingTopic
+		return errx.ErrMissingTopic
 	}
 	if len(topic) > 128 {
-		return ErrInvalidTopicName
+		return errx.ErrInvalidTopicName
 	}
 	// Topic name should not contain special characters
 	if strings.ContainsAny(topic, " \t\n\r/\\") {
-		return ErrInvalidTopicName
+		return errx.ErrInvalidTopicName
 	}
 	return nil
 }
 
 func validateGroupName(group string) error {
 	if group == "" {
-		return ErrInvalidGroup
+		return errx.ErrInvalidGroup
 	}
 	if len(group) > 255 {
-		return ErrInvalidGroup
+		return errx.ErrInvalidGroup
 	}
 	// Group name should not contain special characters
 	if strings.ContainsAny(group, " \t\n\r/\\") {
-		return ErrInvalidGroup
+		return errx.ErrInvalidGroup
 	}
 	return nil
 }

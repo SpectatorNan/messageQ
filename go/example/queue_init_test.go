@@ -1,7 +1,8 @@
-package broker
+package example
 
 import (
 	"fmt"
+	"messageQ/mq/broker"
 	"os"
 	"path/filepath"
 	"testing"
@@ -20,15 +21,15 @@ func TestQueueInitializationOnBrokerStart(t *testing.T) {
 	defer store.Close()
 
 	// Step 1: Create a broker and some topics
-	b1 := NewBrokerWithPersistence(store, 2, tmpDir)
+	b1 := broker.NewBrokerWithPersistence(store, 2, tmpDir)
 
 	// Create topics
-	err := b1.CreateTopic("topic1", TopicTypeNormal, 2)
+	err := b1.CreateTopic("topic1", broker.TopicTypeNormal, 2)
 	if err != nil {
 		t.Fatalf("Failed to create topic1: %v", err)
 	}
 
-	err = b1.CreateTopic("topic2", TopicTypeDelay, 3)
+	err = b1.CreateTopic("topic2", broker.TopicTypeDelay, 3)
 	if err != nil {
 		t.Fatalf("Failed to create topic2: %v", err)
 	}
@@ -71,7 +72,7 @@ func TestQueueInitializationOnBrokerStart(t *testing.T) {
 	store2 := storage.NewWALStorage(tmpDir, 10*time.Millisecond)
 	defer store2.Close()
 
-	b2 := NewBrokerWithPersistence(store2, 2, tmpDir)
+	b2 := broker.NewBrokerWithPersistence(store2, 2, tmpDir)
 	defer b2.Close()
 
 	// Give some time for initialization
@@ -125,7 +126,7 @@ func TestQueueInitializationWithNoTopics(t *testing.T) {
 	store := storage.NewWALStorage(tmpDir, 10*time.Millisecond)
 	defer store.Close()
 
-	b := NewBrokerWithPersistence(store, 2, tmpDir)
+	b := broker.NewBrokerWithPersistence(store, 2, tmpDir)
 	defer b.Close()
 
 	// Should not panic, queues map should be empty

@@ -1,6 +1,8 @@
 package api
 
 import (
+	"messageQ/mq/errx"
+	"messageQ/mq/respx"
 	"net/http"
 	"strconv"
 	"time"
@@ -22,17 +24,17 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 
 		var req ProduceMessageRequest
 		if err := c.ShouldBindUri(&req); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		err := req.Validate()
 		if err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
@@ -40,7 +42,7 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 		topicConfig, err := b.GetTopicConfig(req.Topic)
 		if err != nil {
 			logger.Warn("Topic not found", zap.String("topic", req.Topic))
-			FailGin(c, ErrTopicNotFound)
+			respx.FailGin(c, errx.ErrTopicNotFound)
 			return
 		}
 
@@ -53,7 +55,7 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 			// Validate delay parameters
 			if req.DelayMs > 0 && req.DelaySec > 0 {
 				// Can't specify both
-				FailGin(c, ErrInvalidDelay)
+				respx.FailGin(c, errx.ErrInvalidDelay)
 				return
 			}
 
@@ -65,13 +67,13 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 			var delay time.Duration
 			if req.DelayMs > 0 {
 				if req.DelayMs < 0 || req.DelayMs > 86400000*30 { // max 30 days
-					FailGin(c, ErrInvalidDelay)
+					respx.FailGin(c, errx.ErrInvalidDelay)
 					return
 				}
 				delay = time.Duration(req.DelayMs) * time.Millisecond
 			} else {
 				if req.DelaySec < 1 || req.DelaySec > 86400*30 { // max 30 days, min 1 second
-					FailGin(c, ErrInvalidDelay)
+					respx.FailGin(c, errx.ErrInvalidDelay)
 					return
 				}
 				delay = time.Duration(req.DelaySec) * time.Second
@@ -85,17 +87,15 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 				zap.String("tag", req.Tag),
 				zap.Duration("delay", delay))
 
-			resp := ProduceDelayResponse{
-				ID:           msg.ID,
-				Topic:        req.Topic,
-				Tag:          msg.Tag,
-				ScheduledAt:  msg.Timestamp,
-				ExecuteAt:    msg.Timestamp.Add(delay),
-				DelaySeconds: delay.Seconds(),
-				DelayMs:      delay.Milliseconds(),
+			resp := ProduceMessageResponse{
+				ID:          msg.ID,
+				Topic:       req.Topic,
+				Tag:         msg.Tag,
+				ScheduledAt: msg.Timestamp,
+				ExecutedAt:  nil,
 			}
 
-			c.JSON(http.StatusOK, NewRespSuccess(resp))
+			c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
 			return
 		}
 
@@ -106,7 +106,7 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 			zap.String("message_id", msg.ID),
 			zap.String("tag", req.Tag))
 
-		resp := ProduceResponse{
+		resp := ProduceMessageResponse{
 			ID:        msg.ID,
 			Topic:     req.Topic,
 			Tag:       msg.Tag,
@@ -115,7 +115,7 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 			Retry:     msg.Retry,
 		}
 
-		c.JSON(http.StatusOK, NewRespSuccess(resp))
+		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
 	}
 }
 
@@ -124,23 +124,23 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 
 		var req ConsumeMessageRequest
 		if err := c.ShouldBindUri(&req); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		err := req.Validate()
 		if err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		if _, err := b.GetTopicConfig(req.Topic); err != nil {
 			logger.Warn("Topic not found for consumption", zap.String("topic", req.Topic))
-			FailGin(c, ErrTopicNotFound)
+			respx.FailGin(c, errx.ErrTopicNotFound)
 			return
 		}
 
@@ -155,7 +155,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			msgs, offset, next, err = b.ConsumeWithRetry(req.GroupName, req.Topic, queueID, tag, 1)
 			if err != nil {
 				logger.Error("Consume error", zap.String("group", req.GroupName), zap.String("topic", req.Topic), zap.Error(err))
-				FailGin(c, ErrOffsetUnsupported)
+				respx.FailGin(c, errx.ErrOffsetUnsupported)
 				return
 			}
 		} else {
@@ -175,7 +175,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 
 		if len(msgs) == 0 {
 			logger.Debug("No messages available", zap.String("group", req.GroupName), zap.String("topic", req.Topic))
-			FailGin(c, ErrNotFound)
+			respx.FailGin(c, errx.ErrNotFound)
 			return
 		}
 
@@ -211,7 +211,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			State:      "processing",
 		}
 
-		c.JSON(http.StatusOK, NewRespSuccess(resp))
+		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
 	}
 }
 
@@ -219,23 +219,23 @@ func AckHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req AckMessageRequest
 		if err := c.ShouldBindUri(&req); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 		if err := req.Validate(); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		if !b.ValidateProcessing(req.ID, req.GroupName, req.Topic) {
 			logger.Error("Ack failed - message mismatch", zap.String("message_id", req.ID))
-			FailGin(c, ErrNotFound)
+			respx.FailGin(c, errx.ErrNotFound)
 			return
 		}
 
 		if !b.CompleteProcessing(req.ID, req.GroupName, req.Topic) {
 			logger.Error("Ack failed - message not found", zap.String("message_id", req.ID))
-			FailGin(c, ErrNotFound)
+			respx.FailGin(c, errx.ErrNotFound)
 			return
 		}
 
@@ -250,7 +250,7 @@ func AckHandler(b *broker.Broker) gin.HandlerFunc {
 			Topic:     req.Topic,
 		}
 
-		c.JSON(http.StatusOK, NewRespSuccess(resp))
+		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
 	}
 }
 
@@ -258,23 +258,23 @@ func NackHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req NackMessageRequest
 		if err := c.ShouldBindUri(&req); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 		if err := req.Validate(); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		if !b.ValidateProcessing(req.ID, req.GroupName, req.Topic) {
 			logger.Error("Nack failed - message mismatch", zap.String("message_id", req.ID))
-			FailGin(c, ErrNotFound)
+			respx.FailGin(c, errx.ErrNotFound)
 			return
 		}
 
 		if !b.RetryProcessing(req.ID, req.GroupName, req.Topic) {
 			logger.Error("Nack failed - message not found", zap.String("message_id", req.ID))
-			FailGin(c, ErrNotFound)
+			respx.FailGin(c, errx.ErrNotFound)
 			return
 		}
 
@@ -290,7 +290,7 @@ func NackHandler(b *broker.Broker) gin.HandlerFunc {
 			Requeued:  true,
 		}
 
-		c.JSON(http.StatusOK, NewRespSuccess(resp))
+		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
 	}
 }
 
@@ -298,7 +298,7 @@ func NackHandler(b *broker.Broker) gin.HandlerFunc {
 func StatsHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		stats := b.Stats()
-		c.JSON(http.StatusOK, NewRespSuccess(stats))
+		c.JSON(http.StatusOK, respx.NewRespSuccess(stats))
 	}
 }
 
@@ -309,45 +309,50 @@ func GetOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 		group := c.Param("group")
 
 		if topic == "" {
-			FailGin(c, ErrMissingTopic)
+			respx.FailGin(c, errx.ErrMissingTopic)
 			return
 		}
 
 		if group == "" {
-			FailGin(c, ErrInvalidGroup)
+			respx.FailGin(c, errx.ErrInvalidGroup)
 			return
 		}
 
 		// Validate names
 		if err := validateTopicName(topic); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		if err := validateGroupName(group); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		// Check if topic exists
 		if _, err := b.GetTopicConfig(topic); err != nil {
-			FailGin(c, ErrTopicNotFound)
+			respx.FailGin(c, errx.ErrTopicNotFound)
 			return
 		}
+		queueCount := b.GetQueueCount(topic)
 
 		queueID := 0
 		if q := c.Query("queue_id"); q != "" {
 			v, err := strconv.Atoi(q)
 			if err != nil || v < 0 {
-				FailGin(c, ErrInvalidQueueID)
+				respx.FailGin(c, errx.ErrInvalidQueueID)
 				return
 			}
 			queueID = v
 		}
+		if queueID < 0 || queueID >= queueCount {
+			respx.FailGin(c, errx.ErrInvalidQueueID)
+			return
+		}
 
 		offset, ok, err := b.GetOffset(group, topic, queueID)
 		if err != nil {
-			FailGin(c, ErrOffsetUnsupported)
+			respx.FailGin(c, errx.ErrOffsetUnsupported)
 			return
 		}
 
@@ -362,7 +367,7 @@ func GetOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 			resp.Offset = &offset
 		}
 
-		c.JSON(http.StatusOK, NewRespSuccess(resp))
+		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
 	}
 }
 
@@ -373,31 +378,32 @@ func CommitOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 		group := c.Param("group")
 
 		if topic == "" {
-			FailGin(c, ErrMissingTopic)
+			respx.FailGin(c, errx.ErrMissingTopic)
 			return
 		}
 
 		if group == "" {
-			FailGin(c, ErrInvalidGroup)
+			respx.FailGin(c, errx.ErrInvalidGroup)
 			return
 		}
 
 		// Validate names
 		if err := validateTopicName(topic); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		if err := validateGroupName(group); err != nil {
-			FailGin(c, err)
+			respx.FailGin(c, err)
 			return
 		}
 
 		// Check if topic exists
 		if _, err := b.GetTopicConfig(topic); err != nil {
-			FailGin(c, ErrTopicNotFound)
+			respx.FailGin(c, errx.ErrTopicNotFound)
 			return
 		}
+		queueCount := b.GetQueueCount(topic)
 
 		var payload struct {
 			QueueID int   `json:"queue_id"`
@@ -405,22 +411,26 @@ func CommitOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 		}
 
 		if err := c.ShouldBindJSON(&payload); err != nil {
-			FailGin(c, ErrInvalidOffset)
+			respx.FailGin(c, errx.ErrInvalidOffset)
 			return
 		}
 
 		if payload.Offset < 0 {
-			FailGin(c, ErrInvalidOffset)
+			respx.FailGin(c, errx.ErrInvalidOffset)
 			return
 		}
 
 		if payload.QueueID < 0 {
-			FailGin(c, ErrInvalidQueueID)
+			respx.FailGin(c, errx.ErrInvalidQueueID)
+			return
+		}
+		if payload.QueueID >= queueCount {
+			respx.FailGin(c, errx.ErrInvalidQueueID)
 			return
 		}
 
 		if err := b.CommitOffset(group, topic, payload.QueueID, payload.Offset); err != nil {
-			FailGin(c, ErrOffsetUnsupported)
+			respx.FailGin(c, errx.ErrOffsetUnsupported)
 			return
 		}
 
@@ -432,24 +442,10 @@ func CommitOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 			Committed: true,
 		}
 
-		c.JSON(http.StatusOK, NewRespSuccess(resp))
+		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
 	}
 }
 
 // helper to use api.Fail behavior but for gin.Context
-func FailGin(c *gin.Context, err error) {
-	// if RespErr, use its code/message
-	if re, ok := err.(RespErr); ok {
-		// Determine HTTP status code based on error type
-		statusCode := http.StatusBadRequest
-		switch re.Code {
-		case ErrCodeNotFound, ErrCodeTopicNotFound:
-			statusCode = http.StatusNotFound
-		}
-		c.JSON(statusCode, NewRespFail(re.Code, re.Message))
-		return
-	}
-	c.JSON(http.StatusBadRequest, NewRespFail("error", err.Error()))
-}
 
 // Validation helpers

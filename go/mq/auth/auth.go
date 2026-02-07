@@ -1,6 +1,8 @@
-package api
+package auth
 
 import (
+	"messageQ/mq/errx"
+	"messageQ/mq/respx"
 	"strings"
 
 	"messageQ/mq/broker"
@@ -8,23 +10,18 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const (
-	headerAK      = "X-AK"
-	headerAdminAK = "X-Admin-AK"
-)
-
 // AuthMiddleware validates normal API access key.
 func AuthMiddleware(b *broker.Broker, adminAK string) gin.HandlerFunc {
 	adminAK = strings.TrimSpace(adminAK)
 	return func(c *gin.Context) {
 		if adminAK == "" {
-			FailGin(c, ErrMissingSetAdminKey)
+			respx.FailGin(c, errx.ErrMissingSetAdminKey)
 			c.Abort()
 			return
 		}
-		ak := strings.TrimSpace(c.GetHeader(headerAK))
+		ak := strings.TrimSpace(c.GetHeader(AuthHeaderKey))
 		if ak == "" {
-			FailGin(c, ErrUnauthorized)
+			respx.FailGin(c, errx.ErrUnauthorized)
 			c.Abort()
 			return
 		}
@@ -32,7 +29,7 @@ func AuthMiddleware(b *broker.Broker, adminAK string) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		FailGin(c, ErrUnauthorized)
+		respx.FailGin(c, errx.ErrUnauthorized)
 		c.Abort()
 	}
 }
@@ -42,13 +39,13 @@ func AdminAuthMiddleware(adminAK string) gin.HandlerFunc {
 	adminAK = strings.TrimSpace(adminAK)
 	return func(c *gin.Context) {
 		if adminAK == "" {
-			FailGin(c, ErrMissingSetAdminKey)
+			respx.FailGin(c, errx.ErrMissingSetAdminKey)
 			c.Abort()
 			return
 		}
-		ak := strings.TrimSpace(c.GetHeader(headerAdminAK))
+		ak := strings.TrimSpace(c.GetHeader(AdminHeaderKey))
 		if ak == "" || ak != adminAK {
-			FailGin(c, ErrUnauthorized)
+			respx.FailGin(c, errx.ErrUnauthorized)
 			c.Abort()
 			return
 		}
