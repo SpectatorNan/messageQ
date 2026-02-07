@@ -1,6 +1,7 @@
 package client
 
 import (
+	"fmt"
 	"messageQ/mq/broker"
 
 	"resty.dev/v3"
@@ -217,11 +218,11 @@ func (h *API) ProduceMessage(topic string, tag string, body string, options ...P
 	return result, errResp, nil
 }
 
-type ConsumeMessageOption func(*ConsumeMessageRequest)
+type ConsumeMessageOption func(*resty.Request)
 
 func WithQueueId(queueId int) ConsumeMessageOption {
-	return func(r *ConsumeMessageRequest) {
-		r.QueueId = &queueId
+	return func(r *resty.Request) {
+		r.SetQueryParam("queueId", fmt.Sprintf("%d", queueId))
 	}
 }
 func (h *API) ConsumeMessages(topic string, group string, tag string, options ...ConsumeMessageOption) (*Resp[ConsumeMessageResponse], *ErrResp, error) {
@@ -231,15 +232,14 @@ func (h *API) ConsumeMessages(topic string, group string, tag string, options ..
 		return nil, nil, err
 	}
 
-	req := ConsumeMessageRequest{
-		Tag: tag,
-	}
+	r.SetQueryParam("tag", tag)
+
 	for _, option := range options {
-		option(&req)
+		option(r)
 	}
 
 	var result *Resp[ConsumeMessageResponse]
-	errResp, err := h.Post(r.SetBody(req).SetResult(&result), h.endpoint.ConsumeMessages(topic, group))
+	errResp, err := h.Get(r.SetResult(&result), h.endpoint.ConsumeMessages(topic, group))
 	if err != nil {
 		return nil, nil, err
 	}

@@ -77,10 +77,6 @@ type DeleteTopicResponse struct {
 }
 
 type (
-	ConsumeMessageRequest struct {
-		Tag     string `form:"tag"`
-		QueueId *int   `form:"queue_id"`
-	}
 	ConsumeMessageResponse struct {
 		Message    ConsumeMessage `json:"message"` // storage.Message
 		Group      string         `json:"group"`

@@ -4,7 +4,6 @@ import (
 	"messageQ/mq/errx"
 	"messageQ/mq/respx"
 	"net/http"
-	"strconv"
 	"time"
 
 	"go.uber.org/zap"
@@ -127,7 +126,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			respx.FailGin(c, err)
 			return
 		}
-		if err := c.ShouldBindJSON(&req); err != nil {
+		if err := c.ShouldBindQuery(&req); err != nil {
 			respx.FailGin(c, err)
 			return
 		}
@@ -305,60 +304,45 @@ func StatsHandler(b *broker.Broker) gin.HandlerFunc {
 // GetOffsetHandler returns the committed offset for a group/topic/queue.
 func GetOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		topic := c.Param("topic")
-		group := c.Param("group")
-
-		if topic == "" {
-			respx.FailGin(c, errx.ErrMissingTopic)
-			return
-		}
-
-		if group == "" {
-			respx.FailGin(c, errx.ErrInvalidGroup)
-			return
-		}
-
-		// Validate names
-		if err := validateTopicName(topic); err != nil {
+		var req GetOffsetRequest
+		if err := c.ShouldBindUri(&req); err != nil {
 			respx.FailGin(c, err)
 			return
 		}
-
-		if err := validateGroupName(group); err != nil {
+		if err := c.ShouldBindQuery(&req); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+		if err := req.Validate(); err != nil {
 			respx.FailGin(c, err)
 			return
 		}
 
 		// Check if topic exists
-		if _, err := b.GetTopicConfig(topic); err != nil {
+		if _, err := b.GetTopicConfig(req.Topic); err != nil {
 			respx.FailGin(c, errx.ErrTopicNotFound)
 			return
 		}
-		queueCount := b.GetQueueCount(topic)
+		queueCount := b.GetQueueCount(req.Topic)
 
 		queueID := 0
-		if q := c.Query("queue_id"); q != "" {
-			v, err := strconv.Atoi(q)
-			if err != nil || v < 0 {
-				respx.FailGin(c, errx.ErrInvalidQueueID)
-				return
-			}
-			queueID = v
+		if req.QueueID != nil {
+			queueID = *req.QueueID
 		}
 		if queueID < 0 || queueID >= queueCount {
 			respx.FailGin(c, errx.ErrInvalidQueueID)
 			return
 		}
 
-		offset, ok, err := b.GetOffset(group, topic, queueID)
+		offset, ok, err := b.GetOffset(req.GroupName, req.Topic, queueID)
 		if err != nil {
 			respx.FailGin(c, errx.ErrOffsetUnsupported)
 			return
 		}
 
 		resp := OffsetResponse{
-			Group:   group,
-			Topic:   topic,
+			Group:   req.GroupName,
+			Topic:   req.Topic,
 			QueueID: queueID,
 			Offset:  nil,
 		}
@@ -374,71 +358,43 @@ func GetOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 // CommitOffsetHandler commits the offset for a group/topic/queue.
 func CommitOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		topic := c.Param("topic")
-		group := c.Param("group")
-
-		if topic == "" {
-			respx.FailGin(c, errx.ErrMissingTopic)
-			return
-		}
-
-		if group == "" {
-			respx.FailGin(c, errx.ErrInvalidGroup)
-			return
-		}
-
-		// Validate names
-		if err := validateTopicName(topic); err != nil {
-			respx.FailGin(c, err)
-			return
-		}
-
-		if err := validateGroupName(group); err != nil {
+		var req CommitOffsetRequest
+		if err := c.ShouldBindUri(&req); err != nil {
 			respx.FailGin(c, err)
 			return
 		}
 
 		// Check if topic exists
-		if _, err := b.GetTopicConfig(topic); err != nil {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			respx.FailGin(c, errx.ErrInvalidOffset)
+			return
+		}
+
+		if err := req.Validate(); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+
+		if _, err := b.GetTopicConfig(req.Topic); err != nil {
 			respx.FailGin(c, errx.ErrTopicNotFound)
 			return
 		}
-		queueCount := b.GetQueueCount(topic)
-
-		var payload struct {
-			QueueID int   `json:"queue_id"`
-			Offset  int64 `json:"offset" binding:"required"`
-		}
-
-		if err := c.ShouldBindJSON(&payload); err != nil {
-			respx.FailGin(c, errx.ErrInvalidOffset)
-			return
-		}
-
-		if payload.Offset < 0 {
-			respx.FailGin(c, errx.ErrInvalidOffset)
-			return
-		}
-
-		if payload.QueueID < 0 {
-			respx.FailGin(c, errx.ErrInvalidQueueID)
-			return
-		}
-		if payload.QueueID >= queueCount {
+		queueCount := b.GetQueueCount(req.Topic)
+		if req.QueueID >= queueCount {
 			respx.FailGin(c, errx.ErrInvalidQueueID)
 			return
 		}
 
-		if err := b.CommitOffset(group, topic, payload.QueueID, payload.Offset); err != nil {
+		if err := b.CommitOffset(req.GroupName, req.Topic, req.QueueID, req.Offset); err != nil {
 			respx.FailGin(c, errx.ErrOffsetUnsupported)
 			return
 		}
 
 		resp := CommitOffsetResponse{
-			Group:     group,
-			Topic:     topic,
-			QueueID:   payload.QueueID,
-			Offset:    payload.Offset,
+			Group:     req.GroupName,
+			Topic:     req.Topic,
+			QueueID:   req.QueueID,
+			Offset:    req.Offset,
 			Committed: true,
 		}
 

@@ -33,6 +33,17 @@ type (
 		Tag       string `form:"tag"`
 		QueueId   *int   `form:"queue_id"`
 	}
+	GetOffsetRequest struct {
+		Topic     string `uri:"topic" binding:"required"`
+		GroupName string `uri:"group" binding:"required"`
+		QueueID   *int   `form:"queue_id"`
+	}
+	CommitOffsetRequest struct {
+		Topic     string `uri:"topic" binding:"required"`
+		GroupName string `uri:"group" binding:"required"`
+		QueueID   int    `json:"queue_id"`
+		Offset    int64  `json:"offset" binding:"required"`
+	}
 	AckMessageRequest struct {
 		ID        string `uri:"id" binding:"required"`
 		Topic     string `uri:"topic" binding:"required"`
@@ -97,6 +108,39 @@ func (r *ConsumeMessageRequest) Validate() error {
 		return err
 	}
 
+	return nil
+}
+
+func (r *GetOffsetRequest) Validate() error {
+	if err := validateTopicName(r.Topic); err != nil {
+		logger.Warn("Invalid topic name", zap.String("topic", r.Topic))
+		return err
+	}
+	if err := validateGroupName(r.GroupName); err != nil {
+		logger.Warn("Invalid group name", zap.String("group", r.GroupName))
+		return err
+	}
+	if r.QueueID != nil && *r.QueueID < 0 {
+		return errx.ErrInvalidQueueID
+	}
+	return nil
+}
+
+func (r *CommitOffsetRequest) Validate() error {
+	if err := validateTopicName(r.Topic); err != nil {
+		logger.Warn("Invalid topic name", zap.String("topic", r.Topic))
+		return err
+	}
+	if err := validateGroupName(r.GroupName); err != nil {
+		logger.Warn("Invalid group name", zap.String("group", r.GroupName))
+		return err
+	}
+	if r.QueueID < 0 {
+		return errx.ErrInvalidQueueID
+	}
+	if r.Offset < 0 {
+		return errx.ErrInvalidOffset
+	}
 	return nil
 }
 
