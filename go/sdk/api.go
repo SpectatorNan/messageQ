@@ -246,6 +246,52 @@ func (h *API) ConsumeMessages(topic string, group string, tag string, options ..
 	return result, errResp, nil
 }
 
+type ListMessagesOption func(*resty.Request)
+
+func WithListQueueId(queueId int) ListMessagesOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("queueId", fmt.Sprintf("%d", queueId))
+	}
+}
+
+func WithListTag(tag string) ListMessagesOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("tag", tag)
+	}
+}
+
+func WithListLimit(limit int) ListMessagesOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("limit", fmt.Sprintf("%d", limit))
+	}
+}
+
+func WithListCursor(cursor int64) ListMessagesOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("cursor", fmt.Sprintf("%d", cursor))
+	}
+}
+
+func (h *API) ListMessages(topic string, group string, state string, options ...ListMessagesOption) (*Resp[ListMessagesResponse], *ErrResp, error) {
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+	if state != "" {
+		r.SetQueryParam("state", state)
+	}
+	for _, option := range options {
+		option(r)
+	}
+
+	var result *Resp[ListMessagesResponse]
+	errResp, err := h.Get(r.SetResult(&result), h.endpoint.ListMessages(topic, group))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
 func (h *API) AckMessage(topic string, group string, id string) (*Resp[AckMessageResponse], *ErrResp, error) {
 
 	r, err := h.authRequest()

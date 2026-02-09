@@ -49,6 +49,9 @@ func (e *Endpoint) ProduceMessage(topic string) string {
 func (e *Endpoint) ConsumeMessages(topic, group string) string {
 	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/messages", e.baseUrl, group, topic)
 }
+func (e *Endpoint) ListMessages(topic, group string) string {
+	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/messages/status", e.baseUrl, group, topic)
+}
 func (e *Endpoint) GetOffsets(topic, group string) string {
 	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/offsets", e.baseUrl, group, topic)
 }

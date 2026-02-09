@@ -870,7 +870,7 @@ func (w *WALStorage) ReadFromConsumeQueue(topic string, queueID int, offset int6
 		}
 		segID := binary.BigEndian.Uint32(buf[0:4])
 		pos := binary.BigEndian.Uint64(buf[4:12])
-		size := binary.BigEndian.Uint32(buf[12:16])
+		_ = binary.BigEndian.Uint32(buf[12:16])
 		tagHash := binary.BigEndian.Uint32(buf[16:20])
 		idx++
 		if hash != 0 && tagHash != hash {
@@ -886,9 +886,69 @@ func (w *WALStorage) ReadFromConsumeQueue(topic string, queueID int, offset int6
 		if err != nil {
 			continue
 		}
-		// optional sanity: size can be used for validation
-		_ = size
 		msgs = append(msgs, msg)
 	}
+	return msgs, idx, nil
+}
+
+// ReadFromConsumeQueueWithOffsets scans consumequeue from offset and returns messages with their offsets.
+func (w *WALStorage) ReadFromConsumeQueueWithOffsets(topic string, queueID int, offset int64, max int, tag string) ([]MessageWithOffset, int64, error) {
+	if offset < 0 {
+		offset = 0
+	}
+	if max <= 0 {
+		max = 1
+	}
+	if err := w.FlushTopic(topic, queueID); err != nil {
+		return nil, offset, err
+	}
+	cqPath := w.consumeQueueFile(topic, queueID)
+	cf, err := os.Open(cqPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, offset, nil
+		}
+		return nil, offset, err
+	}
+	defer cf.Close()
+
+	hash := hashTag(tag)
+	start := offset * cqEntrySize
+	if _, err := cf.Seek(start, io.SeekStart); err != nil {
+		return nil, offset, err
+	}
+
+	msgs := make([]MessageWithOffset, 0, max)
+	idx := offset
+	for len(msgs) < max {
+		var buf [cqEntrySize]byte
+		if _, err := io.ReadFull(cf, buf[:]); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
+			return msgs, idx, err
+		}
+		segID := binary.BigEndian.Uint32(buf[0:4])
+		pos := binary.BigEndian.Uint64(buf[4:12])
+		_ = binary.BigEndian.Uint32(buf[12:16])
+		tagHash := binary.BigEndian.Uint32(buf[16:20])
+		entryOffset := idx
+		idx++
+		if hash != 0 && tagHash != hash {
+			continue
+		}
+		segPath := filepath.Join(w.commitLogDir(topic, queueID), fmt.Sprintf("%08d.wal", segID))
+		segFile, err := os.Open(segPath)
+		if err != nil {
+			continue
+		}
+		msg, _, err := readRecordAt(segFile, int64(pos))
+		_ = segFile.Close()
+		if err != nil {
+			continue
+		}
+		msgs = append(msgs, MessageWithOffset{Message: msg, Offset: entryOffset})
+	}
+
 	return msgs, idx, nil
 }

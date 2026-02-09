@@ -37,6 +37,7 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 			consumers := protected.Group("/consumers/:group")
 			{
 				consumers.GET("/topics/:topic/messages", ConsumeHandler(b))
+				consumers.GET("/topics/:topic/messages/status", ListMessagesHandler(b))
 				consumers.GET("/topics/:topic/offsets", GetOffsetHandler(b))
 				consumers.POST("/topics/:topic/offsets", CommitOffsetHandler(b))
 

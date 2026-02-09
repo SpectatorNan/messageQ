@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"messageQ/mq/storage"
+	"sort"
 	"sync"
 	"time"
 
@@ -148,6 +149,53 @@ func (ds *BinaryDelayScheduler) Stats() map[string]interface{} {
 	}
 
 	return stats
+}
+
+// ListScheduled returns scheduled delayed messages filtered by topic/queue with cursor pagination.
+// Cursor is an index into the sorted list by ExecuteAt ascending.
+func (ds *BinaryDelayScheduler) ListScheduled(topic string, queueID *int, cursor int64, limit int) ([]DelayedMessage, *int64) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+
+	ds.mu.Lock()
+	items := make([]DelayedMessage, 0, ds.delayQueue.Len())
+	for _, dm := range ds.delayQueue {
+		if topic != "" && dm.Topic != topic {
+			continue
+		}
+		if queueID != nil && dm.QueueID != *queueID {
+			continue
+		}
+		items = append(items, *dm)
+	}
+	ds.mu.Unlock()
+
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].ExecuteAt.Equal(items[j].ExecuteAt) {
+			return items[i].Message.ID < items[j].Message.ID
+		}
+		return items[i].ExecuteAt.Before(items[j].ExecuteAt)
+	})
+
+	start := int(cursor)
+	if start > len(items) {
+		start = len(items)
+	}
+	end := start + limit
+	if end > len(items) {
+		end = len(items)
+	}
+	page := items[start:end]
+	var next *int64
+	if end < len(items) {
+		n := int64(end)
+		next = &n
+	}
+	return page, next
 }
 
 // persistToCommitLog saves all pending delayed messages to system topic

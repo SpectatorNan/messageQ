@@ -11,6 +11,12 @@ type Message struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+// MessageWithOffset adds consumequeue offset metadata.
+type MessageWithOffset struct {
+	Message
+	Offset int64 `json:"offset"`
+}
+
 // Storage is a simple persistence interface for queue messages per topic/queue.
 // Implementations should be safe for concurrent use by the application layer.
 type Storage interface {

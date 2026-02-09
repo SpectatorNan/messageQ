@@ -14,6 +14,8 @@ type (
 	ProduceMessageRequest struct {
 		Topic string `uri:"topic" binding:"required"`
 		client.ProduceMessageRequest
+		DelayMsAlt  int64 `json:"delay_ms"`
+		DelaySecAlt int64 `json:"delay_sec"`
 	}
 	ProduceMessageResponse struct {
 		ID          string `json:"id"`
@@ -31,6 +33,15 @@ type (
 		GroupName string `uri:"group" binding:"required"`
 		Tag       string `form:"tag"`
 		QueueId   *int   `form:"queueId"`
+	}
+	ListMessagesRequest struct {
+		Topic     string `uri:"topic" binding:"required"`
+		GroupName string `uri:"group" binding:"required"`
+		State     string `form:"state"`
+		Tag       string `form:"tag"`
+		QueueId   *int   `form:"queueId"`
+		Cursor    *int64 `form:"cursor"`
+		Limit     *int   `form:"limit"`
 	}
 	GetOffsetRequest struct {
 		Topic     string `uri:"topic" binding:"required"`
@@ -81,6 +92,26 @@ type (
 		Retry     int    `json:"retry"`
 		Timestamp int64  `json:"timestamp"`
 	}
+	MessageStatus struct {
+		ID         string `json:"id"`
+		Body       string `json:"body"`
+		Tag        string `json:"tag,omitempty"`
+		Retry      int    `json:"retry"`
+		Timestamp  int64  `json:"timestamp"`
+		ScheduledAt *int64 `json:"scheduledAt,omitempty"`
+		ConsumedAt *int64 `json:"consumedAt,omitempty"`
+		AckedAt    *int64 `json:"ackedAt,omitempty"`
+		QueueID    *int   `json:"queueId,omitempty"`
+		Offset     *int64 `json:"offset,omitempty"`
+		NextOffset *int64 `json:"nextOffset,omitempty"`
+	}
+	ListMessagesResponse struct {
+		Group    string          `json:"group"`
+		Topic    string          `json:"topic"`
+		State    string          `json:"state"`
+		Messages []MessageStatus `json:"messages"`
+		NextCursor *int64         `json:"nextCursor,omitempty"`
+	}
 )
 
 func (r *ProduceMessageRequest) Validate() error {
@@ -91,6 +122,9 @@ func (r *ProduceMessageRequest) Validate() error {
 	}
 	body := strings.TrimSpace(r.Body)
 	if body == "" {
+		return errx.ErrInvalidMessage
+	}
+	if strings.TrimSpace(r.Tag) == "" {
 		return errx.ErrInvalidMessage
 	}
 
@@ -107,6 +141,30 @@ func (r *ConsumeMessageRequest) Validate() error {
 		return err
 	}
 
+	return nil
+}
+
+func (r *ListMessagesRequest) Validate() error {
+	if err := validateTopicName(r.Topic); err != nil {
+		logger.Warn("Invalid topic name", zap.String("topic", r.Topic))
+		return err
+	}
+	if err := validateGroupName(r.GroupName); err != nil {
+		logger.Warn("Invalid group name", zap.String("group", r.GroupName))
+		return err
+	}
+	if r.State != "" && r.State != "processing" && r.State != "acked" && r.State != "completed" && r.State != "pending" && r.State != "scheduled" {
+		return errx.ErrInvalidMessage
+	}
+	if (r.State == "pending" || r.State == "scheduled") && r.QueueId != nil && *r.QueueId < 0 {
+		return errx.ErrInvalidQueueID
+	}
+	if r.State == "pending" && r.QueueId == nil {
+		return errx.ErrInvalidQueueID
+	}
+	if r.Limit != nil && *r.Limit <= 0 {
+		return errx.ErrInvalidMessage
+	}
 	return nil
 }
 

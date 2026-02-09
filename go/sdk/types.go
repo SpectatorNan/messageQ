@@ -92,6 +92,26 @@ type (
 		Retry     int    `json:"retry"`
 		Timestamp int64  `json:"timestamp"`
 	}
+	MessageStatus struct {
+		ID          string `json:"id"`
+		Body        string `json:"body"`
+		Tag         string `json:"tag,omitempty"`
+		Retry       int    `json:"retry"`
+		Timestamp   int64  `json:"timestamp"`
+		ScheduledAt *int64 `json:"scheduledAt,omitempty"`
+		ConsumedAt  *int64 `json:"consumedAt,omitempty"`
+		AckedAt     *int64 `json:"ackedAt,omitempty"`
+		QueueID     *int   `json:"queueId,omitempty"`
+		Offset      *int64 `json:"offset,omitempty"`
+		NextOffset  *int64 `json:"nextOffset,omitempty"`
+	}
+	ListMessagesResponse struct {
+		Group      string          `json:"group"`
+		Topic      string          `json:"topic"`
+		State      string          `json:"state"`
+		Messages   []MessageStatus `json:"messages"`
+		NextCursor *int64          `json:"nextCursor,omitempty"`
+	}
 	AckMessageResponse struct {
 		MessageID string `json:"messageId"`
 		Acked     bool   `json:"acked"`

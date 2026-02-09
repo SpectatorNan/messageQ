@@ -30,6 +30,12 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 			respx.FailGin(c, err)
 			return
 		}
+		if req.DelayMs == 0 && req.DelayMsAlt > 0 {
+			req.DelayMs = req.DelayMsAlt
+		}
+		if req.DelaySec == 0 && req.DelaySecAlt > 0 {
+			req.DelaySec = req.DelaySecAlt
+		}
 
 		err := req.Validate()
 		if err != nil {
@@ -213,6 +219,209 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			Offset:     offset,
 			NextOffset: next,
 			State:      "processing",
+		}
+
+		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
+	}
+}
+
+// ListMessagesHandler returns processing or acked message list for a group/topic.
+func ListMessagesHandler(b *broker.Broker) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req ListMessagesRequest
+		if err := c.ShouldBindUri(&req); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+		if err := c.ShouldBindQuery(&req); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+
+		if err := req.Validate(); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+		if req.State == "" {
+			req.State = "processing"
+		}
+		limit := 50
+		if req.Limit != nil {
+			limit = *req.Limit
+		}
+		if limit > 500 {
+			limit = 500
+		}
+
+		resp := ListMessagesResponse{
+			Group: req.GroupName,
+			Topic: req.Topic,
+			State: req.State,
+		}
+
+		switch req.State {
+		case "pending":
+			queueID := *req.QueueId
+			msgs, nextCursor, err := b.ListPending(req.GroupName, req.Topic, queueID, req.Cursor, limit, req.Tag)
+			if err != nil {
+				respx.FailGin(c, errx.ErrOffsetUnsupported)
+				return
+			}
+			resp.State = "pending"
+			out := make([]MessageStatus, 0, len(msgs))
+			for _, msg := range msgs {
+				qid := queueID
+				off := msg.Offset
+				out = append(out, MessageStatus{
+					ID:        msg.ID,
+					Body:      msg.Body,
+					Tag:       msg.Tag,
+					Retry:     msg.Retry,
+					Timestamp: msg.Timestamp.Unix(),
+					QueueID:   &qid,
+					Offset:    &off,
+				})
+			}
+			resp.Messages = out
+			resp.NextCursor = &nextCursor
+		case "scheduled":
+			var next *int64
+			queueID := req.QueueId
+			var cursor int64
+			if req.Cursor != nil {
+				cursor = *req.Cursor
+			}
+			if ds := b.GetDelayScheduler(); ds != nil {
+				items, nc := ds.ListScheduled(req.Topic, queueID, cursor, limit)
+				next = nc
+				resp.State = "scheduled"
+				out := make([]MessageStatus, 0, len(items))
+				for _, item := range items {
+					qid := item.QueueID
+					scheduledAt := item.ExecuteAt.Unix()
+					out = append(out, MessageStatus{
+						ID:          item.Message.ID,
+						Body:        item.Message.Body,
+						Tag:         item.Message.Tag,
+						Retry:       item.Message.Retry,
+						Timestamp:   item.Message.Timestamp.Unix(),
+						ScheduledAt: &scheduledAt,
+						QueueID:     &qid,
+					})
+				}
+				resp.Messages = out
+				resp.NextCursor = next
+			} else {
+				respx.FailGin(c, errx.ErrNotFound)
+				return
+			}
+		case "processing":
+			entries := b.ListProcessing(req.GroupName, req.Topic, limit)
+			if req.Tag != "" {
+				filtered := entries[:0]
+				for _, entry := range entries {
+					if entry.Tag == req.Tag {
+						filtered = append(filtered, entry)
+					}
+				}
+				entries = filtered
+			}
+			cursor := int64(0)
+			if req.Cursor != nil {
+				cursor = *req.Cursor
+			}
+			start := int(cursor)
+			if start < 0 {
+				start = 0
+			}
+			if start > len(entries) {
+				start = len(entries)
+			}
+			end := start + limit
+			if end > len(entries) {
+				end = len(entries)
+			}
+			page := entries[start:end]
+			if end < len(entries) {
+				nc := int64(end)
+				resp.NextCursor = &nc
+			}
+			msgs := make([]MessageStatus, 0, len(entries))
+			for _, entry := range page {
+				consumedAt := entry.ConsumedAt.Unix()
+				qid := entry.QueueID
+				off := entry.Offset
+				next := entry.NextOffset
+				msgs = append(msgs, MessageStatus{
+					ID:         entry.MsgID,
+					Body:       entry.Body,
+					Tag:        entry.Tag,
+					Retry:      entry.Retry,
+					Timestamp:  entry.Timestamp.Unix(),
+					ConsumedAt: &consumedAt,
+					AckedAt:    nil,
+					QueueID:    &qid,
+					Offset:     &off,
+					NextOffset: &next,
+				})
+			}
+			resp.Messages = msgs
+		case "acked", "completed":
+			entries := b.ListCompleted(req.GroupName, req.Topic, limit)
+			if req.Tag != "" {
+				filtered := entries[:0]
+				for _, entry := range entries {
+					if entry.Tag == req.Tag {
+						filtered = append(filtered, entry)
+					}
+				}
+				entries = filtered
+			}
+			cursor := int64(0)
+			if req.Cursor != nil {
+				cursor = *req.Cursor
+			}
+			start := int(cursor)
+			if start < 0 {
+				start = 0
+			}
+			if start > len(entries) {
+				start = len(entries)
+			}
+			end := start + limit
+			if end > len(entries) {
+				end = len(entries)
+			}
+			page := entries[start:end]
+			if end < len(entries) {
+				nc := int64(end)
+				resp.NextCursor = &nc
+			}
+			resp.State = "completed"
+			msgs := make([]MessageStatus, 0, len(entries))
+			for _, entry := range page {
+				consumedAt := entry.ConsumedAt.Unix()
+				ackedAt := entry.AckedAt.Unix()
+				qid := entry.QueueID
+				off := entry.Offset
+				next := entry.NextOffset
+				msgs = append(msgs, MessageStatus{
+					ID:         entry.MsgID,
+					Body:       entry.Body,
+					Tag:        entry.Tag,
+					Retry:      entry.Retry,
+					Timestamp:  entry.Timestamp.Unix(),
+					ConsumedAt: &consumedAt,
+					AckedAt:    &ackedAt,
+					QueueID:    &qid,
+					Offset:     &off,
+					NextOffset: &next,
+				})
+			}
+			resp.Messages = msgs
+		default:
+			respx.FailGin(c, errx.ErrInvalidMessage)
+			return
 		}
 
 		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))

@@ -19,6 +19,9 @@ func CreateTopicHandler(b *broker.Broker) gin.HandlerFunc {
 			respx.FailGin(c, errx.ErrInvalidMessage)
 			return
 		}
+		if req.QueueCount == 0 && req.QueueCountAlt > 0 {
+			req.QueueCount = req.QueueCountAlt
+		}
 
 		err := req.Validate()
 		if err != nil {

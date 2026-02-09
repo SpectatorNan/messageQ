@@ -13,6 +13,7 @@ type (
 		Name       string           `json:"name" binding:"required"`
 		Type       broker.TopicType `json:"type" binding:"required"` // NORMAL or DELAY
 		QueueCount int              `json:"queueCount"`
+		QueueCountAlt int           `json:"queue_count"`
 	}
 	GetTopicRequest struct {
 		Topic string `uri:"topic" binding:"required"`

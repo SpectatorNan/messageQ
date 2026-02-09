@@ -3,6 +3,7 @@ package client
 import (
 	"fmt"
 	"messageQ/mq/broker"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -191,5 +192,8 @@ func (suite *APITestSuite) TestConsumeMessages() {
 }
 
 func TestAPITestSuite(t *testing.T) {
+	if os.Getenv("MSGQ_RUN_SDK_TESTS") == "" {
+		t.Skip("set MSGQ_RUN_SDK_TESTS=1 to run SDK integration tests")
+	}
 	suite.Run(t, new(APITestSuite))
 }
