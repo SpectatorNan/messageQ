@@ -12,7 +12,7 @@ type (
 	CreateTopicRequest struct {
 		Name       string           `json:"name" binding:"required"`
 		Type       broker.TopicType `json:"type" binding:"required"` // NORMAL or DELAY
-		QueueCount int              `json:"queue_count"`
+		QueueCount int              `json:"queueCount"`
 	}
 	GetTopicRequest struct {
 		Topic string `uri:"topic" binding:"required"`
@@ -22,8 +22,8 @@ type (
 	TopicResponse struct {
 		Name       string           `json:"name"`
 		Type       broker.TopicType `json:"type"`
-		QueueCount int              `json:"queue_count"`
-		CreatedAt  int64            `json:"created_at,omitempty"`
+		QueueCount int              `json:"queueCount"`
+		CreatedAt  int64            `json:"createdAt,omitempty"`
 	}
 	DeleteTopicRequest struct {
 		Topic string `uri:"topic" binding:"required"`

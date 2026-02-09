@@ -1,7 +1,6 @@
 package api
 
 import (
-	"messageQ/mq/broker"
 	"time"
 )
 
@@ -9,7 +8,7 @@ import (
 type OffsetResponse struct {
 	Group   string `json:"group"`
 	Topic   string `json:"topic"`
-	QueueID int    `json:"queue_id"`
+	QueueID int    `json:"queueId"`
 	Offset  *int64 `json:"offset"` // pointer to distinguish between 0 and null
 }
 
@@ -17,20 +16,14 @@ type OffsetResponse struct {
 type CommitOffsetResponse struct {
 	Group     string `json:"group"`
 	Topic     string `json:"topic"`
-	QueueID   int    `json:"queue_id"`
+	QueueID   int    `json:"queueId"`
 	Offset    int64  `json:"offset"`
 	Committed bool   `json:"committed"`
-}
-
-// ListTopicsResponse is the response for listing topics
-type ListTopicsResponse struct {
-	Topics []*broker.TopicConfig `json:"topics"`
-	Total  int                   `json:"total"`
 }
 
 // StatsResponse is the response for stats endpoint
 type StatsResponse struct {
 	Groups         map[string]interface{} `json:"groups,omitempty"`
-	DelayScheduler map[string]interface{} `json:"delay_scheduler,omitempty"`
+	DelayScheduler map[string]interface{} `json:"delayScheduler,omitempty"`
 	Timestamp      time.Time              `json:"timestamp"`
 }

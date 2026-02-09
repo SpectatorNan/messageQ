@@ -5,7 +5,6 @@ import (
 	"messageQ/mq/logger"
 	client "messageQ/sdk"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -17,31 +16,31 @@ type (
 		client.ProduceMessageRequest
 	}
 	ProduceMessageResponse struct {
-		ID          string     `json:"id"`
-		Topic       string     `json:"topic"`
-		Tag         string     `json:"tag"`
-		Body        string     `json:"body"`
-		Timestamp   time.Time  `json:"timestamp"`
-		Retry       int        `json:"retry"`
-		ScheduledAt time.Time  `json:"scheduled_at"`
-		ExecutedAt  *time.Time `json:"executed_at"`
+		ID          string `json:"id"`
+		Topic       string `json:"topic"`
+		Tag         string `json:"tag"`
+		Body        string `json:"body"`
+		Timestamp   int64  `json:"timestamp"`
+		Retry       int    `json:"retry"`
+		ScheduledAt int64  `json:"scheduledAt"`
+		ExecutedAt  *int64 `json:"executedAt"`
 	}
 
 	ConsumeMessageRequest struct {
 		Topic     string `uri:"topic" binding:"required"`
 		GroupName string `uri:"group" binding:"required"`
 		Tag       string `form:"tag"`
-		QueueId   *int   `form:"queue_id"`
+		QueueId   *int   `form:"queueId"`
 	}
 	GetOffsetRequest struct {
 		Topic     string `uri:"topic" binding:"required"`
 		GroupName string `uri:"group" binding:"required"`
-		QueueID   *int   `form:"queue_id"`
+		QueueID   *int   `form:"queueId"`
 	}
 	CommitOffsetRequest struct {
 		Topic     string `uri:"topic" binding:"required"`
 		GroupName string `uri:"group" binding:"required"`
-		QueueID   int    `json:"queue_id"`
+		QueueID   int    `json:"queueId"`
 		Offset    int64  `json:"offset" binding:"required"`
 	}
 	AckMessageRequest struct {
@@ -50,7 +49,7 @@ type (
 		GroupName string `uri:"group" binding:"required"`
 	}
 	AckResponse struct {
-		MessageID string `json:"message_id"`
+		MessageID string `json:"messageId"`
 		Acked     bool   `json:"acked"`
 		Topic     string `json:"topic"`
 	}
@@ -60,7 +59,7 @@ type (
 		GroupName string `uri:"group" binding:"required"`
 	}
 	NackResponse struct {
-		MessageID string `json:"message_id"`
+		MessageID string `json:"messageId"`
 		Nacked    bool   `json:"nacked"`
 		Topic     string `json:"topic"`
 		Requeued  bool   `json:"requeued"`
@@ -70,17 +69,17 @@ type (
 		Message    ConsumeMessage `json:"message"` // storage.Message
 		Group      string         `json:"group"`
 		Topic      string         `json:"topic"`
-		QueueID    int            `json:"queue_id"`
+		QueueID    int            `json:"queueId"`
 		Offset     int64          `json:"offset"`
-		NextOffset int64          `json:"next_offset"`
+		NextOffset int64          `json:"nextOffset"`
 		State      string         `json:"state"`
 	}
 	ConsumeMessage struct {
-		ID        string    `json:"id"`
-		Body      string    `json:"body"`
-		Tag       string    `json:"tag,omitempty"`
-		Retry     int       `json:"retry"`
-		Timestamp time.Time `json:"timestamp"`
+		ID        string `json:"id"`
+		Body      string `json:"body"`
+		Tag       string `json:"tag,omitempty"`
+		Retry     int    `json:"retry"`
+		Timestamp int64  `json:"timestamp"`
 	}
 )
 

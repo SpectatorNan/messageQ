@@ -80,12 +80,7 @@ func ListTopicsHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		topics := b.ListTopics()
 
-		resp := ListTopicsResponse{
-			Topics: topics,
-			Total:  len(topics),
-		}
-
-		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
+		c.JSON(http.StatusOK, respx.NewRespList(topics, len(topics)))
 	}
 }
 

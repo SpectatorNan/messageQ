@@ -90,7 +90,10 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 				ID:          msg.ID,
 				Topic:       req.Topic,
 				Tag:         msg.Tag,
-				ScheduledAt: msg.Timestamp,
+				Body:        msg.Body,
+				Timestamp:   msg.Timestamp.Unix(),
+				Retry:       msg.Retry,
+				ScheduledAt: msg.Timestamp.Add(delay).Unix(),
 				ExecutedAt:  nil,
 			}
 
@@ -106,12 +109,14 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 			zap.String("tag", req.Tag))
 
 		resp := ProduceMessageResponse{
-			ID:        msg.ID,
-			Topic:     req.Topic,
-			Tag:       msg.Tag,
-			Body:      msg.Body,
-			Timestamp: msg.Timestamp,
-			Retry:     msg.Retry,
+			ID:          msg.ID,
+			Topic:       req.Topic,
+			Tag:         msg.Tag,
+			Body:        msg.Body,
+			Timestamp:   msg.Timestamp.Unix(),
+			Retry:       msg.Retry,
+			ScheduledAt: msg.Timestamp.Unix(),
+			ExecutedAt:  nil,
 		}
 
 		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
@@ -200,7 +205,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 				Body:      msg.Body,
 				Tag:       msg.Tag,
 				Retry:     msg.Retry,
-				Timestamp: msg.Timestamp,
+				Timestamp: msg.Timestamp.Unix(),
 			},
 			Group:      req.GroupName,
 			Topic:      req.Topic,

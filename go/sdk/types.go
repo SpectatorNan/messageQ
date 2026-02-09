@@ -2,7 +2,6 @@ package client
 
 import (
 	"messageQ/mq/broker"
-	"time"
 )
 
 type CreateAccessKeyRequest struct {
@@ -42,23 +41,23 @@ type ErrResp struct {
 type ProduceMessageRequest struct {
 	Body     string `json:"body"`
 	Tag      string `json:"tag"`
-	DelayMs  int64  `json:"delay_ms"`  // optional: delay in milliseconds
-	DelaySec int64  `json:"delay_sec"` // optional: delay in seconds
+	DelayMs  int64  `json:"delayMs"`  // optional: delay in milliseconds
+	DelaySec int64  `json:"delaySec"` // optional: delay in seconds
 }
 type ProduceMessageResponse struct {
-	ID           string    `json:"id"`
-	Topic        string    `json:"topic"`
-	Tag          string    `json:"tag"`
-	ScheduledAt  time.Time `json:"scheduled_at"`
-	ExecuteAt    time.Time `json:"execute_at"`
-	DelaySeconds float64   `json:"delay_seconds"`
-	DelayMs      int64     `json:"delay_ms"`
+	ID           string  `json:"id"`
+	Topic        string  `json:"topic"`
+	Tag          string  `json:"tag"`
+	ScheduledAt  int64   `json:"scheduledAt"`
+	ExecuteAt    *int64  `json:"executeAt"`
+	DelaySeconds float64 `json:"delaySeconds"`
+	DelayMs      int64   `json:"delayMs"`
 }
 
 type CreateTopicRequest struct {
 	Name       string           `json:"name" binding:"required"`
 	Type       broker.TopicType `json:"type" binding:"required"` // NORMAL or DELAY
-	QueueCount int              `json:"queue_count"`
+	QueueCount int              `json:"queueCount"`
 }
 type GetTopicRequest struct {
 	Topic string `uri:"topic" binding:"required"`
@@ -66,8 +65,8 @@ type GetTopicRequest struct {
 type TopicResponse struct {
 	Name       string           `json:"name"`
 	Type       broker.TopicType `json:"type"`
-	QueueCount int              `json:"queue_count"`
-	CreatedAt  int64            `json:"created_at,omitempty"`
+	QueueCount int              `json:"queueCount"`
+	CreatedAt  int64            `json:"createdAt,omitempty"`
 }
 
 // DeleteTopicResponse is the response for deleting a topic
@@ -81,25 +80,25 @@ type (
 		Message    ConsumeMessage `json:"message"` // storage.Message
 		Group      string         `json:"group"`
 		Topic      string         `json:"topic"`
-		QueueID    int            `json:"queue_id"`
+		QueueID    int            `json:"queueId"`
 		Offset     int64          `json:"offset"`
-		NextOffset int64          `json:"next_offset"`
+		NextOffset int64          `json:"nextOffset"`
 		State      string         `json:"state"`
 	}
 	ConsumeMessage struct {
-		ID        string    `json:"id"`
-		Body      string    `json:"body"`
-		Tag       string    `json:"tag,omitempty"`
-		Retry     int       `json:"retry"`
-		Timestamp time.Time `json:"timestamp"`
+		ID        string `json:"id"`
+		Body      string `json:"body"`
+		Tag       string `json:"tag,omitempty"`
+		Retry     int    `json:"retry"`
+		Timestamp int64  `json:"timestamp"`
 	}
 	AckMessageResponse struct {
-		MessageID string `json:"message_id"`
+		MessageID string `json:"messageId"`
 		Acked     bool   `json:"acked"`
 		Topic     string `json:"topic"`
 	}
 	NackMessageResponse struct {
-		MessageID string `json:"message_id"`
+		MessageID string `json:"messageId"`
 		Nacked    bool   `json:"nacked"`
 		Topic     string `json:"topic"`
 		Requeued  bool   `json:"requeued"`
