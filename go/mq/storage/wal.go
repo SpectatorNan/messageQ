@@ -748,6 +748,36 @@ func (w *WALStorage) Stats() (map[string]interface{}, error) {
 	return stats, nil
 }
 
+// ConsumeQueueDepth returns the number of entries in the consumequeue for a topic/queue.
+// Each entry is cqEntrySize (20) bytes.
+func (w *WALStorage) ConsumeQueueDepth(topic string, queueID int) int64 {
+	cqPath := w.consumeQueueFile(topic, queueID)
+	info, err := os.Stat(cqPath)
+	if err != nil {
+		return 0
+	}
+	return info.Size() / cqEntrySize
+}
+
+// CommitLogBytes returns the total size in bytes of all commitlog segments for a topic/queue.
+func (w *WALStorage) CommitLogBytes(topic string, queueID int) int64 {
+	dir := w.commitLogDir(topic, queueID)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			total += info.Size()
+		}
+	}
+	return total
+}
+
 // SetCompactThreshold sets the byte threshold to trigger segment rotation/compaction.
 func (w *WALStorage) SetCompactThreshold(n int64) {
 	w.mu.Lock()

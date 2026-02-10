@@ -49,6 +49,7 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 
 			// Monitoring
 			protected.GET("/stats", DelayStatsHandler(b))
+			protected.GET("/stats/topics/:topic", TopicStatsHandler(b))
 		}
 
 		admin := v1.Group("/admin")

@@ -188,3 +188,55 @@ type (
 		Requeued  bool   `json:"requeued"`
 	}
 )
+
+// Stats types
+
+type (
+	StatsResponse struct {
+		Topics         []TopicStatsResponse          `json:"topics"`
+		ConsumerGroups []ConsumerGroupStatsResponse   `json:"consumerGroups"`
+		DelayScheduler map[string]interface{}         `json:"delayScheduler,omitempty"`
+		Total          int64                          `json:"total"`
+		Completed      int64                          `json:"completed"`
+		Processing     int64                          `json:"processing"`
+		Pending        int64                          `json:"pending"`
+		Timestamp      string                         `json:"timestamp"`
+	}
+	TopicStatsResponse struct {
+		Name       string           `json:"name"`
+		Type       broker.TopicType `json:"type"`
+		QueueCount int              `json:"queueCount"`
+		Total      int64            `json:"total"`
+		CreatedAt  int64            `json:"createdAt"`
+	}
+	ConsumerGroupStatsResponse struct {
+		Group      string                           `json:"group"`
+		Total      int64                            `json:"total"`
+		Completed  int64                            `json:"completed"`
+		Processing int64                            `json:"processing"`
+		Pending    int64                            `json:"pending"`
+		Topics     []ConsumerGroupTopicStatsResponse `json:"topics"`
+	}
+	ConsumerGroupTopicStatsResponse struct {
+		Topic      string `json:"topic"`
+		Total      int64  `json:"total"`
+		Completed  int64  `json:"completed"`
+		Processing int64  `json:"processing"`
+		Pending    int64  `json:"pending"`
+	}
+	TopicDetailStatsResponse struct {
+		Name       string                        `json:"name"`
+		Type       broker.TopicType              `json:"type"`
+		QueueCount int                           `json:"queueCount"`
+		Total      int64                         `json:"total"`
+		Consumers  []TopicConsumerStatsResponse  `json:"consumers"`
+		CreatedAt  int64                         `json:"createdAt"`
+		Timestamp  string                        `json:"timestamp"`
+	}
+	TopicConsumerStatsResponse struct {
+		Group      string `json:"group"`
+		Completed  int64  `json:"completed"`
+		Processing int64  `json:"processing"`
+		Pending    int64  `json:"pending"`
+	}
+)

@@ -116,6 +116,36 @@ func (h *API) DeleteAccessKey(id string) (*Resp[string], *ErrResp, error) {
 	return result, errResp, nil
 }
 
+// GetStats returns comprehensive broker statistics.
+func (h *API) GetStats() (*Resp[StatsResponse], *ErrResp, error) {
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var result *Resp[StatsResponse]
+	errResp, err := h.Get(r.SetResult(&result), h.endpoint.GetStats())
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
+// GetTopicStats returns detailed statistics for a specific topic.
+func (h *API) GetTopicStats(topic string) (*Resp[TopicDetailStatsResponse], *ErrResp, error) {
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var result *Resp[TopicDetailStatsResponse]
+	errResp, err := h.Get(r.SetResult(&result), h.endpoint.GetTopicStats(topic))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
 func (h *API) CreateTopic(name string, topicType broker.TopicType, queueCount int) (*Resp[TopicResponse], *ErrResp, error) {
 
 	req := CreateTopicRequest{

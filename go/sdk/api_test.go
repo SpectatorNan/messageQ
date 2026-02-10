@@ -3,7 +3,6 @@ package client
 import (
 	"fmt"
 	"messageQ/mq/broker"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -286,7 +285,7 @@ func (suite *APITestSuite) TestBatchProduceConsume() {
 	suite.Len(acked, len(messages))
 }
 
-func (suite *APITestSuite) TestListMessages() { 
+func (suite *APITestSuite) TestListMessages() {
 	group := "test-group"
 	tag := "test-tag"
 
@@ -405,13 +404,13 @@ func (suite *APITestSuite) TestListMessages() {
 		suite.T().Fatalf("completed list did not include acked message")
 	}
 
-		listResp2, errResp, err := suite.api.ListMessages(normalTopic, group, "pending", WithListQueueId(0), WithListLimit(10))
-		suite.NoError(err)
-		suite.Nil(errResp)
-		suite.NotNil(listResp2)
-		suite.Equal("ok", listResp2.Code)
-		suite.Equal("pending", listResp2.Data.State)
-		suite.Equal(4, len(listResp2.Data.Messages), "expected 4 pending messages after consuming 1")
+	listResp2, errResp, err := suite.api.ListMessages(normalTopic, group, "pending", WithListQueueId(0), WithListLimit(10))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(listResp2)
+	suite.Equal("ok", listResp2.Code)
+	suite.Equal("pending", listResp2.Data.State)
+	suite.Equal(4, len(listResp2.Data.Messages), "expected 4 pending messages after consuming 1")
 
 	// scheduled list
 	_, errResp, err = suite.api.ProduceMessage(delayTopic, tag, "list-message-delay", WithDelaySeconds(30))
@@ -431,9 +430,27 @@ func (suite *APITestSuite) TestListMessages() {
 	}
 }
 
+func (suite *APITestSuite) TestGetFullStats() {
+
+	resp, errResp, err := suite.api.GetStats()
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(resp)
+	suite.Equal("ok", resp.Code)
+	suite.NotNil(resp.Data)
+}
+
+func (suite *APITestSuite) TestGetTopicStats() {
+	topicName := "test-topic"
+	resp, errResp, err := suite.api.GetTopicStats(topicName)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(resp)
+	suite.Equal("ok", resp.Code)
+	suite.NotNil(resp.Data)
+}
+
 func TestAPITestSuite(t *testing.T) {
-	if os.Getenv("MSGQ_RUN_SDK_TESTS") == "" {
-		t.Skip("set MSGQ_RUN_SDK_TESTS=1 to run SDK integration tests")
-	}
+
 	suite.Run(t, new(APITestSuite))
 }

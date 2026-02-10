@@ -27,6 +27,9 @@ func (e *Endpoint) DeleteAccessKey(id string) string {
 func (e *Endpoint) GetStats() string {
 	return fmt.Sprintf("%s/api/v1/stats", e.baseUrl)
 }
+func (e *Endpoint) GetTopicStats(topic string) string {
+	return fmt.Sprintf("%s/api/v1/stats/topics/%s", e.baseUrl, topic)
+}
 
 // topics
 func (e *Endpoint) CreateTopic() string {

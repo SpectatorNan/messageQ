@@ -898,6 +898,272 @@ func (b *Broker) PeekTopicQueueTotal() int {
 	return len(b.queues)
 }
 
+// TopicStats holds per-topic message statistics.
+type TopicStats struct {
+	Name       string    `json:"name"`
+	Type       TopicType `json:"type"`
+	QueueCount int       `json:"queueCount"`
+	Total      int64     `json:"total"`      // total messages produced
+	CreatedAt  int64     `json:"createdAt"`
+}
+
+// ConsumerGroupTopicStats holds per-topic stats within a consumer group.
+type ConsumerGroupTopicStats struct {
+	Topic      string `json:"topic"`
+	Total      int64  `json:"total"`      // total messages in the topic
+	Completed  int64  `json:"completed"`  // acked messages
+	Processing int64  `json:"processing"` // in-flight messages
+	Pending    int64  `json:"pending"`    // waiting to be consumed
+}
+
+// ConsumerGroupStats holds per-consumer-group statistics.
+type ConsumerGroupStats struct {
+	Group      string                    `json:"group"`
+	Total      int64                     `json:"total"`
+	Completed  int64                     `json:"completed"`
+	Processing int64                     `json:"processing"`
+	Pending    int64                     `json:"pending"`
+	Topics     []ConsumerGroupTopicStats `json:"topics"`
+}
+
+// BrokerStats holds the full broker statistics.
+type BrokerStats struct {
+	Topics         []TopicStats             `json:"topics"`
+	ConsumerGroups []ConsumerGroupStats     `json:"consumerGroups"`
+	DelayScheduler map[string]interface{}   `json:"delayScheduler,omitempty"`
+	Total          int64                    `json:"total"`
+	Completed      int64                    `json:"completed"`
+	Processing     int64                    `json:"processing"`
+	Pending        int64                    `json:"pending"`
+}
+
+// consumeQueueDepthReader is an optional interface for storage to report queue depth.
+type consumeQueueDepthReader interface {
+	ConsumeQueueDepth(topic string, queueID int) int64
+}
+
+// topicDepth returns the total message count (consumequeue depth) for a topic.
+func (b *Broker) topicDepth(topic string, queueCount int) int64 {
+	dr, ok := b.store.(consumeQueueDepthReader)
+	if !ok {
+		return 0
+	}
+	var total int64
+	for i := 0; i < queueCount; i++ {
+		total += dr.ConsumeQueueDepth(topic, i)
+	}
+	return total
+}
+
+// topicConsumed returns the total consumed offset (sum across all queues) for a group/topic.
+func (b *Broker) topicConsumed(group, topic string, queueCount int) int64 {
+	var total int64
+	for i := 0; i < queueCount; i++ {
+		off, ok, err := b.GetOffset(group, topic, i)
+		if err == nil && ok {
+			total += off
+		}
+	}
+	return total
+}
+
+// countProcessing returns the number of in-flight processing entries for a group/topic.
+// Must be called with b.lock held.
+func (b *Broker) countProcessingLocked(group, topic string) int64 {
+	var count int64
+	for _, entry := range b.processing {
+		if entry.Group == group && entry.Topic == topic && entry.State == stateProcessing {
+			count++
+		}
+	}
+	return count
+}
+
+// FullStats returns comprehensive broker statistics.
+func (b *Broker) FullStats() BrokerStats {
+	topicConfigs := b.topicManager.ListUserTopics()
+
+	// Build topic depth map
+	topicDepthMap := make(map[string]int64, len(topicConfigs))
+	topicQueueCountMap := make(map[string]int, len(topicConfigs))
+	topicStatsList := make([]TopicStats, 0, len(topicConfigs))
+	var grandTotal int64
+
+	for _, tc := range topicConfigs {
+		qc := tc.QueueCount
+		if qc <= 0 {
+			qc = b.queueCount
+		}
+		depth := b.topicDepth(tc.Name, qc)
+		topicDepthMap[tc.Name] = depth
+		topicQueueCountMap[tc.Name] = qc
+		grandTotal += depth
+
+		topicStatsList = append(topicStatsList, TopicStats{
+			Name:       tc.Name,
+			Type:       tc.Type,
+			QueueCount: qc,
+			Total:      depth,
+			CreatedAt:  tc.CreatedAt,
+		})
+	}
+
+	// Discover consumer groups from b.stats
+	b.lock.Lock()
+	groupSet := make(map[string]bool, len(b.stats))
+	for g := range b.stats {
+		groupSet[g] = true
+	}
+
+	// Also discover groups from processing entries
+	for _, entry := range b.processing {
+		groupSet[entry.Group] = true
+	}
+	b.lock.Unlock()
+
+	// Build consumer group stats
+	var totalCompleted, totalProcessing, totalPending int64
+	groupStatsList := make([]ConsumerGroupStats, 0, len(groupSet))
+
+	for group := range groupSet {
+		var gCompleted, gProcessing, gPending, gTotal int64
+		topicStats := make([]ConsumerGroupTopicStats, 0)
+
+		for _, tc := range topicConfigs {
+			qc := topicQueueCountMap[tc.Name]
+			depth := topicDepthMap[tc.Name]
+			consumed := b.topicConsumed(group, tc.Name, qc)
+
+			b.lock.Lock()
+			processing := b.countProcessingLocked(group, tc.Name)
+			b.lock.Unlock()
+
+			// completed = consumed - processing (consumed offset includes processing messages)
+			completed := consumed - processing
+			if completed < 0 {
+				completed = 0
+			}
+
+			// pending = total depth - consumed
+			pending := depth - consumed
+			if pending < 0 {
+				pending = 0
+			}
+
+			// Only include topics that this group has interacted with
+			if consumed > 0 || processing > 0 {
+				topicStats = append(topicStats, ConsumerGroupTopicStats{
+					Topic:      tc.Name,
+					Total:      depth,
+					Completed:  completed,
+					Processing: processing,
+					Pending:    pending,
+				})
+				gTotal += depth
+				gCompleted += completed
+				gProcessing += processing
+				gPending += pending
+			}
+		}
+
+		if len(topicStats) > 0 {
+			groupStatsList = append(groupStatsList, ConsumerGroupStats{
+				Group:      group,
+				Total:      gTotal,
+				Completed:  gCompleted,
+				Processing: gProcessing,
+				Pending:    gPending,
+				Topics:     topicStats,
+			})
+			totalCompleted += gCompleted
+			totalProcessing += gProcessing
+			totalPending += gPending
+		}
+	}
+
+	// Delay scheduler stats
+	var delayStats map[string]interface{}
+	if ds := b.GetDelayScheduler(); ds != nil {
+		delayStats = ds.Stats()
+	}
+
+	return BrokerStats{
+		Topics:         topicStatsList,
+		ConsumerGroups: groupStatsList,
+		DelayScheduler: delayStats,
+		Total:          grandTotal,
+		Completed:      totalCompleted,
+		Processing:     totalProcessing,
+		Pending:        totalPending,
+	}
+}
+
+// TopicFullStats returns detailed stats for a specific topic across all consumer groups.
+func (b *Broker) TopicFullStats(topicName string) (*TopicStats, []ConsumerGroupTopicStats, error) {
+	tc, err := b.topicManager.GetTopicConfig(topicName)
+	if err != nil {
+		return nil, nil, err
+	}
+	qc := tc.QueueCount
+	if qc <= 0 {
+		qc = b.queueCount
+	}
+	depth := b.topicDepth(tc.Name, qc)
+
+	ts := &TopicStats{
+		Name:       tc.Name,
+		Type:       tc.Type,
+		QueueCount: qc,
+		Total:      depth,
+		CreatedAt:  tc.CreatedAt,
+	}
+
+	// Collect per-consumer-group stats for this topic
+	b.lock.Lock()
+	groupSet := make(map[string]bool, len(b.stats))
+	for g := range b.stats {
+		groupSet[g] = true
+	}
+	for _, entry := range b.processing {
+		if entry.Topic == topicName {
+			groupSet[entry.Group] = true
+		}
+	}
+	b.lock.Unlock()
+
+	consumerStats := make([]ConsumerGroupTopicStats, 0)
+	for group := range groupSet {
+		consumed := b.topicConsumed(group, topicName, qc)
+
+		b.lock.Lock()
+		processing := b.countProcessingLocked(group, topicName)
+		b.lock.Unlock()
+
+		if consumed == 0 && processing == 0 {
+			continue
+		}
+
+		completed := consumed - processing
+		if completed < 0 {
+			completed = 0
+		}
+		pending := depth - consumed
+		if pending < 0 {
+			pending = 0
+		}
+
+		consumerStats = append(consumerStats, ConsumerGroupTopicStats{
+			Topic:      group, // repurpose Topic field as group name in per-topic view
+			Total:      depth,
+			Completed:  completed,
+			Processing: processing,
+			Pending:    pending,
+		})
+	}
+
+	return ts, consumerStats, nil
+}
+
 // ListPending reads pending messages from consumequeue starting at cursor or group offset.
 func (b *Broker) ListPending(group, topic string, queueID int, cursor *int64, limit int, tag string) ([]storage.MessageWithOffset, int64, error) {
 	if limit <= 0 {
