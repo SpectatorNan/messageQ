@@ -14,8 +14,9 @@ type (
 	ProduceMessageRequest struct {
 		Topic string `uri:"topic" binding:"required"`
 		client.ProduceMessageRequest
-		DelayMsAlt  int64 `json:"delay_ms"`
-		DelaySecAlt int64 `json:"delay_sec"`
+		DelayMs     int64                `json:"delayMs"`
+		DelaySec    int64                `json:"delaySec"`
+		ScheduledAt *client.FlexibleUnix `json:"scheduledAt,omitempty"`
 	}
 	ProduceMessageResponse struct {
 		ID          string `json:"id"`
@@ -28,16 +29,17 @@ type (
 		ExecutedAt  *int64 `json:"executedAt"`
 	}
 	ProduceBatchMessage struct {
-		Body     string `json:"body"`
-		Tag      string `json:"tag"`
-		DelayMs  int64  `json:"delayMs"`
-		DelaySec int64  `json:"delaySec"`
+		Body        string               `json:"body"`
+		Tag         string               `json:"tag"`
+		DelayMs     int64                `json:"delayMs"`
+		DelaySec    int64                `json:"delaySec"`
+		ScheduledAt *client.FlexibleUnix `json:"scheduledAt,omitempty"`
 	}
 	ProduceBatchRequest struct {
-		Topic    string                 `uri:"topic" binding:"required"`
-		Messages []ProduceBatchMessage  `json:"messages"`
-		DelayMsAlt  int64 `json:"delay_ms"`
-		DelaySecAlt int64 `json:"delay_sec"`
+		Topic    string                `uri:"topic" binding:"required"`
+		Messages []ProduceBatchMessage `json:"messages"`
+		DelayMs  int64                 `json:"delayMs"`
+		DelaySec int64                 `json:"delaySec"`
 	}
 	ProduceBatchResponse struct {
 		Messages []ProduceMessageResponse `json:"messages"`

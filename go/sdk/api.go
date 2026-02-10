@@ -224,6 +224,12 @@ func WithDelayMilliseconds(delayMs int64) ProduceDelayOption {
 		r.DelayMs = delayMs
 	}
 }
+func WithScheduledAtUnix(unixSec int64) ProduceDelayOption {
+	return func(r *ProduceMessageRequest) {
+		v := FlexibleUnix(unixSec)
+		r.ScheduledAt = &v
+	}
+}
 
 func (h *API) ProduceMessage(topic string, tag string, body string, options ...ProduceDelayOption) (*Resp[ProduceMessageResponse], *ErrResp, error) {
 
@@ -259,6 +265,12 @@ func WithBatchDelaySeconds(delaySec int64) ProduceBatchOption {
 func WithBatchDelayMilliseconds(delayMs int64) ProduceBatchOption {
 	return func(m *ProduceBatchMessage) {
 		m.DelayMs = delayMs
+	}
+}
+func WithBatchScheduledAtUnix(unixSec int64) ProduceBatchOption {
+	return func(m *ProduceBatchMessage) {
+		v := FlexibleUnix(unixSec)
+		m.ScheduledAt = &v
 	}
 }
 

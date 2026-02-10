@@ -82,16 +82,18 @@ type ErrResp struct {
 }
 
 type ProduceMessageRequest struct {
-	Body     string `json:"body"`
-	Tag      string `json:"tag"`
-	DelayMs  int64  `json:"delayMs"`  // optional: delay in milliseconds
-	DelaySec int64  `json:"delaySec"` // optional: delay in seconds
+	Body        string        `json:"body"`
+	Tag         string        `json:"tag"`
+	DelayMs     int64         `json:"delayMs"`               // optional: delay in milliseconds
+	DelaySec    int64         `json:"delaySec"`              // optional: delay in seconds
+	ScheduledAt *FlexibleUnix `json:"scheduledAt,omitempty"` // optional: unix seconds or RFC3339
 }
 type ProduceBatchMessage struct {
-	Body     string `json:"body"`
-	Tag      string `json:"tag"`
-	DelayMs  int64  `json:"delayMs"`
-	DelaySec int64  `json:"delaySec"`
+	Body        string        `json:"body"`
+	Tag         string        `json:"tag"`
+	DelayMs     int64         `json:"delayMs"`
+	DelaySec    int64         `json:"delaySec"`
+	ScheduledAt *FlexibleUnix `json:"scheduledAt,omitempty"`
 }
 type ProduceBatchRequest struct {
 	Messages []ProduceBatchMessage `json:"messages"`
@@ -150,24 +152,24 @@ type (
 		State      string           `json:"state"`
 	}
 	ConsumeMessage struct {
-		ID        string `json:"id"`
-		Body      string `json:"body"`
-		Tag       string `json:"tag,omitempty"`
-		Retry     int    `json:"retry"`
+		ID        string       `json:"id"`
+		Body      string       `json:"body"`
+		Tag       string       `json:"tag,omitempty"`
+		Retry     int          `json:"retry"`
 		Timestamp FlexibleUnix `json:"timestamp"`
 	}
 	MessageStatus struct {
-		ID          string `json:"id"`
-		Body        string `json:"body"`
-		Tag         string `json:"tag,omitempty"`
-		Retry       int    `json:"retry"`
+		ID          string        `json:"id"`
+		Body        string        `json:"body"`
+		Tag         string        `json:"tag,omitempty"`
+		Retry       int           `json:"retry"`
 		Timestamp   FlexibleUnix  `json:"timestamp"`
 		ScheduledAt *FlexibleUnix `json:"scheduledAt,omitempty"`
 		ConsumedAt  *FlexibleUnix `json:"consumedAt,omitempty"`
 		AckedAt     *FlexibleUnix `json:"ackedAt,omitempty"`
-		QueueID     *int   `json:"queueId,omitempty"`
-		Offset      *int64 `json:"offset,omitempty"`
-		NextOffset  *int64 `json:"nextOffset,omitempty"`
+		QueueID     *int          `json:"queueId,omitempty"`
+		Offset      *int64        `json:"offset,omitempty"`
+		NextOffset  *int64        `json:"nextOffset,omitempty"`
 	}
 	ListMessagesResponse struct {
 		Group      string          `json:"group"`
@@ -193,14 +195,14 @@ type (
 
 type (
 	StatsResponse struct {
-		Topics         []TopicStatsResponse          `json:"topics"`
-		ConsumerGroups []ConsumerGroupStatsResponse   `json:"consumerGroups"`
-		DelayScheduler map[string]interface{}         `json:"delayScheduler,omitempty"`
-		Total          int64                          `json:"total"`
-		Completed      int64                          `json:"completed"`
-		Processing     int64                          `json:"processing"`
-		Pending        int64                          `json:"pending"`
-		Timestamp      string                         `json:"timestamp"`
+		Topics         []TopicStatsResponse         `json:"topics"`
+		ConsumerGroups []ConsumerGroupStatsResponse `json:"consumerGroups"`
+		DelayScheduler map[string]interface{}       `json:"delayScheduler,omitempty"`
+		Total          int64                        `json:"total"`
+		Completed      int64                        `json:"completed"`
+		Processing     int64                        `json:"processing"`
+		Pending        int64                        `json:"pending"`
+		Timestamp      string                       `json:"timestamp"`
 	}
 	TopicStatsResponse struct {
 		Name       string           `json:"name"`
@@ -210,11 +212,11 @@ type (
 		CreatedAt  int64            `json:"createdAt"`
 	}
 	ConsumerGroupStatsResponse struct {
-		Group      string                           `json:"group"`
-		Total      int64                            `json:"total"`
-		Completed  int64                            `json:"completed"`
-		Processing int64                            `json:"processing"`
-		Pending    int64                            `json:"pending"`
+		Group      string                            `json:"group"`
+		Total      int64                             `json:"total"`
+		Completed  int64                             `json:"completed"`
+		Processing int64                             `json:"processing"`
+		Pending    int64                             `json:"pending"`
 		Topics     []ConsumerGroupTopicStatsResponse `json:"topics"`
 	}
 	ConsumerGroupTopicStatsResponse struct {
@@ -225,13 +227,13 @@ type (
 		Pending    int64  `json:"pending"`
 	}
 	TopicDetailStatsResponse struct {
-		Name       string                        `json:"name"`
-		Type       broker.TopicType              `json:"type"`
-		QueueCount int                           `json:"queueCount"`
-		Total      int64                         `json:"total"`
-		Consumers  []TopicConsumerStatsResponse  `json:"consumers"`
-		CreatedAt  int64                         `json:"createdAt"`
-		Timestamp  string                        `json:"timestamp"`
+		Name       string                       `json:"name"`
+		Type       broker.TopicType             `json:"type"`
+		QueueCount int                          `json:"queueCount"`
+		Total      int64                        `json:"total"`
+		Consumers  []TopicConsumerStatsResponse `json:"consumers"`
+		CreatedAt  int64                        `json:"createdAt"`
+		Timestamp  string                       `json:"timestamp"`
 	}
 	TopicConsumerStatsResponse struct {
 		Group      string `json:"group"`

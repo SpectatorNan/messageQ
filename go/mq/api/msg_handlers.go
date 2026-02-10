@@ -13,9 +13,42 @@ import (
 	"messageQ/mq/logger"
 	"messageQ/mq/queue"
 	"messageQ/mq/storage"
+	client "messageQ/sdk"
 
 	"github.com/gin-gonic/gin"
 )
+
+const (
+	maxDelaySeconds = 86400 * 30
+	maxDelayMillis  = 86400000 * 30
+)
+
+func resolveDelay(delayMs int64, delaySec int64, scheduledAt *client.FlexibleUnix) (time.Duration, error) {
+	if scheduledAt != nil {
+		scheduledUnix := int64(*scheduledAt)
+		if scheduledUnix <= 0 {
+			return 0, errx.ErrInvalidDelay
+		}
+		secUntil := scheduledUnix - time.Now().Unix()
+		if secUntil < 1 || secUntil > maxDelaySeconds {
+			return 0, errx.ErrInvalidDelay
+		}
+		return time.Duration(secUntil) * time.Second, nil
+	}
+	if delayMs == 0 && delaySec == 0 {
+		delaySec = 1
+	}
+	if delayMs > 0 {
+		if delayMs > maxDelayMillis {
+			return 0, errx.ErrInvalidDelay
+		}
+		return time.Duration(delayMs) * time.Millisecond, nil
+	}
+	if delaySec > maxDelaySeconds {
+		return 0, errx.ErrInvalidDelay
+	}
+	return time.Duration(delaySec) * time.Second, nil
+}
 
 // Handler constructors that accept a broker and return gin.HandlerFunc.
 
@@ -30,12 +63,6 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 		if err := c.ShouldBindJSON(&req); err != nil {
 			respx.FailGin(c, err)
 			return
-		}
-		if req.DelayMs == 0 && req.DelayMsAlt > 0 {
-			req.DelayMs = req.DelayMsAlt
-		}
-		if req.DelaySec == 0 && req.DelaySecAlt > 0 {
-			req.DelaySec = req.DelaySecAlt
 		}
 
 		if err := req.Validate(); err != nil {
@@ -55,36 +82,12 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 		isDelayTopic := topicConfig.Type == broker.TopicTypeDelay
 
 		if isDelayTopic {
-			hasDelay := req.DelayMs > 0 || req.DelaySec > 0
-
-			// Validate delay parameters
-			if req.DelayMs > 0 && req.DelaySec > 0 {
-				// Can't specify both
-				respx.FailGin(c, errx.ErrInvalidDelay)
+			delay, err := resolveDelay(req.DelayMs, req.DelaySec, req.ScheduledAt)
+			if err != nil {
+				respx.FailGin(c, err)
 				return
 			}
 
-			if !hasDelay {
-				// Use default delay of 1 second for delay topic
-				req.DelaySec = 1
-			}
-
-			var delay time.Duration
-			if req.DelayMs > 0 {
-				if req.DelayMs < 0 || req.DelayMs > 86400000*30 { // max 30 days
-					respx.FailGin(c, errx.ErrInvalidDelay)
-					return
-				}
-				delay = time.Duration(req.DelayMs) * time.Millisecond
-			} else {
-				if req.DelaySec < 1 || req.DelaySec > 86400*30 { // max 30 days, min 1 second
-					respx.FailGin(c, errx.ErrInvalidDelay)
-					return
-				}
-				delay = time.Duration(req.DelaySec) * time.Second
-			}
-
-			// Produce delayed message
 			msg := b.EnqueueWithDelay(req.Topic, req.Body, req.Tag, delay)
 			logger.Info("Delayed message produced",
 				zap.String("topic", req.Topic),
@@ -174,35 +177,17 @@ func ProduceBatchHandler(b *broker.Broker) gin.HandlerFunc {
 
 				delayMs := item.DelayMs
 				delaySec := item.DelaySec
-				if delayMs == 0 && req.DelayMsAlt > 0 {
-					delayMs = req.DelayMsAlt
+				if delayMs == 0 && req.DelayMs > 0 {
+					delayMs = req.DelayMs
 				}
-				if delaySec == 0 && req.DelaySecAlt > 0 {
-					delaySec = req.DelaySecAlt
+				if delaySec == 0 && req.DelaySec > 0 {
+					delaySec = req.DelaySec
 				}
 
-				hasDelay := delayMs > 0 || delaySec > 0
-				if delayMs > 0 && delaySec > 0 {
-					respx.FailGin(c, errx.ErrInvalidDelay)
+				delay, err := resolveDelay(delayMs, delaySec, item.ScheduledAt)
+				if err != nil {
+					respx.FailGin(c, err)
 					return
-				}
-				if !hasDelay {
-					delaySec = 1
-				}
-
-				var delay time.Duration
-				if delayMs > 0 {
-					if delayMs < 0 || delayMs > 86400000*30 {
-						respx.FailGin(c, errx.ErrInvalidDelay)
-						return
-					}
-					delay = time.Duration(delayMs) * time.Millisecond
-				} else {
-					if delaySec < 1 || delaySec > 86400*30 {
-						respx.FailGin(c, errx.ErrInvalidDelay)
-						return
-					}
-					delay = time.Duration(delaySec) * time.Second
 				}
 
 				items = append(items, broker.DelayEnqueueItem{
