@@ -1,8 +1,51 @@
 package client
 
 import (
+	"encoding/json"
 	"messageQ/mq/broker"
+	"strconv"
+	"time"
 )
+
+// FlexibleUnix handles both numeric unix seconds and RFC3339 time strings.
+type FlexibleUnix int64
+
+func (f *FlexibleUnix) UnmarshalJSON(b []byte) error {
+	if string(b) == "null" {
+		return nil
+	}
+	if len(b) == 0 {
+		return nil
+	}
+	if b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		if s == "" {
+			return nil
+		}
+		if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+			*f = FlexibleUnix(t.Unix())
+			return nil
+		}
+		if t, err := time.Parse(time.RFC3339, s); err == nil {
+			*f = FlexibleUnix(t.Unix())
+			return nil
+		}
+		// fallback: try parse numeric string
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			*f = FlexibleUnix(v)
+			return nil
+		}
+		return nil
+	}
+	if v, err := strconv.ParseInt(string(b), 10, 64); err == nil {
+		*f = FlexibleUnix(v)
+		return nil
+	}
+	return nil
+}
 
 type CreateAccessKeyRequest struct {
 	Name      string `json:"name"`
@@ -45,13 +88,13 @@ type ProduceMessageRequest struct {
 	DelaySec int64  `json:"delaySec"` // optional: delay in seconds
 }
 type ProduceMessageResponse struct {
-	ID           string  `json:"id"`
-	Topic        string  `json:"topic"`
-	Tag          string  `json:"tag"`
-	ScheduledAt  int64   `json:"scheduledAt"`
-	ExecuteAt    *int64  `json:"executeAt"`
-	DelaySeconds float64 `json:"delaySeconds"`
-	DelayMs      int64   `json:"delayMs"`
+	ID           string        `json:"id"`
+	Topic        string        `json:"topic"`
+	Tag          string        `json:"tag"`
+	ScheduledAt  FlexibleUnix  `json:"scheduledAt"`
+	ExecuteAt    *FlexibleUnix `json:"executeAt"`
+	DelaySeconds float64       `json:"delaySeconds"`
+	DelayMs      int64         `json:"delayMs"`
 }
 
 type CreateTopicRequest struct {
@@ -90,17 +133,17 @@ type (
 		Body      string `json:"body"`
 		Tag       string `json:"tag,omitempty"`
 		Retry     int    `json:"retry"`
-		Timestamp int64  `json:"timestamp"`
+		Timestamp FlexibleUnix `json:"timestamp"`
 	}
 	MessageStatus struct {
 		ID          string `json:"id"`
 		Body        string `json:"body"`
 		Tag         string `json:"tag,omitempty"`
 		Retry       int    `json:"retry"`
-		Timestamp   int64  `json:"timestamp"`
-		ScheduledAt *int64 `json:"scheduledAt,omitempty"`
-		ConsumedAt  *int64 `json:"consumedAt,omitempty"`
-		AckedAt     *int64 `json:"ackedAt,omitempty"`
+		Timestamp   FlexibleUnix  `json:"timestamp"`
+		ScheduledAt *FlexibleUnix `json:"scheduledAt,omitempty"`
+		ConsumedAt  *FlexibleUnix `json:"consumedAt,omitempty"`
+		AckedAt     *FlexibleUnix `json:"ackedAt,omitempty"`
 		QueueID     *int   `json:"queueId,omitempty"`
 		Offset      *int64 `json:"offset,omitempty"`
 		NextOffset  *int64 `json:"nextOffset,omitempty"`
