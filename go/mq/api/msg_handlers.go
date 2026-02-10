@@ -4,6 +4,7 @@ import (
 	"messageQ/mq/errx"
 	"messageQ/mq/respx"
 	"net/http"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -37,8 +38,7 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 			req.DelaySec = req.DelaySecAlt
 		}
 
-		err := req.Validate()
-		if err != nil {
+		if err := req.Validate(); err != nil {
 			respx.FailGin(c, err)
 			return
 		}
@@ -129,6 +129,137 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 	}
 }
 
+// ProduceBatchHandler handles batch message production.
+func ProduceBatchHandler(b *broker.Broker) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req ProduceBatchRequest
+		if err := c.ShouldBindUri(&req); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+
+		if err := validateTopicName(req.Topic); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+		if len(req.Messages) == 0 {
+			respx.FailGin(c, errx.ErrInvalidMessage)
+			return
+		}
+
+		// Check if topic exists
+		topicConfig, err := b.GetTopicConfig(req.Topic)
+		if err != nil {
+			logger.Warn("Topic not found", zap.String("topic", req.Topic))
+			respx.FailGin(c, errx.ErrTopicNotFound)
+			return
+		}
+
+		isDelayTopic := topicConfig.Type == broker.TopicTypeDelay
+		responses := make([]ProduceMessageResponse, 0, len(req.Messages))
+
+		if isDelayTopic {
+			items := make([]broker.DelayEnqueueItem, 0, len(req.Messages))
+			for _, item := range req.Messages {
+				body := strings.TrimSpace(item.Body)
+				tag := strings.TrimSpace(item.Tag)
+				if body == "" || tag == "" {
+					respx.FailGin(c, errx.ErrInvalidMessage)
+					return
+				}
+
+				delayMs := item.DelayMs
+				delaySec := item.DelaySec
+				if delayMs == 0 && req.DelayMsAlt > 0 {
+					delayMs = req.DelayMsAlt
+				}
+				if delaySec == 0 && req.DelaySecAlt > 0 {
+					delaySec = req.DelaySecAlt
+				}
+
+				hasDelay := delayMs > 0 || delaySec > 0
+				if delayMs > 0 && delaySec > 0 {
+					respx.FailGin(c, errx.ErrInvalidDelay)
+					return
+				}
+				if !hasDelay {
+					delaySec = 1
+				}
+
+				var delay time.Duration
+				if delayMs > 0 {
+					if delayMs < 0 || delayMs > 86400000*30 {
+						respx.FailGin(c, errx.ErrInvalidDelay)
+						return
+					}
+					delay = time.Duration(delayMs) * time.Millisecond
+				} else {
+					if delaySec < 1 || delaySec > 86400*30 {
+						respx.FailGin(c, errx.ErrInvalidDelay)
+						return
+					}
+					delay = time.Duration(delaySec) * time.Second
+				}
+
+				items = append(items, broker.DelayEnqueueItem{
+					Body:  body,
+					Tag:   tag,
+					Delay: delay,
+				})
+			}
+
+			msgs := b.EnqueueWithDelayBatch(req.Topic, items)
+			for i, msg := range msgs {
+				delay := items[i].Delay
+				responses = append(responses, ProduceMessageResponse{
+					ID:          msg.ID,
+					Topic:       req.Topic,
+					Tag:         msg.Tag,
+					Body:        msg.Body,
+					Timestamp:   msg.Timestamp.Unix(),
+					Retry:       msg.Retry,
+					ScheduledAt: msg.Timestamp.Add(delay).Unix(),
+					ExecutedAt:  nil,
+				})
+			}
+
+			c.JSON(http.StatusOK, respx.NewRespSuccess(ProduceBatchResponse{Messages: responses}))
+			return
+		}
+
+		items := make([]queue.Message, 0, len(req.Messages))
+		for _, item := range req.Messages {
+			body := strings.TrimSpace(item.Body)
+			tag := strings.TrimSpace(item.Tag)
+			if body == "" || tag == "" {
+				respx.FailGin(c, errx.ErrInvalidMessage)
+				return
+			}
+			items = append(items, queue.Message{Body: body, Tag: tag})
+		}
+
+		msgs := b.EnqueueBatch(req.Topic, items)
+		for _, msg := range msgs {
+			responses = append(responses, ProduceMessageResponse{
+				ID:          msg.ID,
+				Topic:       req.Topic,
+				Tag:         msg.Tag,
+				Body:        msg.Body,
+				Timestamp:   msg.Timestamp.Unix(),
+				Retry:       msg.Retry,
+				ScheduledAt: msg.Timestamp.Unix(),
+				ExecutedAt:  nil,
+			})
+		}
+
+		c.JSON(http.StatusOK, respx.NewRespSuccess(ProduceBatchResponse{Messages: responses}))
+	}
+}
+
 func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 
@@ -142,8 +273,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			return
 		}
 
-		err := req.Validate()
-		if err != nil {
+		if err := req.Validate(); err != nil {
 			respx.FailGin(c, err)
 			return
 		}
@@ -158,6 +288,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 		var msgs []storage.Message
 		var offset, next int64
 		var queueID int
+		var err error
 
 		if req.QueueId != nil {
 
@@ -213,6 +344,109 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 				Retry:     msg.Retry,
 				Timestamp: msg.Timestamp.Unix(),
 			},
+			Group:      req.GroupName,
+			Topic:      req.Topic,
+			QueueID:    queueID,
+			Offset:     offset,
+			NextOffset: next,
+			State:      "processing",
+		}
+
+		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
+	}
+}
+
+// ConsumeBatchHandler returns up to max messages for a group/topic.
+func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req ConsumeBatchRequest
+		if err := c.ShouldBindUri(&req); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+		if err := c.ShouldBindQuery(&req); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+		if err := req.Validate(); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+
+		if _, err := b.GetTopicConfig(req.Topic); err != nil {
+			logger.Warn("Topic not found for consumption", zap.String("topic", req.Topic))
+			respx.FailGin(c, errx.ErrTopicNotFound)
+			return
+		}
+
+		max := 10
+		if req.Max != nil {
+			max = *req.Max
+		}
+		if max <= 0 {
+			respx.FailGin(c, errx.ErrInvalidMessage)
+			return
+		}
+		if max > 100 {
+			max = 100
+		}
+
+		tag := req.Tag
+		var msgs []storage.Message
+		var offset, next int64
+		var queueID int
+		var err error
+
+		if req.QueueId != nil {
+			queueID = *req.QueueId
+			msgs, offset, next, err = b.ConsumeWithRetry(req.GroupName, req.Topic, queueID, tag, max)
+			if err != nil {
+				logger.Error("Consume batch error", zap.String("group", req.GroupName), zap.String("topic", req.Topic), zap.Error(err))
+				respx.FailGin(c, errx.ErrOffsetUnsupported)
+				return
+			}
+		} else {
+			queueCount := b.GetQueueCount(req.Topic)
+			for i := 0; i < queueCount; i++ {
+				msgs, offset, next, err = b.ConsumeWithRetry(req.GroupName, req.Topic, i, tag, max)
+				if err != nil {
+					continue
+				}
+				if len(msgs) > 0 {
+					queueID = i
+					break
+				}
+			}
+		}
+
+		if len(msgs) == 0 {
+			logger.Debug("No messages available", zap.String("group", req.GroupName), zap.String("topic", req.Topic))
+			respx.FailGin(c, errx.ErrNotFound)
+			return
+		}
+
+		out := make([]ConsumeMessage, 0, len(msgs))
+		batch := make([]queue.Message, 0, len(msgs))
+		for _, msg := range msgs {
+			batch = append(batch, queue.Message{
+				ID:        msg.ID,
+				Body:      msg.Body,
+				Tag:       msg.Tag,
+				Retry:     msg.Retry,
+				Timestamp: msg.Timestamp,
+			})
+			out = append(out, ConsumeMessage{
+				ID:        msg.ID,
+				Body:      msg.Body,
+				Tag:       msg.Tag,
+				Retry:     msg.Retry,
+				Timestamp: msg.Timestamp.Unix(),
+			})
+		}
+		b.BeginProcessingBatch(req.GroupName, req.Topic, queueID, offset, batch)
+
+		resp := ConsumeBatchResponse{
+			Messages:   out,
 			Group:      req.GroupName,
 			Topic:      req.Topic,
 			QueueID:    queueID,

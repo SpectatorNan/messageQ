@@ -46,8 +46,14 @@ func (e *Endpoint) DeleteTopic(topic string) string {
 func (e *Endpoint) ProduceMessage(topic string) string {
 	return fmt.Sprintf("%s/api/v1/topics/%s/messages", e.baseUrl, topic)
 }
+func (e *Endpoint) ProduceBatchMessage(topic string) string {
+	return fmt.Sprintf("%s/api/v1/topics/%s/messages/batch", e.baseUrl, topic)
+}
 func (e *Endpoint) ConsumeMessages(topic, group string) string {
 	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/messages", e.baseUrl, group, topic)
+}
+func (e *Endpoint) ConsumeBatchMessages(topic, group string) string {
+	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/messages/batch", e.baseUrl, group, topic)
 }
 func (e *Endpoint) ListMessages(topic, group string) string {
 	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/messages/status", e.baseUrl, group, topic)

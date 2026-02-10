@@ -32,11 +32,13 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 
 			// Message production (supports both normal and delayed messages via optional delay_ms/delay_sec parameters)
 			protected.POST("/topics/:topic/messages", ProduceHandler(b))
+			protected.POST("/topics/:topic/messages/batch", ProduceBatchHandler(b))
 
 			// Message consumption (consumer-centric)
 			consumers := protected.Group("/consumers/:group")
 			{
 				consumers.GET("/topics/:topic/messages", ConsumeHandler(b))
+				consumers.GET("/topics/:topic/messages/batch", ConsumeBatchHandler(b))
 				consumers.GET("/topics/:topic/messages/status", ListMessagesHandler(b))
 				consumers.GET("/topics/:topic/offsets", GetOffsetHandler(b))
 				consumers.POST("/topics/:topic/offsets", CommitOffsetHandler(b))

@@ -191,6 +191,101 @@ func (suite *APITestSuite) TestConsumeMessages() {
 	suite.NotNil(consumeResp.Data)
 }
 
+func (suite *APITestSuite) TestBatchProduceConsume() {
+	topic := fmt.Sprintf("batch-topic-%d", time.Now().UnixNano())
+	group := "batch-group"
+	tag := "batch-tag"
+
+	_, errResp, err := suite.api.CreateTopic(topic, broker.TopicTypeNormal, 1)
+	suite.NoError(err)
+	if errResp != nil && errResp.Code != "topic_exists" {
+		suite.T().Fatalf("create topic failed: %v", errResp)
+	}
+
+	messages := []ProduceBatchMessage{
+		{Body: "batch-1", Tag: tag},
+		{Body: "batch-2", Tag: tag},
+		{Body: "batch-3", Tag: tag},
+	}
+	produceResp, errResp, err := suite.api.ProduceBatchMessage(topic, messages)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(produceResp)
+	suite.Equal("ok", produceResp.Code)
+	suite.Len(produceResp.Data.Messages, len(messages))
+	for _, msg := range produceResp.Data.Messages {
+		if msg.ID == "" {
+			suite.T().Fatalf("expected message id in batch produce response")
+		}
+		suite.Equal(topic, msg.Topic)
+		suite.Equal(tag, msg.Tag)
+	}
+
+	acked := map[string]bool{}
+	consumeBatch := func(max int) *Resp[ConsumeBatchResponse] {
+		for i := 0; i < 5; i++ {
+			resp, errResp, err := suite.api.ConsumeBatchMessages(topic, group, WithBatchQueueId(0), WithBatchTag(tag), WithBatchMax(max))
+			suite.NoError(err)
+			if errResp != nil {
+				if errResp.Code == "not_found" {
+					time.Sleep(200 * time.Millisecond)
+					continue
+				}
+				suite.T().Fatalf("consume batch error: %v", errResp)
+			}
+			if resp == nil {
+				suite.T().Fatalf("expected consume batch response, got nil")
+			}
+			return resp
+		}
+		suite.T().Fatalf("consume batch timeout")
+		return nil
+	}
+
+	resp1 := consumeBatch(2)
+	suite.Equal("ok", resp1.Code)
+	suite.Equal("processing", resp1.Data.State)
+	if len(resp1.Data.Messages) == 0 {
+		suite.T().Fatalf("expected batch messages, got 0")
+	}
+	for _, msg := range resp1.Data.Messages {
+		if msg.ID == "" {
+			suite.T().Fatalf("expected message id in batch consume response")
+		}
+		suite.Equal(tag, msg.Tag)
+		acked[msg.ID] = true
+		ackResp, errResp, err := suite.api.AckMessage(topic, group, msg.ID)
+		suite.NoError(err)
+		suite.Nil(errResp)
+		suite.NotNil(ackResp)
+		suite.Equal("ok", ackResp.Code)
+	}
+
+	resp2 := consumeBatch(10)
+	suite.Equal("ok", resp2.Code)
+	suite.Equal("processing", resp2.Data.State)
+	if len(resp2.Data.Messages) == 0 {
+		suite.T().Fatalf("expected remaining batch messages, got 0")
+	}
+	for _, msg := range resp2.Data.Messages {
+		if msg.ID == "" {
+			suite.T().Fatalf("expected message id in batch consume response")
+		}
+		if acked[msg.ID] {
+			suite.T().Fatalf("duplicate message consumed: %s", msg.ID)
+		}
+		suite.Equal(tag, msg.Tag)
+		acked[msg.ID] = true
+		ackResp, errResp, err := suite.api.AckMessage(topic, group, msg.ID)
+		suite.NoError(err)
+		suite.Nil(errResp)
+		suite.NotNil(ackResp)
+		suite.Equal("ok", ackResp.Code)
+	}
+
+	suite.Len(acked, len(messages))
+}
+
 func (suite *APITestSuite) TestListMessages() { 
 	group := "test-group"
 	tag := "test-tag"

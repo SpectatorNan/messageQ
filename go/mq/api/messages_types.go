@@ -27,12 +27,34 @@ type (
 		ScheduledAt int64  `json:"scheduledAt"`
 		ExecutedAt  *int64 `json:"executedAt"`
 	}
+	ProduceBatchMessage struct {
+		Body     string `json:"body"`
+		Tag      string `json:"tag"`
+		DelayMs  int64  `json:"delayMs"`
+		DelaySec int64  `json:"delaySec"`
+	}
+	ProduceBatchRequest struct {
+		Topic    string                 `uri:"topic" binding:"required"`
+		Messages []ProduceBatchMessage  `json:"messages"`
+		DelayMsAlt  int64 `json:"delay_ms"`
+		DelaySecAlt int64 `json:"delay_sec"`
+	}
+	ProduceBatchResponse struct {
+		Messages []ProduceMessageResponse `json:"messages"`
+	}
 
 	ConsumeMessageRequest struct {
 		Topic     string `uri:"topic" binding:"required"`
 		GroupName string `uri:"group" binding:"required"`
 		Tag       string `form:"tag"`
 		QueueId   *int   `form:"queueId"`
+	}
+	ConsumeBatchRequest struct {
+		Topic     string `uri:"topic" binding:"required"`
+		GroupName string `uri:"group" binding:"required"`
+		Tag       string `form:"tag"`
+		QueueId   *int   `form:"queueId"`
+		Max       *int   `form:"max"`
 	}
 	ListMessagesRequest struct {
 		Topic     string `uri:"topic" binding:"required"`
@@ -93,24 +115,33 @@ type (
 		Timestamp int64  `json:"timestamp"`
 	}
 	MessageStatus struct {
-		ID         string `json:"id"`
-		Body       string `json:"body"`
-		Tag        string `json:"tag,omitempty"`
-		Retry      int    `json:"retry"`
-		Timestamp  int64  `json:"timestamp"`
+		ID          string `json:"id"`
+		Body        string `json:"body"`
+		Tag         string `json:"tag,omitempty"`
+		Retry       int    `json:"retry"`
+		Timestamp   int64  `json:"timestamp"`
 		ScheduledAt *int64 `json:"scheduledAt,omitempty"`
-		ConsumedAt *int64 `json:"consumedAt,omitempty"`
-		AckedAt    *int64 `json:"ackedAt,omitempty"`
-		QueueID    *int   `json:"queueId,omitempty"`
-		Offset     *int64 `json:"offset,omitempty"`
-		NextOffset *int64 `json:"nextOffset,omitempty"`
+		ConsumedAt  *int64 `json:"consumedAt,omitempty"`
+		AckedAt     *int64 `json:"ackedAt,omitempty"`
+		QueueID     *int   `json:"queueId,omitempty"`
+		Offset      *int64 `json:"offset,omitempty"`
+		NextOffset  *int64 `json:"nextOffset,omitempty"`
+	}
+	ConsumeBatchResponse struct {
+		Messages   []ConsumeMessage `json:"messages"`
+		Group      string           `json:"group"`
+		Topic      string           `json:"topic"`
+		QueueID    int              `json:"queueId"`
+		Offset     int64            `json:"offset"`
+		NextOffset int64            `json:"nextOffset"`
+		State      string           `json:"state"`
 	}
 	ListMessagesResponse struct {
-		Group    string          `json:"group"`
-		Topic    string          `json:"topic"`
-		State    string          `json:"state"`
-		Messages []MessageStatus `json:"messages"`
-		NextCursor *int64         `json:"nextCursor,omitempty"`
+		Group      string          `json:"group"`
+		Topic      string          `json:"topic"`
+		State      string          `json:"state"`
+		Messages   []MessageStatus `json:"messages"`
+		NextCursor *int64          `json:"nextCursor,omitempty"`
 	}
 )
 
@@ -141,6 +172,24 @@ func (r *ConsumeMessageRequest) Validate() error {
 		return err
 	}
 
+	return nil
+}
+
+func (r *ConsumeBatchRequest) Validate() error {
+	if err := validateTopicName(r.Topic); err != nil {
+		logger.Warn("Invalid topic name", zap.String("topic", r.Topic))
+		return err
+	}
+	if err := validateGroupName(r.GroupName); err != nil {
+		logger.Warn("Invalid group name", zap.String("group", r.GroupName))
+		return err
+	}
+	if r.QueueId != nil && *r.QueueId < 0 {
+		return errx.ErrInvalidQueueID
+	}
+	if r.Max != nil && *r.Max <= 0 {
+		return errx.ErrInvalidMessage
+	}
 	return nil
 }
 

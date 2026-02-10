@@ -218,6 +218,35 @@ func (h *API) ProduceMessage(topic string, tag string, body string, options ...P
 	return result, errResp, nil
 }
 
+type ProduceBatchOption func(*ProduceBatchMessage)
+
+func WithBatchDelaySeconds(delaySec int64) ProduceBatchOption {
+	return func(m *ProduceBatchMessage) {
+		m.DelaySec = delaySec
+	}
+}
+
+func WithBatchDelayMilliseconds(delayMs int64) ProduceBatchOption {
+	return func(m *ProduceBatchMessage) {
+		m.DelayMs = delayMs
+	}
+}
+
+func (h *API) ProduceBatchMessage(topic string, messages []ProduceBatchMessage) (*Resp[ProduceBatchResponse], *ErrResp, error) {
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	req := ProduceBatchRequest{Messages: messages}
+	var result *Resp[ProduceBatchResponse]
+	errResp, err := h.Post(r.SetBody(req).SetResult(&result), h.endpoint.ProduceBatchMessage(topic))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
 type ConsumeMessageOption func(*resty.Request)
 
 func WithQueueId(queueId int) ConsumeMessageOption {
@@ -240,6 +269,43 @@ func (h *API) ConsumeMessages(topic string, group string, tag string, options ..
 
 	var result *Resp[ConsumeMessageResponse]
 	errResp, err := h.Get(r.SetResult(&result), h.endpoint.ConsumeMessages(topic, group))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
+type ConsumeBatchOption func(*resty.Request)
+
+func WithBatchQueueId(queueId int) ConsumeBatchOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("queueId", fmt.Sprintf("%d", queueId))
+	}
+}
+
+func WithBatchTag(tag string) ConsumeBatchOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("tag", tag)
+	}
+}
+
+func WithBatchMax(max int) ConsumeBatchOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("max", fmt.Sprintf("%d", max))
+	}
+}
+
+func (h *API) ConsumeBatchMessages(topic string, group string, options ...ConsumeBatchOption) (*Resp[ConsumeBatchResponse], *ErrResp, error) {
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, option := range options {
+		option(r)
+	}
+
+	var result *Resp[ConsumeBatchResponse]
+	errResp, err := h.Get(r.SetResult(&result), h.endpoint.ConsumeBatchMessages(topic, group))
 	if err != nil {
 		return nil, nil, err
 	}

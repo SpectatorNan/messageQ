@@ -94,6 +94,13 @@ type groupStats struct {
 	Retry      int64 `json:"retry"`
 }
 
+// DelayEnqueueItem represents a delayed enqueue input.
+type DelayEnqueueItem struct {
+	Body  string
+	Tag   string
+	Delay time.Duration
+}
+
 func NewBroker() *Broker {
 	return NewBrokerWithStorage(nil, defaultQueueCount)
 }
@@ -304,6 +311,25 @@ func (b *Broker) GetQueueCount(topic string) int {
 
 // Enqueue routes to a queue using round-robin and returns the message.
 func (b *Broker) Enqueue(topic string, body string, tag string) queue.Message {
+	return b.enqueueSingle(topic, body, tag)
+}
+
+// EnqueueBody keeps backward compatibility for callers without tags.
+func (b *Broker) EnqueueBody(topic string, body string) queue.Message {
+	return b.Enqueue(topic, body, "")
+}
+
+// EnqueueWithDelay schedules a message for delayed delivery
+func (b *Broker) EnqueueWithDelay(topic string, body string, tag string, delay time.Duration) queue.Message {
+	msgs := b.EnqueueWithDelayBatch(topic, []DelayEnqueueItem{{Body: body, Tag: tag, Delay: delay}})
+	if len(msgs) == 0 {
+		return queue.Message{}
+	}
+	return msgs[0]
+}
+
+// enqueueSingle enqueues a single message without calling batch APIs.
+func (b *Broker) enqueueSingle(topic string, body string, tag string) queue.Message {
 	if tag == "" {
 		return queue.Message{}
 	}
@@ -315,42 +341,98 @@ func (b *Broker) Enqueue(topic string, body string, tag string) queue.Message {
 	return qs[idx].Enqueue(body, tag)
 }
 
-// EnqueueBody keeps backward compatibility for callers without tags.
-func (b *Broker) EnqueueBody(topic string, body string) queue.Message {
-	return b.Enqueue(topic, body, "")
-}
-
-// EnqueueWithDelay schedules a message for delayed delivery
-func (b *Broker) EnqueueWithDelay(topic string, body string, tag string, delay time.Duration) queue.Message {
-	if tag == "" {
-		return queue.Message{}
+// EnqueueBatch enqueues multiple messages with a single broker lock.
+func (b *Broker) EnqueueBatch(topic string, items []queue.Message) []queue.Message {
+	if len(items) == 0 {
+		return nil
 	}
-
+	if len(items) == 1 {
+		msg := b.enqueueSingle(topic, items[0].Body, items[0].Tag)
+		return []queue.Message{msg}
+	}
 	b.lock.Lock()
 	qs := b.getQueues(topic)
-	idx := b.rrEnq[topic] % len(qs)
-	b.rrEnq[topic] = (idx + 1) % len(qs)
+	start := b.rrEnq[topic] % len(qs)
+	b.rrEnq[topic] = (start + len(items)) % len(qs)
 	b.lock.Unlock()
 
-	// Generate message ID and metadata
-	uid, _ := uuid.NewV7()
-	msg := queue.Message{
-		ID:        uid.String(),
-		Body:      body,
-		Tag:       tag,
-		Timestamp: time.Now(),
+	msgs := make([]queue.Message, 0, len(items))
+	for i, item := range items {
+		idx := (start + i) % len(qs)
+		msg := qs[idx].Enqueue(item.Body, item.Tag)
+		if msg.ID != "" {
+			msgs = append(msgs, msg)
+		}
 	}
+	return msgs
+}
 
-	// Schedule for delayed delivery
-	b.delayScheduler.ScheduleWithDelay(topic, idx, storage.Message{
-		ID:        msg.ID,
-		Body:      msg.Body,
-		Tag:       msg.Tag,
-		Retry:     0,
-		Timestamp: msg.Timestamp,
-	}, delay)
+// EnqueueWithDelayBatch schedules multiple delayed messages with a single broker lock.
+func (b *Broker) EnqueueWithDelayBatch(topic string, items []DelayEnqueueItem) []queue.Message {
+	if len(items) == 0 {
+		return nil
+	}
+	if len(items) == 1 {
+		item := items[0]
+		if item.Tag == "" {
+			return nil
+		}
+		uid, err := uuid.NewV7()
+		if err != nil {
+			uid = uuid.New()
+		}
+		msg := queue.Message{
+			ID:        uid.String(),
+			Body:      item.Body,
+			Tag:       item.Tag,
+			Timestamp: time.Now(),
+		}
+		b.lock.Lock()
+		qs := b.getQueues(topic)
+		idx := b.rrEnq[topic] % len(qs)
+		b.rrEnq[topic] = (idx + 1) % len(qs)
+		b.lock.Unlock()
+		b.delayScheduler.ScheduleWithDelay(topic, idx, storage.Message{
+			ID:        msg.ID,
+			Body:      msg.Body,
+			Tag:       msg.Tag,
+			Retry:     0,
+			Timestamp: msg.Timestamp,
+		}, item.Delay)
+		return []queue.Message{msg}
+	}
+	b.lock.Lock()
+	qs := b.getQueues(topic)
+	start := b.rrEnq[topic] % len(qs)
+	b.rrEnq[topic] = (start + len(items)) % len(qs)
+	b.lock.Unlock()
 
-	return msg
+	msgs := make([]queue.Message, 0, len(items))
+	for i, item := range items {
+		if item.Tag == "" {
+			continue
+		}
+		idx := (start + i) % len(qs)
+		uid, err := uuid.NewV7()
+		if err != nil {
+			uid = uuid.New()
+		}
+		msg := queue.Message{
+			ID:        uid.String(),
+			Body:      item.Body,
+			Tag:       item.Tag,
+			Timestamp: time.Now(),
+		}
+		b.delayScheduler.ScheduleWithDelay(topic, idx, storage.Message{
+			ID:        msg.ID,
+			Body:      msg.Body,
+			Tag:       msg.Tag,
+			Retry:     0,
+			Timestamp: msg.Timestamp,
+		}, item.Delay)
+		msgs = append(msgs, msg)
+	}
+	return msgs
 }
 
 // Dequeue attempts a non-blocking scan across queues; if empty, blocks on a queue in round-robin.
@@ -555,49 +637,63 @@ func (b *Broker) ConsumeWithRetry(group, topic string, queueID int, tag string, 
 
 // BeginProcessing records a message as processing for a group/queue/offset.
 func (b *Broker) BeginProcessing(group, topic string, queueID int, offset, nextOffset int64, msg queue.Message) {
-	b.lock.Lock()
-	defer b.lock.Unlock()
+	_ = nextOffset
+	b.BeginProcessingBatch(group, topic, queueID, offset, []queue.Message{msg})
+}
+
+// BeginProcessingBatch records multiple messages as processing in a single lock.
+func (b *Broker) BeginProcessingBatch(group, topic string, queueID int, startOffset int64, msgs []queue.Message) {
+	if len(msgs) == 0 {
+		return
+	}
 	consumedAt := now()
-	// apply retry count if tracked
-	if rc := b.retryCounts[msg.ID]; rc > msg.Retry {
-		msg.Retry = rc
-	}
-	entry := processingEntry{
-		Group:      group,
-		Topic:      topic,
-		QueueID:    queueID,
-		Offset:     offset,
-		NextOffset: nextOffset,
-		MsgID:      msg.ID,
-		Body:       msg.Body,
-		Tag:        msg.Tag,
-		Retry:      msg.Retry,
-		Timestamp:  msg.Timestamp,
-		ConsumedAt: consumedAt,
-		State:      stateProcessing,
-		UpdatedAt:  consumedAt,
-	}
-	b.processing[processingKey(group, topic, msg.ID)] = entry
-	// fmt.Printf("[DEBUG] BeginProcessing: added %s to processing map (total: %d)\n", msg.ID, len(b.processing))
+	b.lock.Lock()
 	gs := b.stats[group]
 	if gs == nil {
 		gs = &groupStats{}
 		b.stats[group] = gs
 	}
-	gs.Processing++
+	for i, msg := range msgs {
+		// apply retry count if tracked
+		if rc := b.retryCounts[msg.ID]; rc > msg.Retry {
+			msg.Retry = rc
+		}
+		offset := startOffset + int64(i)
+		nextOffset := offset + 1
+		entry := processingEntry{
+			Group:      group,
+			Topic:      topic,
+			QueueID:    queueID,
+			Offset:     offset,
+			NextOffset: nextOffset,
+			MsgID:      msg.ID,
+			Body:       msg.Body,
+			Tag:        msg.Tag,
+			Retry:      msg.Retry,
+			Timestamp:  msg.Timestamp,
+			ConsumedAt: consumedAt,
+			State:      stateProcessing,
+			UpdatedAt:  consumedAt,
+		}
+		b.processing[processingKey(group, topic, msg.ID)] = entry
+	}
+	gs.Processing += int64(len(msgs))
+	b.lock.Unlock()
 
 	if ps, ok := b.store.(ProcessingStore); ok {
-		_ = ps.SaveProcessing(storage.ProcessingRecord{
-			Group:     group,
-			Topic:     topic,
-			QueueID:   queueID,
-			MsgID:     msg.ID,
-			Body:      msg.Body,
-			Tag:       msg.Tag,
-			Retry:     msg.Retry,
-			Timestamp: msg.Timestamp,
-			UpdatedAt: consumedAt,
-		})
+		for _, msg := range msgs {
+			_ = ps.SaveProcessing(storage.ProcessingRecord{
+				Group:     group,
+				Topic:     topic,
+				QueueID:   queueID,
+				MsgID:     msg.ID,
+				Body:      msg.Body,
+				Tag:       msg.Tag,
+				Retry:     msg.Retry,
+				Timestamp: msg.Timestamp,
+				UpdatedAt: consumedAt,
+			})
+		}
 	}
 }
 

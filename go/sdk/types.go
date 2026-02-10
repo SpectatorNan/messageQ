@@ -87,6 +87,15 @@ type ProduceMessageRequest struct {
 	DelayMs  int64  `json:"delayMs"`  // optional: delay in milliseconds
 	DelaySec int64  `json:"delaySec"` // optional: delay in seconds
 }
+type ProduceBatchMessage struct {
+	Body     string `json:"body"`
+	Tag      string `json:"tag"`
+	DelayMs  int64  `json:"delayMs"`
+	DelaySec int64  `json:"delaySec"`
+}
+type ProduceBatchRequest struct {
+	Messages []ProduceBatchMessage `json:"messages"`
+}
 type ProduceMessageResponse struct {
 	ID           string        `json:"id"`
 	Topic        string        `json:"topic"`
@@ -95,6 +104,9 @@ type ProduceMessageResponse struct {
 	ExecuteAt    *FlexibleUnix `json:"executeAt"`
 	DelaySeconds float64       `json:"delaySeconds"`
 	DelayMs      int64         `json:"delayMs"`
+}
+type ProduceBatchResponse struct {
+	Messages []ProduceMessageResponse `json:"messages"`
 }
 
 type CreateTopicRequest struct {
@@ -127,6 +139,15 @@ type (
 		Offset     int64          `json:"offset"`
 		NextOffset int64          `json:"nextOffset"`
 		State      string         `json:"state"`
+	}
+	ConsumeBatchResponse struct {
+		Messages   []ConsumeMessage `json:"messages"`
+		Group      string           `json:"group"`
+		Topic      string           `json:"topic"`
+		QueueID    int              `json:"queueId"`
+		Offset     int64            `json:"offset"`
+		NextOffset int64            `json:"nextOffset"`
+		State      string           `json:"state"`
 	}
 	ConsumeMessage struct {
 		ID        string `json:"id"`
