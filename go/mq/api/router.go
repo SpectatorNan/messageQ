@@ -4,6 +4,8 @@ import (
 	"messageQ/mq/auth"
 	"messageQ/mq/broker"
 	"messageQ/mq/config"
+	"messageQ/mq/errx"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
 )
@@ -17,6 +19,15 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 	if err == nil && cfg != nil {
 		adminAK = cfg.AdminAK
 	}
+
+	// if adminAK is not set, log a fatal error and exit
+	if adminAK == "" {
+		panic("Admin access key is not set in configuration")
+	}
+
+	r.NoRoute(func(context *gin.Context) {
+		context.JSON(http.StatusNotFound, errx.ErrInvalidApi)
+	})
 
 	// API version 1
 	v1 := r.Group("/api/v1")

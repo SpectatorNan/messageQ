@@ -1,0 +1,101 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: messageq
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: messageq-env
+  namespace: messageq
+data:
+  MQ_ADMIN_KEY: ""
+  MQ_SERVER_PORT: "8080"
+  MQ_SERVER_HOST: ""
+  MQ_SERVER_SHUTDOWN_TIMEOUT: "10s"
+  MQ_BROKER_QUEUE_COUNT: "4"
+  MQ_BROKER_MAX_RETRY: "3"
+  MQ_BROKER_PROCESSING_TIMEOUT: "30s"
+  MQ_BROKER_TIMEOUT_CHECK_INTERVAL: "5s"
+  MQ_BROKER_DATA_DIR: "/app/data"
+  MQ_BROKER_RETRY_BACKOFF_BASE: "1s"
+  MQ_BROKER_RETRY_BACKOFF_MULTIPLIER: "2.0"
+  MQ_BROKER_RETRY_BACKOFF_MAX: "60s"
+  MQ_STORAGE_FLUSH_INTERVAL: "100ms"
+  MQ_STORAGE_COMPACT_INTERVAL: "5m"
+  MQ_STORAGE_COMPACT_THRESHOLD: "10485760"
+  MQ_STORAGE_MAX_RECORD_SIZE: "67108864"
+  MQ_STORAGE_BUFFER_SIZE: "65536"
+  MQ_LOGGING_LEVEL: "info"
+  MQ_LOGGING_OUTPUT_PATH: "stdout"
+  MQ_LOGGING_FORMAT: "console"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: messageq
+  namespace: messageq
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: messageq
+  template:
+    metadata:
+      labels:
+        app: messageq
+    spec:
+      containers:
+        - name: messageq
+          image: messageq:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: messageq-env
+          volumeMounts:
+            - name: data
+              mountPath: /app/data
+          readinessProbe:
+            httpGet:
+              path: /api/v1/stats
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/v1/stats
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: messageq-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: messageq-data
+  namespace: messageq
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: messageq
+  namespace: messageq
+spec:
+  type: ClusterIP
+  selector:
+    app: messageq
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
