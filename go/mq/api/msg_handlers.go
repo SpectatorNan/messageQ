@@ -25,27 +25,36 @@ const (
 
 func resolveDelay(delayMs int64, delaySec int64, scheduledAt *client.FlexibleUnix) (time.Duration, error) {
 	if scheduledAt != nil {
+		if delayMs != 0 || delaySec != 0 {
+			return 0, errx.ErrDelayConflict
+		}
 		scheduledUnix := int64(*scheduledAt)
 		if scheduledUnix <= 0 {
-			return 0, errx.ErrInvalidDelay
+			return 0, errx.ErrScheduledAtInvalid
 		}
 		secUntil := scheduledUnix - time.Now().Unix()
 		if secUntil < 1 || secUntil > maxDelaySeconds {
-			return 0, errx.ErrInvalidDelay
+			return 0, errx.ErrScheduledAtInvalid
 		}
 		return time.Duration(secUntil) * time.Second, nil
+	}
+	if delayMs < 0 || delaySec < 0 {
+		return 0, errx.ErrDelayNonPositive
+	}
+	if delayMs > 0 && delaySec > 0 {
+		return 0, errx.ErrDelayBothSet
 	}
 	if delayMs == 0 && delaySec == 0 {
 		delaySec = 1
 	}
 	if delayMs > 0 {
 		if delayMs > maxDelayMillis {
-			return 0, errx.ErrInvalidDelay
+			return 0, errx.ErrDelayTooLarge
 		}
 		return time.Duration(delayMs) * time.Millisecond, nil
 	}
 	if delaySec > maxDelaySeconds {
-		return 0, errx.ErrInvalidDelay
+		return 0, errx.ErrDelayTooLarge
 	}
 	return time.Duration(delaySec) * time.Second, nil
 }
