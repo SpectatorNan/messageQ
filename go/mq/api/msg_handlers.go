@@ -1,10 +1,12 @@
 package api
 
 import (
+	"fmt"
 	"messageQ/mq/errx"
 	"messageQ/mq/respx"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -22,6 +24,45 @@ const (
 	maxDelaySeconds = 86400 * 30
 	maxDelayMillis  = 86400000 * 30
 )
+
+var consumeQueueRR = struct {
+	mu   sync.Mutex
+	next map[string]int
+}{
+	next: make(map[string]int),
+}
+
+func consumeRRStart(group string, topic string, tag string, queueCount int) int {
+	if queueCount <= 0 {
+		return 0
+	}
+	tagKey := tag
+	if tagKey == "" {
+		tagKey = "__all__"
+	}
+	key := fmt.Sprintf("%s|%s|%s", group, topic, tagKey)
+	consumeQueueRR.mu.Lock()
+	start := consumeQueueRR.next[key] % queueCount
+	consumeQueueRR.mu.Unlock()
+	if start < 0 {
+		return 0
+	}
+	return start
+}
+
+func consumeRRAdvance(group string, topic string, tag string, queueCount int, next int) {
+	if queueCount <= 0 {
+		return
+	}
+	tagKey := tag
+	if tagKey == "" {
+		tagKey = "__all__"
+	}
+	key := fmt.Sprintf("%s|%s|%s", group, topic, tagKey)
+	consumeQueueRR.mu.Lock()
+	consumeQueueRR.next[key] = next % queueCount
+	consumeQueueRR.mu.Unlock()
+}
 
 func resolveDelay(delayMs int64, delaySec int64, scheduledAt *client.FlexibleUnix) (time.Duration, error) {
 	if scheduledAt != nil {
@@ -296,15 +337,24 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 		} else {
 			// 没有指定 queue_id，轮询所有队列
 			queueCount := b.GetQueueCount(req.Topic)
+			start := consumeRRStart(req.GroupName, req.Topic, tag, queueCount)
 			for i := 0; i < queueCount; i++ {
-				msgs, offset, next, err = b.ConsumeWithRetry(req.GroupName, req.Topic, i, tag, 1)
+				idx := (start + i) % queueCount
+				msgs, offset, next, err = b.ConsumeWithRetry(req.GroupName, req.Topic, idx, tag, 1)
 				if err != nil {
 					continue // 跳过出错的队列
 				}
 				if len(msgs) > 0 {
-					queueID = i
+					queueID = idx
 					break
 				}
+			}
+			if queueCount > 0 {
+				nextIdx := start + 1
+				if len(msgs) > 0 {
+					nextIdx = queueID + 1
+				}
+				consumeRRAdvance(req.GroupName, req.Topic, tag, queueCount, nextIdx)
 			}
 		}
 
@@ -387,66 +437,95 @@ func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
 
 		tag := req.Tag
 		var msgs []storage.Message
-		var offset, next int64
+		var offset int64
 		var queueID int
 		var err error
+		out := make([]ConsumeBatchMessage, 0, max)
+		batchByQueue := make([]queue.Message, 0, max)
 
 		if req.QueueId != nil {
 			queueID = *req.QueueId
-			msgs, offset, next, err = b.ConsumeWithRetry(req.GroupName, req.Topic, queueID, tag, max)
+			msgs, offset, _, err = b.ConsumeWithRetry(req.GroupName, req.Topic, queueID, tag, max)
 			if err != nil {
 				logger.Error("Consume batch error", zap.String("group", req.GroupName), zap.String("topic", req.Topic), zap.Error(err))
 				respx.FailGin(c, errx.ErrOffsetUnsupported)
 				return
 			}
+			for i, msg := range msgs {
+				batchByQueue = append(batchByQueue, queue.Message{
+					ID:        msg.ID,
+					Body:      msg.Body,
+					Tag:       msg.Tag,
+					Retry:     msg.Retry,
+					Timestamp: msg.Timestamp,
+				})
+				out = append(out, ConsumeBatchMessage{
+					ID:         msg.ID,
+					Body:       msg.Body,
+					Tag:        msg.Tag,
+					Retry:      msg.Retry,
+					Timestamp:  msg.Timestamp.Unix(),
+					QueueID:    queueID,
+					Offset:     offset + int64(i),
+					NextOffset: offset + int64(i) + 1,
+				})
+			}
+			b.BeginProcessingBatch(req.GroupName, req.Topic, queueID, offset, batchByQueue)
 		} else {
 			queueCount := b.GetQueueCount(req.Topic)
-			for i := 0; i < queueCount; i++ {
-				msgs, offset, next, err = b.ConsumeWithRetry(req.GroupName, req.Topic, i, tag, max)
+			start := consumeRRStart(req.GroupName, req.Topic, tag, queueCount)
+			remaining := max
+			lastIdx := start
+			for i := 0; i < queueCount && remaining > 0; i++ {
+				idx := (start + i) % queueCount
+				lastIdx = idx
+				msgs, offset, _, err = b.ConsumeWithRetry(req.GroupName, req.Topic, idx, tag, remaining)
 				if err != nil {
 					continue
 				}
-				if len(msgs) > 0 {
-					queueID = i
-					break
+				if len(msgs) == 0 {
+					continue
 				}
+				batchByQueue = batchByQueue[:0]
+				for j, msg := range msgs {
+					batchByQueue = append(batchByQueue, queue.Message{
+						ID:        msg.ID,
+						Body:      msg.Body,
+						Tag:       msg.Tag,
+						Retry:     msg.Retry,
+						Timestamp: msg.Timestamp,
+					})
+					out = append(out, ConsumeBatchMessage{
+						ID:         msg.ID,
+						Body:       msg.Body,
+						Tag:        msg.Tag,
+						Retry:      msg.Retry,
+						Timestamp:  msg.Timestamp.Unix(),
+						QueueID:    idx,
+						Offset:     offset + int64(j),
+						NextOffset: offset + int64(j) + 1,
+					})
+				}
+				b.BeginProcessingBatch(req.GroupName, req.Topic, idx, offset, batchByQueue)
+				remaining = max - len(out)
+			}
+			if queueCount > 0 {
+				nextIdx := lastIdx + 1
+				consumeRRAdvance(req.GroupName, req.Topic, tag, queueCount, nextIdx)
 			}
 		}
 
-		if len(msgs) == 0 {
+		if len(out) == 0 {
 			logger.Debug("No messages available", zap.String("group", req.GroupName), zap.String("topic", req.Topic))
 			respx.FailGin(c, errx.ErrNotFound)
 			return
 		}
 
-		out := make([]ConsumeMessage, 0, len(msgs))
-		batch := make([]queue.Message, 0, len(msgs))
-		for _, msg := range msgs {
-			batch = append(batch, queue.Message{
-				ID:        msg.ID,
-				Body:      msg.Body,
-				Tag:       msg.Tag,
-				Retry:     msg.Retry,
-				Timestamp: msg.Timestamp,
-			})
-			out = append(out, ConsumeMessage{
-				ID:        msg.ID,
-				Body:      msg.Body,
-				Tag:       msg.Tag,
-				Retry:     msg.Retry,
-				Timestamp: msg.Timestamp.Unix(),
-			})
-		}
-		b.BeginProcessingBatch(req.GroupName, req.Topic, queueID, offset, batch)
-
 		resp := ConsumeBatchResponse{
-			Messages:   out,
-			Group:      req.GroupName,
-			Topic:      req.Topic,
-			QueueID:    queueID,
-			Offset:     offset,
-			NextOffset: next,
-			State:      "processing",
+			Messages: out,
+			Group:    req.GroupName,
+			Topic:    req.Topic,
+			State:    "processing",
 		}
 
 		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))

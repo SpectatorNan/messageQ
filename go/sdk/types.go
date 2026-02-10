@@ -143,13 +143,10 @@ type (
 		State      string         `json:"state"`
 	}
 	ConsumeBatchResponse struct {
-		Messages   []ConsumeMessage `json:"messages"`
-		Group      string           `json:"group"`
-		Topic      string           `json:"topic"`
-		QueueID    int              `json:"queueId"`
-		Offset     int64            `json:"offset"`
-		NextOffset int64            `json:"nextOffset"`
-		State      string           `json:"state"`
+		Messages []ConsumeBatchMessage `json:"messages"`
+		Group    string                `json:"group"`
+		Topic    string                `json:"topic"`
+		State    string                `json:"state"`
 	}
 	ConsumeMessage struct {
 		ID        string       `json:"id"`
@@ -157,6 +154,16 @@ type (
 		Tag       string       `json:"tag,omitempty"`
 		Retry     int          `json:"retry"`
 		Timestamp FlexibleUnix `json:"timestamp"`
+	}
+	ConsumeBatchMessage struct {
+		ID         string       `json:"id"`
+		Body       string       `json:"body"`
+		Tag        string       `json:"tag,omitempty"`
+		Retry      int          `json:"retry"`
+		Timestamp  FlexibleUnix `json:"timestamp"`
+		QueueID    int          `json:"queueId"`
+		Offset     int64        `json:"offset"`
+		NextOffset int64        `json:"nextOffset"`
 	}
 	MessageStatus struct {
 		ID          string        `json:"id"`
