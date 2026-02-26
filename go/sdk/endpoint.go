@@ -27,6 +27,9 @@ func (e *Endpoint) DeleteAccessKey(id string) string {
 func (e *Endpoint) GetStats() string {
 	return fmt.Sprintf("%s/api/v1/stats", e.baseUrl)
 }
+func (e *Endpoint) GetTopicStats(topic string) string {
+	return fmt.Sprintf("%s/api/v1/stats/topics/%s", e.baseUrl, topic)
+}
 
 // topics
 func (e *Endpoint) CreateTopic() string {
@@ -46,8 +49,17 @@ func (e *Endpoint) DeleteTopic(topic string) string {
 func (e *Endpoint) ProduceMessage(topic string) string {
 	return fmt.Sprintf("%s/api/v1/topics/%s/messages", e.baseUrl, topic)
 }
+func (e *Endpoint) ProduceBatchMessage(topic string) string {
+	return fmt.Sprintf("%s/api/v1/topics/%s/messages/batch", e.baseUrl, topic)
+}
 func (e *Endpoint) ConsumeMessages(topic, group string) string {
 	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/messages", e.baseUrl, group, topic)
+}
+func (e *Endpoint) ConsumeBatchMessages(topic, group string) string {
+	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/messages/batch", e.baseUrl, group, topic)
+}
+func (e *Endpoint) ListMessages(topic, group string) string {
+	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/messages/status", e.baseUrl, group, topic)
 }
 func (e *Endpoint) GetOffsets(topic, group string) string {
 	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/offsets", e.baseUrl, group, topic)

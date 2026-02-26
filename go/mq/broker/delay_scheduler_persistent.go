@@ -4,7 +4,7 @@ import (
 	"container/heap"
 	"encoding/json"
 	"fmt"
-	"messageQ/mq/storage"
+	"github.com/SpectatorNan/messageQ/go/mq/storage"
 	"os"
 	"path/filepath"
 	"sync"

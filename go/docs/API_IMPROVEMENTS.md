@@ -339,7 +339,7 @@ if req.QueueCount > 128 {
     --- PASS: TestTopicManagement/list_topics (0.00s)
 
 PASS
-ok      messageQ/mq/api 0.567s
+ok      github.com/SpectatorNan/messageQ/go/mq/api 0.567s
 ```
 
 ---

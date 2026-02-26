@@ -3,7 +3,7 @@ package broker
 import (
 	"container/heap"
 	"fmt"
-	"messageQ/mq/storage"
+	"github.com/SpectatorNan/messageQ/go/mq/storage"
 	"sync"
 	"time"
 )

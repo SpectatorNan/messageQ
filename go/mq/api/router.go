@@ -1,9 +1,11 @@
 package api
 
 import (
-	"messageQ/mq/auth"
-	"messageQ/mq/broker"
-	"messageQ/mq/config"
+	"github.com/SpectatorNan/messageQ/go/mq/auth"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/config"
+	"github.com/SpectatorNan/messageQ/go/mq/errx"
+	"net/http"
 
 	"github.com/gin-gonic/gin"
 )
@@ -17,6 +19,15 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 	if err == nil && cfg != nil {
 		adminAK = cfg.AdminAK
 	}
+
+	// if adminAK is not set, log a fatal error and exit
+	if adminAK == "" {
+		panic("Admin access key is not set in configuration")
+	}
+
+	r.NoRoute(func(context *gin.Context) {
+		context.JSON(http.StatusNotFound, errx.ErrInvalidApi)
+	})
 
 	// API version 1
 	v1 := r.Group("/api/v1")
@@ -32,11 +43,14 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 
 			// Message production (supports both normal and delayed messages via optional delay_ms/delay_sec parameters)
 			protected.POST("/topics/:topic/messages", ProduceHandler(b))
+			protected.POST("/topics/:topic/messages/batch", ProduceBatchHandler(b))
 
 			// Message consumption (consumer-centric)
 			consumers := protected.Group("/consumers/:group")
 			{
 				consumers.GET("/topics/:topic/messages", ConsumeHandler(b))
+				consumers.GET("/topics/:topic/messages/batch", ConsumeBatchHandler(b))
+				consumers.GET("/topics/:topic/messages/status", ListMessagesHandler(b))
 				consumers.GET("/topics/:topic/offsets", GetOffsetHandler(b))
 				consumers.POST("/topics/:topic/offsets", CommitOffsetHandler(b))
 
@@ -46,6 +60,7 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 
 			// Monitoring
 			protected.GET("/stats", DelayStatsHandler(b))
+			protected.GET("/stats/topics/:topic", TopicStatsHandler(b))
 		}
 
 		admin := v1.Group("/admin")

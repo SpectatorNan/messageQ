@@ -1,6 +1,7 @@
 package errx
 
 var (
+	ErrInvalidApi         = NewRespErr(ErrCodeInvalidApi, "invalid API endpoint or method")
 	ErrMissingTopic       = NewRespErr(ErrCodeMissingTopic, "missing topic parameter")
 	ErrInvalidMessage     = NewRespErr(ErrCodeInvalidMsg, "invalid message format or empty body")
 	ErrInvalidID          = NewRespErr(ErrCodeInvalidID, "invalid message id format")
@@ -11,6 +12,11 @@ var (
 	ErrMissingTag         = NewRespErr(ErrCodeMissingTag, "missing tag parameter")
 	ErrBusy               = NewRespErr(ErrCodeBusy, "message is currently being processed")
 	ErrInvalidDelay       = NewRespErr(ErrCodeInvalidDelay, "invalid delay parameter")
+	ErrDelayConflict      = NewRespErr(ErrCodeDelayConflict, "scheduledAt cannot be combined with delayMs or delaySec")
+	ErrDelayBothSet       = NewRespErr(ErrCodeDelayBothSet, "delayMs and delaySec cannot both be set")
+	ErrDelayNonPositive   = NewRespErr(ErrCodeDelayNonPositive, "delay values must be positive")
+	ErrDelayTooLarge      = NewRespErr(ErrCodeDelayTooLarge, "delay exceeds maximum")
+	ErrScheduledAtInvalid = NewRespErr(ErrCodeScheduledAtInvalid, "scheduledAt must be in the future and within the max window")
 	ErrInvalidTopicType   = NewRespErr(ErrCodeInvalidTopicType, "invalid topic type, must be NORMAL or DELAY")
 	ErrTopicExists        = NewRespErr(ErrCodeTopicExists, "topic already exists")
 	ErrInvalidQueueID     = NewRespErr(ErrCodeInvalidQueueID, "invalid queue_id parameter")
@@ -23,6 +29,7 @@ var (
 
 // Optionally define error codes for API responses
 const (
+	ErrCodeInvalidApi         = "invalid_api"
 	ErrCodeMissingTopic       = "missing_topic"
 	ErrCodeInvalidMsg         = "invalid_message"
 	ErrCodeInvalidID          = "invalid_id"
@@ -33,6 +40,11 @@ const (
 	ErrCodeMissingTag         = "missing_tag"
 	ErrCodeBusy               = "busy"
 	ErrCodeInvalidDelay       = "invalid_delay"
+	ErrCodeDelayConflict      = "delay_conflict"
+	ErrCodeDelayBothSet       = "delay_both_set"
+	ErrCodeDelayNonPositive   = "delay_non_positive"
+	ErrCodeDelayTooLarge      = "delay_too_large"
+	ErrCodeScheduledAtInvalid = "scheduled_at_invalid"
 	ErrCodeInvalidTopicType   = "invalid_topic_type"
 	ErrCodeTopicExists        = "topic_exists"
 	ErrCodeInvalidQueueID     = "invalid_queue_id"

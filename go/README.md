@@ -11,6 +11,23 @@ go run .
 
 Default server: `http://localhost:8080`
 
+## As a Dependency
+
+Because this module is in the `go/` subdirectory, use this module path:
+
+```bash
+go get github.com/SpectatorNan/messageQ/go@latest
+```
+
+Import examples:
+
+```go
+import (
+    "github.com/SpectatorNan/messageQ/go/sdk"
+    "github.com/SpectatorNan/messageQ/go/mq/broker"
+)
+```
+
 ## Features
 
 - ✅ **RESTful API** with versioned endpoints (`/api/v1`)
@@ -38,7 +55,7 @@ See [API documentation](mq/api/ROUTE_OPTIMIZATION.md) for complete endpoint refe
 
 MessageQ uses [zap](https://github.com/uber-go/zap) for structured, high-performance logging.
 
-See [LOGGING.md](LOGGING.md) for detailed documentation.
+See [LOGGING.md](docs/LOGGING.md) for detailed documentation.
 
 **Quick configuration:**
 

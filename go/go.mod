@@ -1,4 +1,4 @@
-module messageQ
+module github.com/SpectatorNan/messageQ/go
 
 go 1.24.4
 

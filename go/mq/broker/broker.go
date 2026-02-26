@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -12,14 +13,15 @@ import (
 
 	"github.com/google/uuid"
 
-	"messageQ/mq/logger"
-	"messageQ/mq/queue"
-	"messageQ/mq/storage"
+	"github.com/SpectatorNan/messageQ/go/mq/logger"
+	"github.com/SpectatorNan/messageQ/go/mq/queue"
+	"github.com/SpectatorNan/messageQ/go/mq/storage"
 )
 
 const defaultQueueCount = 4
 const defaultMaxRetry = 3
 const defaultProcessingTimeout = 30 * time.Second // 消息处理超时时间
+const defaultCompletedHistorySize = 1000
 
 type processingState string
 
@@ -40,8 +42,24 @@ type processingEntry struct {
 	Tag        string
 	Retry      int
 	Timestamp  time.Time
+	ConsumedAt time.Time
 	State      processingState
 	UpdatedAt  time.Time
+}
+
+type completedEntry struct {
+	Group      string
+	Topic      string
+	QueueID    int
+	Offset     int64
+	NextOffset int64
+	MsgID      string
+	Body       string
+	Tag        string
+	Retry      int
+	Timestamp  time.Time
+	ConsumedAt time.Time
+	AckedAt    time.Time
 }
 
 type Broker struct {
@@ -53,6 +71,7 @@ type Broker struct {
 	rrDeq                  map[string]int
 	inflight               map[string]int
 	processing             map[string]processingEntry // group:topic:msgID -> entry
+	completed              map[string][]completedEntry
 	stats                  map[string]*groupStats     // group -> stats
 	retryCounts            map[string]int             // msgID -> retry count (in-memory)
 	maxRetry               int
@@ -61,6 +80,7 @@ type Broker struct {
 	topicManager           *TopicManager          // topic metadata manager
 	dataDir                string                 // data directory for persistence
 	processingTimeout      time.Duration          // message processing timeout
+	completedLimit         int
 	retryBackoffBase       time.Duration          // retry backoff base delay
 	retryBackoffMultiplier float64                // retry backoff multiplier
 	retryBackoffMax        time.Duration          // retry backoff max delay
@@ -72,6 +92,13 @@ type groupStats struct {
 	Processing int64 `json:"processing"`
 	Completed  int64 `json:"completed"`
 	Retry      int64 `json:"retry"`
+}
+
+// DelayEnqueueItem represents a delayed enqueue input.
+type DelayEnqueueItem struct {
+	Body  string
+	Tag   string
+	Delay time.Duration
 }
 
 func NewBroker() *Broker {
@@ -130,6 +157,8 @@ func NewBrokerWithPersistence(store storage.Storage, queueCount int, dataDir str
 		retryBackoffMultiplier: 2.0,
 		retryBackoffMax:        60 * time.Second,
 		stopChan:               make(chan struct{}),
+		completed:              make(map[string][]completedEntry),
+		completedLimit:         defaultCompletedHistorySize,
 	}
 
 	akStore, err := storage.NewAccessKeyStore(filepath.Join(dataDir, "aks.json"))
@@ -242,6 +271,10 @@ func processingKey(group, topic, msgID string) string {
 	return group + ":" + topic + ":" + msgID
 }
 
+func groupTopicKey(group, topic string) string {
+	return group + ":" + topic
+}
+
 // getQueues ensures queues exist for a topic.
 func (b *Broker) getQueues(topic string) []*queue.Queue {
 	if qs, ok := b.queues[topic]; ok {
@@ -278,6 +311,25 @@ func (b *Broker) GetQueueCount(topic string) int {
 
 // Enqueue routes to a queue using round-robin and returns the message.
 func (b *Broker) Enqueue(topic string, body string, tag string) queue.Message {
+	return b.enqueueSingle(topic, body, tag)
+}
+
+// EnqueueBody keeps backward compatibility for callers without tags.
+func (b *Broker) EnqueueBody(topic string, body string) queue.Message {
+	return b.Enqueue(topic, body, "")
+}
+
+// EnqueueWithDelay schedules a message for delayed delivery
+func (b *Broker) EnqueueWithDelay(topic string, body string, tag string, delay time.Duration) queue.Message {
+	msgs := b.EnqueueWithDelayBatch(topic, []DelayEnqueueItem{{Body: body, Tag: tag, Delay: delay}})
+	if len(msgs) == 0 {
+		return queue.Message{}
+	}
+	return msgs[0]
+}
+
+// enqueueSingle enqueues a single message without calling batch APIs.
+func (b *Broker) enqueueSingle(topic string, body string, tag string) queue.Message {
 	if tag == "" {
 		return queue.Message{}
 	}
@@ -289,42 +341,98 @@ func (b *Broker) Enqueue(topic string, body string, tag string) queue.Message {
 	return qs[idx].Enqueue(body, tag)
 }
 
-// EnqueueBody keeps backward compatibility for callers without tags.
-func (b *Broker) EnqueueBody(topic string, body string) queue.Message {
-	return b.Enqueue(topic, body, "")
-}
-
-// EnqueueWithDelay schedules a message for delayed delivery
-func (b *Broker) EnqueueWithDelay(topic string, body string, tag string, delay time.Duration) queue.Message {
-	if tag == "" {
-		return queue.Message{}
+// EnqueueBatch enqueues multiple messages with a single broker lock.
+func (b *Broker) EnqueueBatch(topic string, items []queue.Message) []queue.Message {
+	if len(items) == 0 {
+		return nil
 	}
-
+	if len(items) == 1 {
+		msg := b.enqueueSingle(topic, items[0].Body, items[0].Tag)
+		return []queue.Message{msg}
+	}
 	b.lock.Lock()
 	qs := b.getQueues(topic)
-	idx := b.rrEnq[topic] % len(qs)
-	b.rrEnq[topic] = (idx + 1) % len(qs)
+	start := b.rrEnq[topic] % len(qs)
+	b.rrEnq[topic] = (start + len(items)) % len(qs)
 	b.lock.Unlock()
 
-	// Generate message ID and metadata
-	uid, _ := uuid.NewV7()
-	msg := queue.Message{
-		ID:        uid.String(),
-		Body:      body,
-		Tag:       tag,
-		Timestamp: time.Now(),
+	msgs := make([]queue.Message, 0, len(items))
+	for i, item := range items {
+		idx := (start + i) % len(qs)
+		msg := qs[idx].Enqueue(item.Body, item.Tag)
+		if msg.ID != "" {
+			msgs = append(msgs, msg)
+		}
 	}
+	return msgs
+}
 
-	// Schedule for delayed delivery
-	b.delayScheduler.ScheduleWithDelay(topic, idx, storage.Message{
-		ID:        msg.ID,
-		Body:      msg.Body,
-		Tag:       msg.Tag,
-		Retry:     0,
-		Timestamp: msg.Timestamp,
-	}, delay)
+// EnqueueWithDelayBatch schedules multiple delayed messages with a single broker lock.
+func (b *Broker) EnqueueWithDelayBatch(topic string, items []DelayEnqueueItem) []queue.Message {
+	if len(items) == 0 {
+		return nil
+	}
+	if len(items) == 1 {
+		item := items[0]
+		if item.Tag == "" {
+			return nil
+		}
+		uid, err := uuid.NewV7()
+		if err != nil {
+			uid = uuid.New()
+		}
+		msg := queue.Message{
+			ID:        uid.String(),
+			Body:      item.Body,
+			Tag:       item.Tag,
+			Timestamp: time.Now(),
+		}
+		b.lock.Lock()
+		qs := b.getQueues(topic)
+		idx := b.rrEnq[topic] % len(qs)
+		b.rrEnq[topic] = (idx + 1) % len(qs)
+		b.lock.Unlock()
+		b.delayScheduler.ScheduleWithDelay(topic, idx, storage.Message{
+			ID:        msg.ID,
+			Body:      msg.Body,
+			Tag:       msg.Tag,
+			Retry:     0,
+			Timestamp: msg.Timestamp,
+		}, item.Delay)
+		return []queue.Message{msg}
+	}
+	b.lock.Lock()
+	qs := b.getQueues(topic)
+	start := b.rrEnq[topic] % len(qs)
+	b.rrEnq[topic] = (start + len(items)) % len(qs)
+	b.lock.Unlock()
 
-	return msg
+	msgs := make([]queue.Message, 0, len(items))
+	for i, item := range items {
+		if item.Tag == "" {
+			continue
+		}
+		idx := (start + i) % len(qs)
+		uid, err := uuid.NewV7()
+		if err != nil {
+			uid = uuid.New()
+		}
+		msg := queue.Message{
+			ID:        uid.String(),
+			Body:      item.Body,
+			Tag:       item.Tag,
+			Timestamp: time.Now(),
+		}
+		b.delayScheduler.ScheduleWithDelay(topic, idx, storage.Message{
+			ID:        msg.ID,
+			Body:      msg.Body,
+			Tag:       msg.Tag,
+			Retry:     0,
+			Timestamp: msg.Timestamp,
+		}, item.Delay)
+		msgs = append(msgs, msg)
+	}
+	return msgs
 }
 
 // Dequeue attempts a non-blocking scan across queues; if empty, blocks on a queue in round-robin.
@@ -405,10 +513,23 @@ type ConsumeQueueReader interface {
 	ReadFromConsumeQueue(topic string, queueID int, offset int64, max int, tag string) ([]storage.Message, int64, error)
 }
 
+// ConsumeQueueReaderWithOffset provides consumequeue reads with offsets.
+type ConsumeQueueReaderWithOffset interface {
+	ReadFromConsumeQueueWithOffsets(topic string, queueID int, offset int64, max int, tag string) ([]storage.MessageWithOffset, int64, error)
+}
+
 // ReadFromConsumeQueue proxies to storage consumequeue reader when available.
 func (b *Broker) ReadFromConsumeQueue(topic string, queueID int, offset int64, max int, tag string) ([]storage.Message, int64, error) {
 	if r, ok := b.store.(ConsumeQueueReader); ok {
 		return r.ReadFromConsumeQueue(topic, queueID, offset, max, tag)
+	}
+	return nil, offset, ErrOffsetUnsupported
+}
+
+// ReadFromConsumeQueueWithOffsets proxies to storage consumequeue reader when available.
+func (b *Broker) ReadFromConsumeQueueWithOffsets(topic string, queueID int, offset int64, max int, tag string) ([]storage.MessageWithOffset, int64, error) {
+	if r, ok := b.store.(ConsumeQueueReaderWithOffset); ok {
+		return r.ReadFromConsumeQueueWithOffsets(topic, queueID, offset, max, tag)
 	}
 	return nil, offset, ErrOffsetUnsupported
 }
@@ -516,47 +637,63 @@ func (b *Broker) ConsumeWithRetry(group, topic string, queueID int, tag string, 
 
 // BeginProcessing records a message as processing for a group/queue/offset.
 func (b *Broker) BeginProcessing(group, topic string, queueID int, offset, nextOffset int64, msg queue.Message) {
+	_ = nextOffset
+	b.BeginProcessingBatch(group, topic, queueID, offset, []queue.Message{msg})
+}
+
+// BeginProcessingBatch records multiple messages as processing in a single lock.
+func (b *Broker) BeginProcessingBatch(group, topic string, queueID int, startOffset int64, msgs []queue.Message) {
+	if len(msgs) == 0 {
+		return
+	}
+	consumedAt := now()
 	b.lock.Lock()
-	defer b.lock.Unlock()
-	// apply retry count if tracked
-	if rc := b.retryCounts[msg.ID]; rc > msg.Retry {
-		msg.Retry = rc
-	}
-	entry := processingEntry{
-		Group:      group,
-		Topic:      topic,
-		QueueID:    queueID,
-		Offset:     offset,
-		NextOffset: nextOffset,
-		MsgID:      msg.ID,
-		Body:       msg.Body,
-		Tag:        msg.Tag,
-		Retry:      msg.Retry,
-		Timestamp:  msg.Timestamp,
-		State:      stateProcessing,
-		UpdatedAt:  time.Now(),
-	}
-	b.processing[processingKey(group, topic, msg.ID)] = entry
-	// fmt.Printf("[DEBUG] BeginProcessing: added %s to processing map (total: %d)\n", msg.ID, len(b.processing))
 	gs := b.stats[group]
 	if gs == nil {
 		gs = &groupStats{}
 		b.stats[group] = gs
 	}
-	gs.Processing++
+	for i, msg := range msgs {
+		// apply retry count if tracked
+		if rc := b.retryCounts[msg.ID]; rc > msg.Retry {
+			msg.Retry = rc
+		}
+		offset := startOffset + int64(i)
+		nextOffset := offset + 1
+		entry := processingEntry{
+			Group:      group,
+			Topic:      topic,
+			QueueID:    queueID,
+			Offset:     offset,
+			NextOffset: nextOffset,
+			MsgID:      msg.ID,
+			Body:       msg.Body,
+			Tag:        msg.Tag,
+			Retry:      msg.Retry,
+			Timestamp:  msg.Timestamp,
+			ConsumedAt: consumedAt,
+			State:      stateProcessing,
+			UpdatedAt:  consumedAt,
+		}
+		b.processing[processingKey(group, topic, msg.ID)] = entry
+	}
+	gs.Processing += int64(len(msgs))
+	b.lock.Unlock()
 
 	if ps, ok := b.store.(ProcessingStore); ok {
-		_ = ps.SaveProcessing(storage.ProcessingRecord{
-			Group:     group,
-			Topic:     topic,
-			QueueID:   queueID,
-			MsgID:     msg.ID,
-			Body:      msg.Body,
-			Tag:       msg.Tag,
-			Retry:     msg.Retry,
-			Timestamp: msg.Timestamp,
-			UpdatedAt: time.Now(),
-		})
+		for _, msg := range msgs {
+			_ = ps.SaveProcessing(storage.ProcessingRecord{
+				Group:     group,
+				Topic:     topic,
+				QueueID:   queueID,
+				MsgID:     msg.ID,
+				Body:      msg.Body,
+				Tag:       msg.Tag,
+				Retry:     msg.Retry,
+				Timestamp: msg.Timestamp,
+				UpdatedAt: consumedAt,
+			})
+		}
 	}
 }
 
@@ -654,7 +791,8 @@ func (b *Broker) CompleteProcessing(msgID, group, topic string) bool {
 		return false
 	}
 	entry.State = stateCompleted
-	entry.UpdatedAt = time.Now()
+	ackedAt := now()
+	entry.UpdatedAt = ackedAt
 	b.processing[msgID] = entry
 	gs := b.stats[entry.Group]
 	if gs != nil {
@@ -662,6 +800,27 @@ func (b *Broker) CompleteProcessing(msgID, group, topic string) bool {
 		gs.Completed++
 	}
 	delete(b.processing, key)
+
+	ctKey := groupTopicKey(entry.Group, entry.Topic)
+	completed := b.completed[ctKey]
+	completed = append(completed, completedEntry{
+		Group:      entry.Group,
+		Topic:      entry.Topic,
+		QueueID:    entry.QueueID,
+		Offset:     entry.Offset,
+		NextOffset: entry.NextOffset,
+		MsgID:      entry.MsgID,
+		Body:       entry.Body,
+		Tag:        entry.Tag,
+		Retry:      entry.Retry,
+		Timestamp:  entry.Timestamp,
+		ConsumedAt: entry.ConsumedAt,
+		AckedAt:    ackedAt,
+	})
+	if b.completedLimit > 0 && len(completed) > b.completedLimit {
+		completed = completed[len(completed)-b.completedLimit:]
+	}
+	b.completed[ctKey] = completed
 	b.clearRetryCount(msgID)
 	b.lock.Unlock()
 
@@ -680,6 +839,349 @@ func (b *Broker) Stats() map[string]groupStats {
 		out[g] = *s
 	}
 	return out
+}
+
+// ListProcessing returns in-flight processing entries for a group/topic.
+func (b *Broker) ListProcessing(group, topic string, limit int) []processingEntry {
+	if limit <= 0 {
+		limit = 50
+	}
+	b.lock.Lock()
+	entries := make([]processingEntry, 0)
+	for _, entry := range b.processing {
+		if entry.Group == group && entry.Topic == topic && entry.State == stateProcessing {
+			entries = append(entries, entry)
+		}
+	}
+	b.lock.Unlock()
+
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].ConsumedAt.After(entries[j].ConsumedAt)
+	})
+	if len(entries) > limit {
+		entries = entries[:limit]
+	}
+	return entries
+}
+
+// ListCompleted returns recent acked entries for a group/topic.
+func (b *Broker) ListCompleted(group, topic string, limit int) []completedEntry {
+	if limit <= 0 {
+		limit = 50
+	}
+	b.lock.Lock()
+	entries := append([]completedEntry(nil), b.completed[groupTopicKey(group, topic)]...)
+	b.lock.Unlock()
+	if len(entries) > limit {
+		entries = entries[len(entries)-limit:]
+	}
+	return entries
+}
+
+// PeekQueueCount returns the number of queues for a topic if already initialized.
+// It does not create queues.
+func (b *Broker) PeekQueueCount(topic string) (int, bool) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	qs, ok := b.queues[topic]
+	if !ok {
+		return 0, false
+	}
+	return len(qs), true
+}
+
+// PeekTopicQueueTotal returns the number of topics with initialized queues.
+// It does not create queues.
+func (b *Broker) PeekTopicQueueTotal() int {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	return len(b.queues)
+}
+
+// TopicStats holds per-topic message statistics.
+type TopicStats struct {
+	Name       string    `json:"name"`
+	Type       TopicType `json:"type"`
+	QueueCount int       `json:"queueCount"`
+	Total      int64     `json:"total"`      // total messages produced
+	CreatedAt  int64     `json:"createdAt"`
+}
+
+// ConsumerGroupTopicStats holds per-topic stats within a consumer group.
+type ConsumerGroupTopicStats struct {
+	Topic      string `json:"topic"`
+	Total      int64  `json:"total"`      // total messages in the topic
+	Completed  int64  `json:"completed"`  // acked messages
+	Processing int64  `json:"processing"` // in-flight messages
+	Pending    int64  `json:"pending"`    // waiting to be consumed
+}
+
+// ConsumerGroupStats holds per-consumer-group statistics.
+type ConsumerGroupStats struct {
+	Group      string                    `json:"group"`
+	Total      int64                     `json:"total"`
+	Completed  int64                     `json:"completed"`
+	Processing int64                     `json:"processing"`
+	Pending    int64                     `json:"pending"`
+	Topics     []ConsumerGroupTopicStats `json:"topics"`
+}
+
+// BrokerStats holds the full broker statistics.
+type BrokerStats struct {
+	Topics         []TopicStats             `json:"topics"`
+	ConsumerGroups []ConsumerGroupStats     `json:"consumerGroups"`
+	DelayScheduler map[string]interface{}   `json:"delayScheduler,omitempty"`
+	Total          int64                    `json:"total"`
+	Completed      int64                    `json:"completed"`
+	Processing     int64                    `json:"processing"`
+	Pending        int64                    `json:"pending"`
+}
+
+// consumeQueueDepthReader is an optional interface for storage to report queue depth.
+type consumeQueueDepthReader interface {
+	ConsumeQueueDepth(topic string, queueID int) int64
+}
+
+// topicDepth returns the total message count (consumequeue depth) for a topic.
+func (b *Broker) topicDepth(topic string, queueCount int) int64 {
+	dr, ok := b.store.(consumeQueueDepthReader)
+	if !ok {
+		return 0
+	}
+	var total int64
+	for i := 0; i < queueCount; i++ {
+		total += dr.ConsumeQueueDepth(topic, i)
+	}
+	return total
+}
+
+// topicConsumed returns the total consumed offset (sum across all queues) for a group/topic.
+func (b *Broker) topicConsumed(group, topic string, queueCount int) int64 {
+	var total int64
+	for i := 0; i < queueCount; i++ {
+		off, ok, err := b.GetOffset(group, topic, i)
+		if err == nil && ok {
+			total += off
+		}
+	}
+	return total
+}
+
+// countProcessing returns the number of in-flight processing entries for a group/topic.
+// Must be called with b.lock held.
+func (b *Broker) countProcessingLocked(group, topic string) int64 {
+	var count int64
+	for _, entry := range b.processing {
+		if entry.Group == group && entry.Topic == topic && entry.State == stateProcessing {
+			count++
+		}
+	}
+	return count
+}
+
+// FullStats returns comprehensive broker statistics.
+func (b *Broker) FullStats() BrokerStats {
+	topicConfigs := b.topicManager.ListUserTopics()
+
+	// Build topic depth map
+	topicDepthMap := make(map[string]int64, len(topicConfigs))
+	topicQueueCountMap := make(map[string]int, len(topicConfigs))
+	topicStatsList := make([]TopicStats, 0, len(topicConfigs))
+	var grandTotal int64
+
+	for _, tc := range topicConfigs {
+		qc := tc.QueueCount
+		if qc <= 0 {
+			qc = b.queueCount
+		}
+		depth := b.topicDepth(tc.Name, qc)
+		topicDepthMap[tc.Name] = depth
+		topicQueueCountMap[tc.Name] = qc
+		grandTotal += depth
+
+		topicStatsList = append(topicStatsList, TopicStats{
+			Name:       tc.Name,
+			Type:       tc.Type,
+			QueueCount: qc,
+			Total:      depth,
+			CreatedAt:  tc.CreatedAt,
+		})
+	}
+
+	// Discover consumer groups from b.stats
+	b.lock.Lock()
+	groupSet := make(map[string]bool, len(b.stats))
+	for g := range b.stats {
+		groupSet[g] = true
+	}
+
+	// Also discover groups from processing entries
+	for _, entry := range b.processing {
+		groupSet[entry.Group] = true
+	}
+	b.lock.Unlock()
+
+	// Build consumer group stats
+	var totalCompleted, totalProcessing, totalPending int64
+	groupStatsList := make([]ConsumerGroupStats, 0, len(groupSet))
+
+	for group := range groupSet {
+		var gCompleted, gProcessing, gPending, gTotal int64
+		topicStats := make([]ConsumerGroupTopicStats, 0)
+
+		for _, tc := range topicConfigs {
+			qc := topicQueueCountMap[tc.Name]
+			depth := topicDepthMap[tc.Name]
+			consumed := b.topicConsumed(group, tc.Name, qc)
+
+			b.lock.Lock()
+			processing := b.countProcessingLocked(group, tc.Name)
+			b.lock.Unlock()
+
+			// completed = consumed - processing (consumed offset includes processing messages)
+			completed := consumed - processing
+			if completed < 0 {
+				completed = 0
+			}
+
+			// pending = total depth - consumed
+			pending := depth - consumed
+			if pending < 0 {
+				pending = 0
+			}
+
+			// Only include topics that this group has interacted with
+			if consumed > 0 || processing > 0 {
+				topicStats = append(topicStats, ConsumerGroupTopicStats{
+					Topic:      tc.Name,
+					Total:      depth,
+					Completed:  completed,
+					Processing: processing,
+					Pending:    pending,
+				})
+				gTotal += depth
+				gCompleted += completed
+				gProcessing += processing
+				gPending += pending
+			}
+		}
+
+		if len(topicStats) > 0 {
+			groupStatsList = append(groupStatsList, ConsumerGroupStats{
+				Group:      group,
+				Total:      gTotal,
+				Completed:  gCompleted,
+				Processing: gProcessing,
+				Pending:    gPending,
+				Topics:     topicStats,
+			})
+			totalCompleted += gCompleted
+			totalProcessing += gProcessing
+			totalPending += gPending
+		}
+	}
+
+	// Delay scheduler stats
+	var delayStats map[string]interface{}
+	if ds := b.GetDelayScheduler(); ds != nil {
+		delayStats = ds.Stats()
+	}
+
+	return BrokerStats{
+		Topics:         topicStatsList,
+		ConsumerGroups: groupStatsList,
+		DelayScheduler: delayStats,
+		Total:          grandTotal,
+		Completed:      totalCompleted,
+		Processing:     totalProcessing,
+		Pending:        totalPending,
+	}
+}
+
+// TopicFullStats returns detailed stats for a specific topic across all consumer groups.
+func (b *Broker) TopicFullStats(topicName string) (*TopicStats, []ConsumerGroupTopicStats, error) {
+	tc, err := b.topicManager.GetTopicConfig(topicName)
+	if err != nil {
+		return nil, nil, err
+	}
+	qc := tc.QueueCount
+	if qc <= 0 {
+		qc = b.queueCount
+	}
+	depth := b.topicDepth(tc.Name, qc)
+
+	ts := &TopicStats{
+		Name:       tc.Name,
+		Type:       tc.Type,
+		QueueCount: qc,
+		Total:      depth,
+		CreatedAt:  tc.CreatedAt,
+	}
+
+	// Collect per-consumer-group stats for this topic
+	b.lock.Lock()
+	groupSet := make(map[string]bool, len(b.stats))
+	for g := range b.stats {
+		groupSet[g] = true
+	}
+	for _, entry := range b.processing {
+		if entry.Topic == topicName {
+			groupSet[entry.Group] = true
+		}
+	}
+	b.lock.Unlock()
+
+	consumerStats := make([]ConsumerGroupTopicStats, 0)
+	for group := range groupSet {
+		consumed := b.topicConsumed(group, topicName, qc)
+
+		b.lock.Lock()
+		processing := b.countProcessingLocked(group, topicName)
+		b.lock.Unlock()
+
+		if consumed == 0 && processing == 0 {
+			continue
+		}
+
+		completed := consumed - processing
+		if completed < 0 {
+			completed = 0
+		}
+		pending := depth - consumed
+		if pending < 0 {
+			pending = 0
+		}
+
+		consumerStats = append(consumerStats, ConsumerGroupTopicStats{
+			Topic:      group, // repurpose Topic field as group name in per-topic view
+			Total:      depth,
+			Completed:  completed,
+			Processing: processing,
+			Pending:    pending,
+		})
+	}
+
+	return ts, consumerStats, nil
+}
+
+// ListPending reads pending messages from consumequeue starting at cursor or group offset.
+func (b *Broker) ListPending(group, topic string, queueID int, cursor *int64, limit int, tag string) ([]storage.MessageWithOffset, int64, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	start := int64(0)
+	if cursor != nil {
+		start = *cursor
+	} else {
+		off, ok, err := b.GetOffset(group, topic, queueID)
+		if err != nil {
+			return nil, 0, err
+		}
+		if ok {
+			start = off
+		}
+	}
+	return b.ReadFromConsumeQueueWithOffsets(topic, queueID, start, limit, tag)
 }
 
 // Topic Management Methods
@@ -841,6 +1343,11 @@ func (b *Broker) SetRetryBackoff(base time.Duration, multiplier float64, max tim
 	b.retryBackoffBase = base
 	b.retryBackoffMultiplier = multiplier
 	b.retryBackoffMax = max
+}
+
+// CalculateRetryBackoff returns the retry backoff delay for the given retry count.
+func (b *Broker) CalculateRetryBackoff(retryCount int) time.Duration {
+	return b.calculateRetryBackoff(retryCount)
 }
 
 // calculateRetryBackoff calculates retry backoff delay using configured parameters.

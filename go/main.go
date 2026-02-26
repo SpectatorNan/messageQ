@@ -11,11 +11,11 @@ import (
 
 	"go.uber.org/zap"
 
-	"messageQ/mq/api"
-	"messageQ/mq/broker"
-	"messageQ/mq/config"
-	"messageQ/mq/logger"
-	"messageQ/mq/storage"
+	"github.com/SpectatorNan/messageQ/go/mq/api"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/config"
+	"github.com/SpectatorNan/messageQ/go/mq/logger"
+	"github.com/SpectatorNan/messageQ/go/mq/storage"
 )
 
 func main() {

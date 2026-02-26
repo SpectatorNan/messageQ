@@ -2,7 +2,7 @@ package client
 
 import (
 	"fmt"
-	"messageQ/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
 
 	"resty.dev/v3"
 )
@@ -116,6 +116,36 @@ func (h *API) DeleteAccessKey(id string) (*Resp[string], *ErrResp, error) {
 	return result, errResp, nil
 }
 
+// GetStats returns comprehensive broker statistics.
+func (h *API) GetStats() (*Resp[StatsResponse], *ErrResp, error) {
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var result *Resp[StatsResponse]
+	errResp, err := h.Get(r.SetResult(&result), h.endpoint.GetStats())
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
+// GetTopicStats returns detailed statistics for a specific topic.
+func (h *API) GetTopicStats(topic string) (*Resp[TopicDetailStatsResponse], *ErrResp, error) {
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var result *Resp[TopicDetailStatsResponse]
+	errResp, err := h.Get(r.SetResult(&result), h.endpoint.GetTopicStats(topic))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
 func (h *API) CreateTopic(name string, topicType broker.TopicType, queueCount int) (*Resp[TopicResponse], *ErrResp, error) {
 
 	req := CreateTopicRequest{
@@ -194,6 +224,12 @@ func WithDelayMilliseconds(delayMs int64) ProduceDelayOption {
 		r.DelayMs = delayMs
 	}
 }
+func WithScheduledAtUnix(unixSec int64) ProduceDelayOption {
+	return func(r *ProduceMessageRequest) {
+		v := FlexibleUnix(unixSec)
+		r.ScheduledAt = &v
+	}
+}
 
 func (h *API) ProduceMessage(topic string, tag string, body string, options ...ProduceDelayOption) (*Resp[ProduceMessageResponse], *ErrResp, error) {
 
@@ -212,6 +248,41 @@ func (h *API) ProduceMessage(topic string, tag string, body string, options ...P
 
 	var result *Resp[ProduceMessageResponse]
 	errResp, err := h.Post(r.SetBody(req).SetResult(&result), h.endpoint.ProduceMessage(topic))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
+type ProduceBatchOption func(*ProduceBatchMessage)
+
+func WithBatchDelaySeconds(delaySec int64) ProduceBatchOption {
+	return func(m *ProduceBatchMessage) {
+		m.DelaySec = delaySec
+	}
+}
+
+func WithBatchDelayMilliseconds(delayMs int64) ProduceBatchOption {
+	return func(m *ProduceBatchMessage) {
+		m.DelayMs = delayMs
+	}
+}
+func WithBatchScheduledAtUnix(unixSec int64) ProduceBatchOption {
+	return func(m *ProduceBatchMessage) {
+		v := FlexibleUnix(unixSec)
+		m.ScheduledAt = &v
+	}
+}
+
+func (h *API) ProduceBatchMessage(topic string, messages []ProduceBatchMessage) (*Resp[ProduceBatchResponse], *ErrResp, error) {
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	req := ProduceBatchRequest{Messages: messages}
+	var result *Resp[ProduceBatchResponse]
+	errResp, err := h.Post(r.SetBody(req).SetResult(&result), h.endpoint.ProduceBatchMessage(topic))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -240,6 +311,89 @@ func (h *API) ConsumeMessages(topic string, group string, tag string, options ..
 
 	var result *Resp[ConsumeMessageResponse]
 	errResp, err := h.Get(r.SetResult(&result), h.endpoint.ConsumeMessages(topic, group))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
+type ConsumeBatchOption func(*resty.Request)
+
+func WithBatchQueueId(queueId int) ConsumeBatchOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("queueId", fmt.Sprintf("%d", queueId))
+	}
+}
+
+func WithBatchTag(tag string) ConsumeBatchOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("tag", tag)
+	}
+}
+
+func WithBatchMax(max int) ConsumeBatchOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("max", fmt.Sprintf("%d", max))
+	}
+}
+
+func (h *API) ConsumeBatchMessages(topic string, group string, options ...ConsumeBatchOption) (*Resp[ConsumeBatchResponse], *ErrResp, error) {
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, option := range options {
+		option(r)
+	}
+
+	var result *Resp[ConsumeBatchResponse]
+	errResp, err := h.Get(r.SetResult(&result), h.endpoint.ConsumeBatchMessages(topic, group))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
+type ListMessagesOption func(*resty.Request)
+
+func WithListQueueId(queueId int) ListMessagesOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("queueId", fmt.Sprintf("%d", queueId))
+	}
+}
+
+func WithListTag(tag string) ListMessagesOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("tag", tag)
+	}
+}
+
+func WithListLimit(limit int) ListMessagesOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("limit", fmt.Sprintf("%d", limit))
+	}
+}
+
+func WithListCursor(cursor int64) ListMessagesOption {
+	return func(r *resty.Request) {
+		r.SetQueryParam("cursor", fmt.Sprintf("%d", cursor))
+	}
+}
+
+func (h *API) ListMessages(topic string, group string, state string, options ...ListMessagesOption) (*Resp[ListMessagesResponse], *ErrResp, error) {
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+	if state != "" {
+		r.SetQueryParam("state", state)
+	}
+	for _, option := range options {
+		option(r)
+	}
+
+	var result *Resp[ListMessagesResponse]
+	errResp, err := h.Get(r.SetResult(&result), h.endpoint.ListMessages(topic, group))
 	if err != nil {
 		return nil, nil, err
 	}

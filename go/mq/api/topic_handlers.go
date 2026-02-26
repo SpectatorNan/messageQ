@@ -1,9 +1,9 @@
 package api
 
 import (
-	"messageQ/mq/broker"
-	"messageQ/mq/errx"
-	"messageQ/mq/respx"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/errx"
+	"github.com/SpectatorNan/messageQ/go/mq/respx"
 	"net/http"
 	"strings"
 	"time"
@@ -18,6 +18,9 @@ func CreateTopicHandler(b *broker.Broker) gin.HandlerFunc {
 		if err := c.ShouldBindJSON(&req); err != nil {
 			respx.FailGin(c, errx.ErrInvalidMessage)
 			return
+		}
+		if req.QueueCount == 0 && req.QueueCountAlt > 0 {
+			req.QueueCount = req.QueueCountAlt
 		}
 
 		err := req.Validate()
@@ -80,12 +83,7 @@ func ListTopicsHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		topics := b.ListTopics()
 
-		resp := ListTopicsResponse{
-			Topics: topics,
-			Total:  len(topics),
-		}
-
-		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
+		c.JSON(http.StatusOK, respx.NewRespList(topics, len(topics)))
 	}
 }
 

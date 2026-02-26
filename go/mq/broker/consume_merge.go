@@ -1,7 +1,7 @@
 package broker
 
 import (
-	"messageQ/mq/storage"
+	"github.com/SpectatorNan/messageQ/go/mq/storage"
 	"sort"
 )
 
