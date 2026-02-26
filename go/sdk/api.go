@@ -2,7 +2,7 @@ package client
 
 import (
 	"fmt"
-	"messageQ/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
 
 	"resty.dev/v3"
 )

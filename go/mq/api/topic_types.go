@@ -1,9 +1,9 @@
 package api
 
 import (
-	"messageQ/mq/broker"
-	"messageQ/mq/errx"
-	client "messageQ/sdk"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/errx"
+	client "github.com/SpectatorNan/messageQ/go/sdk"
 )
 
 type (

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"messageQ/mq/storage"
+	"github.com/SpectatorNan/messageQ/go/mq/storage"
 )
 
 // DelayedMessage represents a message scheduled for delayed delivery

@@ -8,8 +8,8 @@ import (
 
 	"github.com/google/uuid"
 
-	"messageQ/mq/logger"
-	"messageQ/mq/storage"
+	"github.com/SpectatorNan/messageQ/go/mq/logger"
+	"github.com/SpectatorNan/messageQ/go/mq/storage"
 )
 
 type Queue struct {

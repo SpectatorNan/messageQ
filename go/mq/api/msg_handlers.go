@@ -2,8 +2,8 @@ package api
 
 import (
 	"fmt"
-	"messageQ/mq/errx"
-	"messageQ/mq/respx"
+	"github.com/SpectatorNan/messageQ/go/mq/errx"
+	"github.com/SpectatorNan/messageQ/go/mq/respx"
 	"net/http"
 	"strings"
 	"sync"
@@ -11,11 +11,11 @@ import (
 
 	"go.uber.org/zap"
 
-	"messageQ/mq/broker"
-	"messageQ/mq/logger"
-	"messageQ/mq/queue"
-	"messageQ/mq/storage"
-	client "messageQ/sdk"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/logger"
+	"github.com/SpectatorNan/messageQ/go/mq/queue"
+	"github.com/SpectatorNan/messageQ/go/mq/storage"
+	client "github.com/SpectatorNan/messageQ/go/sdk"
 
 	"github.com/gin-gonic/gin"
 )

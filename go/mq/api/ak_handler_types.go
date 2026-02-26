@@ -2,7 +2,7 @@ package api
 
 import (
 	"errors"
-	client "messageQ/sdk"
+	client "github.com/SpectatorNan/messageQ/go/sdk"
 	"strings"
 )
 

@@ -1,9 +1,9 @@
 package api
 
 import (
-	"messageQ/mq/broker"
-	"messageQ/mq/errx"
-	"messageQ/mq/respx"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/errx"
+	"github.com/SpectatorNan/messageQ/go/mq/respx"
 	"net/http"
 	"strings"
 	"time"

@@ -1,11 +1,11 @@
 package auth
 
 import (
-	"messageQ/mq/errx"
-	"messageQ/mq/respx"
+	"github.com/SpectatorNan/messageQ/go/mq/errx"
+	"github.com/SpectatorNan/messageQ/go/mq/respx"
 	"strings"
 
-	"messageQ/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
 
 	"github.com/gin-gonic/gin"
 )

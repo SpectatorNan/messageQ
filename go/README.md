@@ -11,6 +11,23 @@ go run .
 
 Default server: `http://localhost:8080`
 
+## As a Dependency
+
+Because this module is in the `go/` subdirectory, use this module path:
+
+```bash
+go get github.com/SpectatorNan/messageQ/go@latest
+```
+
+Import examples:
+
+```go
+import (
+    "github.com/SpectatorNan/messageQ/go/sdk"
+    "github.com/SpectatorNan/messageQ/go/mq/broker"
+)
+```
+
 ## Features
 
 - ✅ **RESTful API** with versioned endpoints (`/api/v1`)

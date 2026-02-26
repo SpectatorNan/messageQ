@@ -1,8 +1,8 @@
 package api
 
 import (
-	"messageQ/mq/broker"
-	"messageQ/mq/respx"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/respx"
 	"net/http"
 
 	"github.com/gin-gonic/gin"

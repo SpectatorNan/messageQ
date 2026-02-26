@@ -1,7 +1,7 @@
 package client
 
 import (
-	"messageQ/mq/auth"
+	"github.com/SpectatorNan/messageQ/go/mq/auth"
 
 	"resty.dev/v3"
 )

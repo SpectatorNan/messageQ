@@ -48,7 +48,7 @@ Critical errors causing application termination. Includes:
 ### Programmatic Configuration
 
 ```go
-import "messageQ/mq/logger"
+import "github.com/SpectatorNan/messageQ/go/mq/logger"
 
 // Use default configuration (INFO level, console format, stdout)
 logger.InitDefault()

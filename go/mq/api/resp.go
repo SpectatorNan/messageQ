@@ -1,7 +1,7 @@
 package api
 
 import (
-	"messageQ/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
 	"time"
 )
 

@@ -2,7 +2,7 @@ package client
 
 import (
 	"encoding/json"
-	"messageQ/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
 	"strconv"
 	"time"
 )

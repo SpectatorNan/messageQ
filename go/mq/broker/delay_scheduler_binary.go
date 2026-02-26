@@ -4,7 +4,7 @@ import (
 	"container/heap"
 	"encoding/binary"
 	"fmt"
-	"messageQ/mq/storage"
+	"github.com/SpectatorNan/messageQ/go/mq/storage"
 	"sort"
 	"sync"
 	"time"

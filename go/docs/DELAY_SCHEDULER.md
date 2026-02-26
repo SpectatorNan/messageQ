@@ -126,7 +126,7 @@ curl http://localhost:8080/stats
 ```go
 import (
     "time"
-    "messageQ/mq/broker"
+  "github.com/SpectatorNan/messageQ/go/mq/broker"
 )
 
 b := broker.NewBrokerWithStorage(store, 4)

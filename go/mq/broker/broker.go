@@ -13,9 +13,9 @@ import (
 
 	"github.com/google/uuid"
 
-	"messageQ/mq/logger"
-	"messageQ/mq/queue"
-	"messageQ/mq/storage"
+	"github.com/SpectatorNan/messageQ/go/mq/logger"
+	"github.com/SpectatorNan/messageQ/go/mq/queue"
+	"github.com/SpectatorNan/messageQ/go/mq/storage"
 )
 
 const defaultQueueCount = 4

@@ -1,9 +1,9 @@
 package api
 
 import (
-	"messageQ/mq/errx"
-	"messageQ/mq/logger"
-	client "messageQ/sdk"
+	"github.com/SpectatorNan/messageQ/go/mq/errx"
+	"github.com/SpectatorNan/messageQ/go/mq/logger"
+	client "github.com/SpectatorNan/messageQ/go/sdk"
 	"strings"
 
 	"github.com/google/uuid"

@@ -1,10 +1,10 @@
 package api
 
 import (
-	"messageQ/mq/auth"
-	"messageQ/mq/broker"
-	"messageQ/mq/config"
-	"messageQ/mq/errx"
+	"github.com/SpectatorNan/messageQ/go/mq/auth"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/config"
+	"github.com/SpectatorNan/messageQ/go/mq/errx"
 	"net/http"
 
 	"github.com/gin-gonic/gin"

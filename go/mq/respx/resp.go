@@ -1,7 +1,7 @@
 package respx
 
 import (
-	"messageQ/mq/errx"
+	"github.com/SpectatorNan/messageQ/go/mq/errx"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
