@@ -102,15 +102,24 @@ type (
 		Requeued  bool   `json:"requeued"`
 	}
 	TerminateMessageRequest struct {
-		ID        string `uri:"id" binding:"required"`
-		Topic     string `uri:"topic" binding:"required"`
-		GroupName string `uri:"group" binding:"required"`
+		ID    string `uri:"id" binding:"required"`
+		Topic string `uri:"topic" binding:"required"`
 	}
 	TerminateResponse struct {
 		MessageID  string `json:"messageId"`
 		Terminated bool   `json:"terminated"`
 		Topic      string `json:"topic"`
 		State      string `json:"state"`
+	}
+	TerminateBatchRequest struct {
+		Topic      string   `uri:"topic" binding:"required"`
+		MessageIDs []string `json:"messageIds"`
+	}
+	TerminateBatchResponse struct {
+		MessageIDs      []string `json:"messageIds"`
+		TerminatedCount int      `json:"terminatedCount"`
+		Topic           string   `json:"topic"`
+		State           string   `json:"state"`
 	}
 	// ConsumeMessageResponse is the response for consuming a message
 	ConsumeMessageResponse struct {
@@ -317,13 +326,26 @@ func (r *TerminateMessageRequest) Validate() error {
 		logger.Warn("Invalid topic name", zap.String("topic", r.Topic))
 		return err
 	}
-	if err := validateGroupName(r.GroupName); err != nil {
-		logger.Warn("Invalid group name", zap.String("group", r.GroupName))
-		return err
-	}
 	if _, err := uuid.Parse(r.ID); err != nil {
 		logger.Warn("Invalid message ID format", zap.String("message_id", r.ID), zap.Error(err))
 		return errx.ErrInvalidID
+	}
+	return nil
+}
+
+func (r *TerminateBatchRequest) Validate() error {
+	if err := validateTopicName(r.Topic); err != nil {
+		logger.Warn("Invalid topic name", zap.String("topic", r.Topic))
+		return err
+	}
+	if len(r.MessageIDs) == 0 {
+		return errx.ErrInvalidMessage
+	}
+	for _, id := range r.MessageIDs {
+		if _, err := uuid.Parse(id); err != nil {
+			logger.Warn("Invalid message ID format", zap.String("message_id", id), zap.Error(err))
+			return errx.ErrInvalidID
+		}
 	}
 	return nil
 }

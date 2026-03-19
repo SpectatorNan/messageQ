@@ -615,7 +615,7 @@ func ListMessagesHandler(b *broker.Broker) gin.HandlerFunc {
 				cursor = *req.Cursor
 			}
 			if ds := b.GetDelayScheduler(); ds != nil {
-				items, next := b.ListScheduledVisible(req.GroupName, req.Topic, queueID, cursor, limit)
+				items, next := b.ListScheduledVisible(req.Topic, queueID, cursor, limit)
 				resp.State = "scheduled"
 				out := make([]MessageStatus, 0, len(items))
 				for _, item := range items {
@@ -745,7 +745,7 @@ func ListMessagesHandler(b *broker.Broker) gin.HandlerFunc {
 			}
 			resp.Messages = msgs
 		case "cancelled":
-			entries := b.ListCancelled(req.GroupName, req.Topic, limit)
+			entries := b.ListCancelled(req.Topic, limit)
 			if req.Tag != "" {
 				filtered := entries[:0]
 				for _, entry := range entries {
@@ -804,7 +804,7 @@ func TerminateHandler(b *broker.Broker) gin.HandlerFunc {
 			return
 		}
 
-		if !b.TerminateMessage(req.ID, req.GroupName, req.Topic) {
+		if !b.TerminateMessage(req.ID, req.Topic) {
 			respx.FailGin(c, errx.ErrInvalidMessage)
 			return
 		}
@@ -814,6 +814,33 @@ func TerminateHandler(b *broker.Broker) gin.HandlerFunc {
 			Terminated: true,
 			Topic:      req.Topic,
 			State:      "cancelled",
+		}
+		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
+	}
+}
+
+func TerminateBatchHandler(b *broker.Broker) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req TerminateBatchRequest
+		if err := c.ShouldBindUri(&req); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+		if err := req.Validate(); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+
+		terminatedCount := b.TerminateMessages(req.Topic, req.MessageIDs)
+		resp := TerminateBatchResponse{
+			MessageIDs:      req.MessageIDs,
+			TerminatedCount: terminatedCount,
+			Topic:           req.Topic,
+			State:           "cancelled",
 		}
 		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
 	}

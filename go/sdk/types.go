@@ -209,6 +209,15 @@ type (
 		Topic      string `json:"topic"`
 		State      string `json:"state"`
 	}
+	TerminateBatchRequest struct {
+		MessageIDs []string `json:"messageIds"`
+	}
+	TerminateBatchResponse struct {
+		MessageIDs      []string `json:"messageIds"`
+		TerminatedCount int      `json:"terminatedCount"`
+		Topic           string   `json:"topic"`
+		State           string   `json:"state"`
+	}
 )
 
 // Stats types

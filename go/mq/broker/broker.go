@@ -306,7 +306,7 @@ func (b *Broker) recoverCancelledRecords() {
 	b.lock.Lock()
 	defer b.lock.Unlock()
 	for _, rec := range records {
-		b.cancelled[cancelledKey(rec.Group, rec.Topic, rec.MsgID)] = cancelledEntry{
+		b.cancelled[cancelledKey(rec.Topic, rec.MsgID)] = cancelledEntry{
 			Group:         rec.Group,
 			Topic:         rec.Topic,
 			QueueID:       rec.QueueID,
@@ -336,8 +336,8 @@ func groupTopicKey(group, topic string) string {
 	return group + ":" + topic
 }
 
-func cancelledKey(group, topic, msgID string) string {
-	return group + ":" + topic + ":" + msgID
+func cancelledKey(topic, msgID string) string {
+	return topic + ":" + msgID
 }
 
 // getQueues ensures queues exist for a topic.
@@ -741,7 +741,7 @@ func (b *Broker) consumeVisibleFromTopic(group, logicalTopic, storageTopic strin
 
 		cursor = nextCursor
 		msg := msgs[0]
-		if b.IsCancelled(group, logicalTopic, msg.ID) {
+		if b.IsCancelled(logicalTopic, msg.ID) {
 			continue
 		}
 		out = append(out, msg)
@@ -1011,11 +1011,11 @@ func (b *Broker) ListCompleted(group, topic string, limit int) []completedEntry 
 	return entries
 }
 
-// IsCancelled reports whether a message has been terminated for a consumer group/topic.
-func (b *Broker) IsCancelled(group, topic, msgID string) bool {
+// IsCancelled reports whether a message has been terminated for a topic.
+func (b *Broker) IsCancelled(topic, msgID string) bool {
 	b.lock.Lock()
 	defer b.lock.Unlock()
-	_, ok := b.cancelled[cancelledKey(group, topic, msgID)]
+	_, ok := b.cancelled[cancelledKey(topic, msgID)]
 	return ok
 }
 
@@ -1056,58 +1056,71 @@ func (b *Broker) recordCancelled(entry cancelledEntry) {
 	if entry.CancelledAt.IsZero() {
 		entry.CancelledAt = now()
 	}
+	entry.Group = ""
 	b.lock.Lock()
-	b.cancelled[cancelledKey(entry.Group, entry.Topic, entry.MsgID)] = entry
+	b.cancelled[cancelledKey(entry.Topic, entry.MsgID)] = entry
 	b.clearRetryCount(entry.MsgID)
 	b.lock.Unlock()
 	b.persistCancelled(entry)
 }
 
-func (b *Broker) cancelProcessing(msgID, group, topic string) bool {
-	key := processingKey(group, topic, msgID)
+func (b *Broker) cancelProcessing(msgID, topic string) bool {
 	cancelledAt := now()
 
 	b.lock.Lock()
-	entry, ok := b.processing[key]
-	if !ok || entry.State != stateProcessing {
+	keys := make([]string, 0)
+	entries := make([]processingEntry, 0)
+	for key, entry := range b.processing {
+		if entry.Topic != topic || entry.MsgID != msgID || entry.State != stateProcessing {
+			continue
+		}
+		keys = append(keys, key)
+		entries = append(entries, entry)
+	}
+	if len(entries) == 0 {
 		b.lock.Unlock()
 		return false
 	}
-	delete(b.processing, key)
-	if gs := b.stats[group]; gs != nil {
-		gs.Processing--
-	}
-	consumedAt := entry.ConsumedAt
-	queueID := entry.QueueID
-	offset := entry.Offset
-	nextOffset := entry.NextOffset
+	first := entries[0]
+	consumedAt := first.ConsumedAt
+	queueID := first.QueueID
+	offset := first.Offset
+	nextOffset := first.NextOffset
 	cancelled := cancelledEntry{
-		Group:         entry.Group,
-		Topic:         entry.Topic,
+		Topic:         first.Topic,
 		QueueID:       &queueID,
 		Offset:        &offset,
 		NextOffset:    &nextOffset,
-		MsgID:         entry.MsgID,
-		Body:          entry.Body,
-		Tag:           entry.Tag,
-		CorrelationID: entry.CorrelationID,
-		Retry:         entry.Retry,
-		Timestamp:     entry.Timestamp,
+		MsgID:         first.MsgID,
+		Body:          first.Body,
+		Tag:           first.Tag,
+		CorrelationID: first.CorrelationID,
+		Retry:         first.Retry,
+		Timestamp:     first.Timestamp,
 		ConsumedAt:    &consumedAt,
 		CancelledAt:   cancelledAt,
 	}
-	b.cancelled[cancelledKey(group, topic, msgID)] = cancelled
+	for i, key := range keys {
+		entry := entries[i]
+		delete(b.processing, key)
+		if gs := b.stats[entry.Group]; gs != nil {
+			gs.Processing--
+		}
+	}
+	b.cancelled[cancelledKey(topic, msgID)] = cancelled
 	b.clearRetryCount(msgID)
 	b.lock.Unlock()
 
 	if ps, ok := b.store.(ProcessingStore); ok {
-		_ = ps.RemoveProcessing(entry.Group, entry.Topic, entry.QueueID, msgID)
+		for _, entry := range entries {
+			_ = ps.RemoveProcessing(entry.Group, entry.Topic, entry.QueueID, msgID)
+		}
 	}
 	b.persistCancelled(cancelled)
 	return true
 }
 
-func (b *Broker) findScheduledMessage(group, topic, msgID string) (cancelledEntry, bool) {
+func (b *Broker) findScheduledMessage(topic, msgID string) (cancelledEntry, bool) {
 	ds := b.GetDelayScheduler()
 	if ds == nil {
 		return cancelledEntry{}, false
@@ -1122,7 +1135,6 @@ func (b *Broker) findScheduledMessage(group, topic, msgID string) (cancelledEntr
 		queueID := dm.QueueID
 		scheduledAt := dm.ExecuteAt
 		return cancelledEntry{
-			Group:         group,
 			Topic:         topic,
 			QueueID:       &queueID,
 			MsgID:         dm.Message.ID,
@@ -1138,19 +1150,12 @@ func (b *Broker) findScheduledMessage(group, topic, msgID string) (cancelledEntr
 	return cancelledEntry{}, false
 }
 
-func (b *Broker) findPendingMessage(group, logicalTopic, storageTopic, msgID string) (cancelledEntry, bool) {
-	queueCount := b.topicQueueCount(storageTopic)
+func (b *Broker) findPendingMessage(topic, msgID string) (cancelledEntry, bool) {
+	queueCount := b.topicQueueCount(topic)
 	for queueID := 0; queueID < queueCount; queueID++ {
-		start, ok, err := b.GetOffset(group, storageTopic, queueID)
-		if err != nil {
-			continue
-		}
-		if !ok {
-			start = 0
-		}
-		cursor := start
+		cursor := int64(0)
 		for {
-			msgs, nextCursor, err := b.ReadFromConsumeQueueWithOffsets(storageTopic, queueID, cursor, 128, "")
+			msgs, nextCursor, err := b.ReadFromConsumeQueueWithOffsets(topic, queueID, cursor, 128, "")
 			if err != nil {
 				break
 			}
@@ -1165,8 +1170,7 @@ func (b *Broker) findPendingMessage(group, logicalTopic, storageTopic, msgID str
 				nextOffset := msg.Offset + 1
 				queueIDCopy := queueID
 				return cancelledEntry{
-					Group:         group,
-					Topic:         logicalTopic,
+					Topic:         topic,
 					QueueID:       &queueIDCopy,
 					Offset:        &offset,
 					NextOffset:    &nextOffset,
@@ -1185,15 +1189,15 @@ func (b *Broker) findPendingMessage(group, logicalTopic, storageTopic, msgID str
 	return cancelledEntry{}, false
 }
 
-// ListCancelled returns recent terminated entries for a group/topic.
-func (b *Broker) ListCancelled(group, topic string, limit int) []cancelledEntry {
+// ListCancelled returns recent terminated entries for a topic.
+func (b *Broker) ListCancelled(topic string, limit int) []cancelledEntry {
 	if limit <= 0 {
 		limit = 50
 	}
 	b.lock.Lock()
 	entries := make([]cancelledEntry, 0)
 	for _, entry := range b.cancelled {
-		if entry.Group == group && entry.Topic == topic {
+		if entry.Topic == topic {
 			entries = append(entries, entry)
 		}
 	}
@@ -1528,7 +1532,7 @@ func (b *Broker) ListPending(group, topic string, queueID int, cursor *int64, li
 		}
 		scanCursor = nextCursor
 		for _, msg := range msgs {
-			if b.IsCancelled(group, topic, msg.ID) {
+			if b.IsCancelled(topic, msg.ID) {
 				continue
 			}
 			out = append(out, msg)
@@ -1541,7 +1545,7 @@ func (b *Broker) ListPending(group, topic string, queueID int, cursor *int64, li
 }
 
 // ListScheduledVisible returns scheduled delayed messages after filtering cancelled ones.
-func (b *Broker) ListScheduledVisible(group, topic string, queueID *int, cursor int64, limit int) ([]DelayedMessage, *int64) {
+func (b *Broker) ListScheduledVisible(topic string, queueID *int, cursor int64, limit int) ([]DelayedMessage, *int64) {
 	ds := b.GetDelayScheduler()
 	if ds == nil {
 		return nil, nil
@@ -1562,7 +1566,7 @@ func (b *Broker) ListScheduledVisible(group, topic string, queueID *int, cursor 
 			return out, next
 		}
 		for _, item := range items {
-			if b.IsCancelled(group, topic, item.Message.ID) {
+			if b.IsCancelled(topic, item.Message.ID) {
 				continue
 			}
 			out = append(out, item)
@@ -1611,33 +1615,39 @@ func (b *Broker) ValidateProcessing(msgID, group, topic string) bool {
 	return true
 }
 
-// TerminateMessage marks a message cancelled for a consumer group/topic.
+// TerminateMessage marks a message cancelled for a topic.
 // It is intentionally idempotent: unknown or already-terminated messages still succeed.
-func (b *Broker) TerminateMessage(msgID, group, topic string) bool {
-	if group == "" || topic == "" || msgID == "" {
+func (b *Broker) TerminateMessage(msgID, topic string) bool {
+	if topic == "" || msgID == "" {
 		return false
 	}
-	if b.IsCancelled(group, topic, msgID) {
+	if b.IsCancelled(topic, msgID) {
 		return true
 	}
-	if b.cancelProcessing(msgID, group, topic) {
+	if b.cancelProcessing(msgID, topic) {
 		return true
 	}
-	if entry, ok := b.findScheduledMessage(group, topic, msgID); ok {
+	if entry, ok := b.findScheduledMessage(topic, msgID); ok {
 		b.recordCancelled(entry)
 		return true
 	}
-	if entry, ok := b.findPendingMessage(group, topic, topic, msgID); ok {
+	if entry, ok := b.findPendingMessage(topic, msgID); ok {
 		b.recordCancelled(entry)
 		return true
-	}
-	if retryTopic, ok := b.getRetryTopicIfExists(group, topic); ok {
-		if entry, ok := b.findPendingMessage(group, topic, retryTopic, msgID); ok {
-			b.recordCancelled(entry)
-			return true
-		}
 	}
 	return true
+}
+
+// TerminateMessages marks multiple messages cancelled for a topic.
+// Unknown or already-terminated message IDs are treated as successful.
+func (b *Broker) TerminateMessages(topic string, msgIDs []string) int {
+	terminated := 0
+	for _, msgID := range msgIDs {
+		if b.TerminateMessage(msgID, topic) {
+			terminated++
+		}
+	}
+	return terminated
 }
 
 // DeleteTopic deletes a topic

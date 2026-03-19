@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// CancelledRecord persists message termination state for a consumer group.
+// CancelledRecord persists message termination state for a topic/message.
 type CancelledRecord struct {
 	Group         string     `json:"group"`
 	Topic         string     `json:"topic"`
@@ -29,10 +29,10 @@ type CancelledRecord struct {
 
 // SaveCancelled persists a cancelled record.
 func (w *WALStorage) SaveCancelled(rec CancelledRecord) error {
-	if rec.Group == "" || rec.Topic == "" || rec.MsgID == "" {
+	if rec.Topic == "" || rec.MsgID == "" {
 		return fmt.Errorf("invalid cancelled record")
 	}
-	dir := filepath.Join(w.baseDir, "cancelled", rec.Group, rec.Topic)
+	dir := filepath.Join(w.baseDir, "cancelled", rec.Topic)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}

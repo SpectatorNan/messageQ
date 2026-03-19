@@ -247,15 +247,15 @@ curl -X POST http://localhost:8080/topics/orders/messages/019c2291-8fbd-7c0a-8e0
 
 ### 5.1 终止消息（Terminate）
 
-**POST** `/api/v1/consumers/:group/topics/:topic/messages/:id/terminate`
+**POST** `/api/v1/topics/:topic/messages/:id/terminate`
 
 **参数校验：**
 - `id`: 必须是有效的 UUID 格式
-- `group`: 必填，符合消费者组命名规则
 - `topic`: 必填，符合 Topic 命名规则
 
 **行为说明：**
 - 终止成功后，消息状态记为 `cancelled`
+- 终止是 **topic 级全局取消**：不区分消费组，同一条消息对所有消费组都不可再执行
 - 终止操作幂等：重复终止同一消息、或消息不存在时，都会返回成功
 - `cancelled` 消息会在消费路径、pending/scheduled 列表中被过滤，确保不可再消费
 
@@ -276,12 +276,67 @@ curl -X POST http://localhost:8080/topics/orders/messages/019c2291-8fbd-7c0a-8e0
 **示例：**
 ```bash
 curl -X POST \
-  http://localhost:8080/api/v1/consumers/consumer-g1/topics/orders/messages/019c2291-8fbd-7c0a-8e0a-3b262bf11e96/terminate
+  http://localhost:8080/api/v1/topics/orders/messages/019c2291-8fbd-7c0a-8e0a-3b262bf11e96/terminate
 ```
 
 ---
 
-### 5.2 查询消息状态
+### 5.2 批量终止消息
+
+**POST** `/api/v1/topics/:topic/terminate/batch`
+
+**请求体：**
+```json
+{
+  "messageIds": [
+    "019c2291-8fbd-7c0a-8e0a-3b262bf11e96",
+    "019c2291-8fbd-7c0a-8e0a-3b262bf11e97"
+  ]
+}
+```
+
+**参数校验：**
+- `topic`: 必填，符合 Topic 命名规则
+- `messageIds`: 必填且不能为空
+- `messageIds` 中每个元素都必须是有效 UUID
+
+**行为说明：**
+- 批量终止同样是 **topic 级全局取消**
+- 每个 messageId 都按单条 terminate 的幂等规则处理
+
+**响应：**
+```json
+{
+  "code": "ok",
+  "message": "success",
+  "data": {
+    "messageIds": [
+      "019c2291-8fbd-7c0a-8e0a-3b262bf11e96",
+      "019c2291-8fbd-7c0a-8e0a-3b262bf11e97"
+    ],
+    "terminatedCount": 2,
+    "topic": "orders",
+    "state": "cancelled"
+  }
+}
+```
+
+**示例：**
+```bash
+curl -X POST \
+  http://localhost:8080/api/v1/topics/orders/terminate/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "messageIds": [
+      "019c2291-8fbd-7c0a-8e0a-3b262bf11e96",
+      "019c2291-8fbd-7c0a-8e0a-3b262bf11e97"
+    ]
+  }'
+```
+
+---
+
+### 5.3 查询消息状态
 
 **GET** `/api/v1/consumers/:group/topics/:topic/messages/status?state=:state&queueId=:queueId&tag=:tag`
 
@@ -294,7 +349,8 @@ curl -X POST \
 
 **说明：**
 - `pending` / `scheduled` / `processing` / `completed` / `cancelled` 响应里的消息对象都会返回 `correlationId`
-- 查询 `cancelled` 可看到已终止消息；被终止消息不会出现在 `pending`、`scheduled` 以及实际消费结果中
+- 查询 `cancelled` 可看到 topic 上已终止消息；该视图不区分消费组，同一 topic 的任意 group 查询结果一致
+- 被终止消息不会出现在 `pending`、`scheduled` 以及实际消费结果中
 
 **`cancelled` 响应示例：**
 ```json

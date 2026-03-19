@@ -453,7 +453,8 @@ func (suite *APITestSuite) TestListMessages() {
 
 func (suite *APITestSuite) TestTerminateMessage() {
 	topic := suite.newTopic("terminate-topic", broker.TopicTypeNormal)
-	group := suite.newGroup("terminate-group")
+	groupA := suite.newGroup("terminate-group-a")
+	groupB := suite.newGroup("terminate-group-b")
 	tag := "terminate-tag"
 	cancelledCorrelationID := "cancelled-cid-" + uuid.NewString()
 
@@ -462,26 +463,26 @@ func (suite *APITestSuite) TestTerminateMessage() {
 	suite.Nil(errResp)
 	suite.NotNil(produceResp)
 
-	terminateResp, errResp, err := suite.api.TerminateMessage(topic, group, produceResp.Data.ID)
+	terminateResp, errResp, err := suite.api.TerminateMessage(topic, groupA, produceResp.Data.ID)
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(terminateResp)
 	suite.True(terminateResp.Data.Terminated)
 	suite.Equal("cancelled", terminateResp.Data.State)
 
-	terminateResp, errResp, err = suite.api.TerminateMessage(topic, group, produceResp.Data.ID)
+	terminateResp, errResp, err = suite.api.TerminateMessage(topic, groupA, produceResp.Data.ID)
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(terminateResp)
 	suite.True(terminateResp.Data.Terminated)
 
-	terminateResp, errResp, err = suite.api.TerminateMessage(topic, group, uuid.NewString())
+	terminateResp, errResp, err = suite.api.TerminateMessage(topic, groupA, uuid.NewString())
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(terminateResp)
 	suite.True(terminateResp.Data.Terminated)
 
-	cancelledResp, errResp, err := suite.api.ListMessages(topic, group, "cancelled", client.WithListLimit(10))
+	cancelledResp, errResp, err := suite.api.ListMessages(topic, groupB, "cancelled", client.WithListLimit(10))
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(cancelledResp)
@@ -496,7 +497,7 @@ func (suite *APITestSuite) TestTerminateMessage() {
 	}
 	suite.True(foundCancelled)
 
-	pendingResp, errResp, err := suite.api.ListMessages(topic, group, "pending", client.WithListQueueId(0), client.WithListLimit(10))
+	pendingResp, errResp, err := suite.api.ListMessages(topic, groupA, "pending", client.WithListQueueId(0), client.WithListLimit(10))
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(pendingResp)
@@ -504,7 +505,13 @@ func (suite *APITestSuite) TestTerminateMessage() {
 		suite.NotEqual(produceResp.Data.ID, msg.ID)
 	}
 
-	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, group, tag, client.WithQueueId(0))
+	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, groupA, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+
+	consumeResp, errResp, err = suite.api.ConsumeMessages(topic, groupB, tag, client.WithQueueId(0))
 	suite.NoError(err)
 	suite.Nil(consumeResp)
 	suite.NotNil(errResp)
@@ -516,9 +523,63 @@ func (suite *APITestSuite) TestTerminateMessage() {
 	suite.Nil(errResp)
 	suite.NotNil(activeProduceResp)
 
-	activeConsumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	activeConsumeResp := suite.consumeUntil(topic, groupB, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
 	suite.Equal(activeProduceResp.Data.ID, activeConsumeResp.Data.Message.ID)
 	suite.Equal(activeCorrelationID, activeConsumeResp.Data.Message.CorrelationID)
+}
+
+func (suite *APITestSuite) TestTerminateBatchMessages() {
+	topic := suite.newTopic("terminate-batch-topic", broker.TopicTypeNormal)
+	groupA := suite.newGroup("terminate-batch-group-a")
+	groupB := suite.newGroup("terminate-batch-group-b")
+	tag := "terminate-batch-tag"
+
+	firstCorrelationID := "batch-cid-" + uuid.NewString()
+	secondCorrelationID := "batch-cid-" + uuid.NewString()
+
+	firstResp, errResp, err := suite.api.ProduceMessage(topic, tag, "cancel-batch-1", client.WithCorrelationID(firstCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(firstResp)
+
+	secondResp, errResp, err := suite.api.ProduceMessage(topic, tag, "cancel-batch-2", client.WithCorrelationID(secondCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(secondResp)
+
+	terminateResp, errResp, err := suite.api.TerminateBatchMessages(topic, []string{firstResp.Data.ID, secondResp.Data.ID})
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(terminateResp)
+	suite.Equal(2, terminateResp.Data.TerminatedCount)
+	suite.ElementsMatch([]string{firstResp.Data.ID, secondResp.Data.ID}, terminateResp.Data.MessageIDs)
+	suite.Equal("cancelled", terminateResp.Data.State)
+
+	cancelledResp, errResp, err := suite.api.ListMessages(topic, groupA, "cancelled", client.WithListLimit(10))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(cancelledResp)
+
+	found := map[string]string{}
+	for _, msg := range cancelledResp.Data.Messages {
+		if msg.ID == firstResp.Data.ID || msg.ID == secondResp.Data.ID {
+			found[msg.ID] = msg.CorrelationID
+		}
+	}
+	suite.Equal(firstCorrelationID, found[firstResp.Data.ID])
+	suite.Equal(secondCorrelationID, found[secondResp.Data.ID])
+
+	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, groupA, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+
+	consumeResp, errResp, err = suite.api.ConsumeMessages(topic, groupB, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
 }
 
 func (suite *APITestSuite) TestGetFullStats() {

@@ -454,3 +454,18 @@ func (h *API) TerminateMessage(topic string, group string, id string) (*Resp[Ter
 	}
 	return result, errResp, nil
 }
+
+func (h *API) TerminateBatchMessages(topic string, ids []string) (*Resp[TerminateBatchResponse], *ErrResp, error) {
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var result *Resp[TerminateBatchResponse]
+	reqBody := TerminateBatchRequest{MessageIDs: ids}
+	errResp, err := h.Post(r.SetBody(reqBody).SetResult(&result), h.endpoint.TerminateBatchMessages(topic))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
