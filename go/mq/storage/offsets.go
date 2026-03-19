@@ -12,6 +12,10 @@ func (w *WALStorage) CommitOffset(group, topic string, queueID int, offset int64
 	if group == "" || topic == "" {
 		return fmt.Errorf("invalid group or topic")
 	}
+	base := w.ConsumeQueueBaseOffset(topic, queueID)
+	if offset < base {
+		offset = base
+	}
 	dir := filepath.Join(w.baseDir, "offsets", group, topic)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -40,6 +44,7 @@ func (w *WALStorage) GetOffset(group, topic string, queueID int) (int64, bool, e
 	if group == "" || topic == "" {
 		return 0, false, fmt.Errorf("invalid group or topic")
 	}
+	base := w.ConsumeQueueBaseOffset(topic, queueID)
 	path := filepath.Join(w.baseDir, "offsets", group, topic, fmt.Sprintf("%d.offset", queueID))
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -52,5 +57,8 @@ func (w *WALStorage) GetOffset(group, topic string, queueID int) (int64, bool, e
 		return 0, false, fmt.Errorf("invalid offset file")
 	}
 	offset := int64(binary.BigEndian.Uint64(b[:8]))
+	if offset < base {
+		offset = base
+	}
 	return offset, true, nil
 }

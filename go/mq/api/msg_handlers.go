@@ -1087,12 +1087,16 @@ func CommitOffsetHandler(b *broker.Broker) gin.HandlerFunc {
 			respx.FailGin(c, errx.ErrOffsetUnsupported)
 			return
 		}
+		committedOffset, ok, err := b.GetOffset(req.GroupName, req.Topic, req.QueueID)
+		if err != nil || !ok {
+			committedOffset = req.Offset
+		}
 
 		resp := CommitOffsetResponse{
 			Group:     req.GroupName,
 			Topic:     req.Topic,
 			QueueID:   req.QueueID,
-			Offset:    req.Offset,
+			Offset:    committedOffset,
 			Committed: true,
 		}
 

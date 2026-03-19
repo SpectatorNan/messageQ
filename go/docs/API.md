@@ -356,7 +356,7 @@ curl -X POST \
 **说明：**
 - `pending` / `scheduled` / `processing` / `completed` / `cancelled` / `expired` 响应里的消息对象都会返回 `correlationId`
 - 查询 `cancelled` 可看到 topic 上已终止消息；该视图不区分消费组，同一 topic 的任意 group 查询结果一致
-- 查询 `expired` 可看到超过保留窗口后被系统自动终止的消息
+- 查询 `expired` 可看到超过保留窗口后被系统自动终止的消息；这些消息也可能在后台 retention sweep 删除旧 segment 前被补记为 `expired`
 - 被终止或过期的消息不会出现在 `pending`、`scheduled` 以及实际消费结果中
 
 **`cancelled` 响应示例：**
@@ -560,6 +560,8 @@ curl -X DELETE http://localhost:8080/topics/orders
 
 如果没有 offset 记录，说明该 group 还未初始化到该 queue；首次消费普通 topic 时会自动从 `latest` 初始化并写入 offset。
 
+当后台 retention sweep 已经裁掉 queue 头部时，返回的 offset 会自动 rebased 到当前仍可读取的最早逻辑 offset，不会落回已经过期删除的 head。
+
 **示例：**
 ```bash
 curl "http://localhost:8080/topics/orders/offsets/consumer-g1?queue_id=0"
@@ -609,6 +611,8 @@ curl -X POST http://localhost:8080/topics/orders/offsets/consumer-g1 \
     "offset": 100
   }'
 ```
+
+如果提交的 offset 小于当前 queue 的保留起点，服务端会自动将其提升到当前最早可读 offset；响应里的 `offset` 字段返回的是实际提交后的值。
 
 ---
 

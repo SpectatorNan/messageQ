@@ -216,6 +216,10 @@ func NewBrokerWithPersistence(store storage.Storage, queueCount int, dataDir str
 	} else {
 		b.akStore = akStore
 	}
+	if rs, ok := b.store.(SegmentRetentionStore); ok {
+		rs.SetPruneObserver(b.onPrunedMessage)
+	}
+	b.applyRetentionSettings(b.messageRetention, b.messageExpiryFactor)
 
 	// 初始化已有 topics 的 queues，确保 reclaimLoop 运行
 	b.initializeExistingTopics()
@@ -633,6 +637,17 @@ type ConsumeQueueDepthStore interface {
 	ConsumeQueueDepth(topic string, queueID int) int64
 }
 
+// ConsumeQueueBaseOffsetStore reports the current logical base offset for a topic/queue.
+type ConsumeQueueBaseOffsetStore interface {
+	ConsumeQueueBaseOffset(topic string, queueID int) int64
+}
+
+// SegmentRetentionStore configures sealed-segment retention pruning in storage.
+type SegmentRetentionStore interface {
+	SetRetentionWindow(d time.Duration)
+	SetPruneObserver(observer func(topic string, queueID int, msg storage.Message) error)
+}
+
 var ErrOffsetUnsupported = errors.New("offset store not supported")
 var ErrSubscriptionConflict = errors.New("subscription conflict")
 
@@ -686,6 +701,14 @@ func (b *Broker) ConsumeQueueDepth(topic string, queueID int) int64 {
 	return 0
 }
 
+// ConsumeQueueBaseOffset returns the current logical base offset for a topic/queue.
+func (b *Broker) ConsumeQueueBaseOffset(topic string, queueID int) int64 {
+	if r, ok := b.store.(ConsumeQueueBaseOffsetStore); ok {
+		return r.ConsumeQueueBaseOffset(topic, queueID)
+	}
+	return 0
+}
+
 // GetRetryTopicName returns the retry topic name for a group and topic.
 // Example: "orders" + "g1" -> "orders.retry.g1"
 func GetRetryTopicName(group, topic string) string {
@@ -696,9 +719,18 @@ func isRetryTopicName(group, topic string) bool {
 	return strings.HasSuffix(topic, ".retry."+group)
 }
 
+func splitRetryTopicName(topic string) (string, string, bool) {
+	const marker = ".retry."
+	idx := strings.LastIndex(topic, marker)
+	if idx <= 0 || idx+len(marker) >= len(topic) {
+		return "", "", false
+	}
+	return topic[:idx], topic[idx+len(marker):], true
+}
+
 func (b *Broker) resolveInitialOffset(group, topic string, queueID int) (int64, error) {
 	if strings.EqualFold(b.newGroupStartPosition, "earliest") || isRetryTopicName(group, topic) {
-		return 0, nil
+		return b.ConsumeQueueBaseOffset(topic, queueID), nil
 	}
 	offset := b.ConsumeQueueDepth(topic, queueID)
 	if err := b.CommitOffset(group, topic, queueID, offset); err != nil {
@@ -1457,6 +1489,48 @@ func (b *Broker) ListExpired(topic string, limit int) []cancelledEntry {
 	return b.listTerminalByState(topic, string(stateExpired), limit)
 }
 
+func (b *Broker) logicalTopicForStorageTopic(topic string) string {
+	if topic == SystemDelayTopic {
+		return topic
+	}
+	if logicalTopic, _, ok := splitRetryTopicName(topic); ok {
+		return logicalTopic
+	}
+	return topic
+}
+
+func (b *Broker) onPrunedMessage(storageTopic string, queueID int, msg storage.Message) error {
+	if storageTopic == SystemDelayTopic {
+		return nil
+	}
+	logicalTopic := b.logicalTopicForStorageTopic(storageTopic)
+	if b.IsTerminal(logicalTopic, msg.ID) {
+		return nil
+	}
+	queueIDCopy := queueID
+	b.recordExpired(cancelledEntry{
+		Topic:         logicalTopic,
+		QueueID:       &queueIDCopy,
+		MsgID:         msg.ID,
+		Body:          msg.Body,
+		Tag:           msg.Tag,
+		CorrelationID: msg.CorrelationID,
+		Retry:         msg.Retry,
+		Timestamp:     msg.Timestamp,
+		CancelledAt:   now(),
+	})
+	return nil
+}
+
+func (b *Broker) applyRetentionSettings(retention time.Duration, factor int) {
+	if retention <= 0 || factor <= 0 {
+		return
+	}
+	if rs, ok := b.store.(SegmentRetentionStore); ok {
+		rs.SetRetentionWindow(time.Duration(factor) * retention)
+	}
+}
+
 // PeekQueueCount returns the number of queues for a topic if already initialized.
 // It does not create queues.
 func (b *Broker) PeekQueueCount(topic string) (int, bool) {
@@ -2069,19 +2143,25 @@ func (b *Broker) SetRetryBackoff(base time.Duration, multiplier float64, max tim
 // SetMessageRetention sets the retention window used by terminal-expiry checks.
 func (b *Broker) SetMessageRetention(retention time.Duration) {
 	b.lock.Lock()
-	defer b.lock.Unlock()
 	if retention > 0 {
 		b.messageRetention = retention
 	}
+	currentRetention := b.messageRetention
+	currentFactor := b.messageExpiryFactor
+	b.lock.Unlock()
+	b.applyRetentionSettings(currentRetention, currentFactor)
 }
 
 // SetMessageExpiryFactor sets the multiplier applied to retention before auto-expiring a message.
 func (b *Broker) SetMessageExpiryFactor(factor int) {
 	b.lock.Lock()
-	defer b.lock.Unlock()
 	if factor > 0 {
 		b.messageExpiryFactor = factor
 	}
+	currentRetention := b.messageRetention
+	currentFactor := b.messageExpiryFactor
+	b.lock.Unlock()
+	b.applyRetentionSettings(currentRetention, currentFactor)
 }
 
 // SetNewGroupStartPosition sets the initial offset policy for groups without committed offsets.
