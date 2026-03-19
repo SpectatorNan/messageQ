@@ -230,6 +230,11 @@ func WithScheduledAtUnix(unixSec int64) ProduceDelayOption {
 		r.ScheduledAt = &v
 	}
 }
+func WithCorrelationID(correlationID string) ProduceDelayOption {
+	return func(r *ProduceMessageRequest) {
+		r.CorrelationID = correlationID
+	}
+}
 
 func (h *API) ProduceMessage(topic string, tag string, body string, options ...ProduceDelayOption) (*Resp[ProduceMessageResponse], *ErrResp, error) {
 
@@ -271,6 +276,11 @@ func WithBatchScheduledAtUnix(unixSec int64) ProduceBatchOption {
 	return func(m *ProduceBatchMessage) {
 		v := FlexibleUnix(unixSec)
 		m.ScheduledAt = &v
+	}
+}
+func WithBatchCorrelationID(correlationID string) ProduceBatchOption {
+	return func(m *ProduceBatchMessage) {
+		m.CorrelationID = correlationID
 	}
 }
 
@@ -424,6 +434,21 @@ func (h *API) NackMessage(topic string, group string, id string) (*Resp[NackMess
 
 	var result *Resp[NackMessageResponse]
 	errResp, err := h.Post(r.SetResult(&result), h.endpoint.NackMessage(topic, group, id))
+	if err != nil {
+		return nil, nil, err
+	}
+	return result, errResp, nil
+}
+
+func (h *API) TerminateMessage(topic string, group string, id string) (*Resp[TerminateMessageResponse], *ErrResp, error) {
+
+	r, err := h.authRequest()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var result *Resp[TerminateMessageResponse]
+	errResp, err := h.Post(r.SetResult(&result), h.endpoint.TerminateMessage(topic, group, id))
 	if err != nil {
 		return nil, nil, err
 	}

@@ -33,13 +33,15 @@
 ```json
 {
   "body": "message content",
-  "tag": "message-tag"
+  "tag": "message-tag",
+  "correlationId": "order-1001"
 }
 ```
 
 **参数校验：**
 - `body`: 必填，不能为空字符串
 - `tag`: 必填
+- `correlationId`: 可选，UTF-8 字节数不能超过 128
 - `topic`: 不能包含空格、制表符、换行符、`/`、`\`，长度不超过255
 
 **响应：**
@@ -51,6 +53,7 @@
     "id": "019c2291-8fbd-7c0a-8e0a-3b262bf11e96",
     "topic": "orders",
     "tag": "electronics",
+    "correlationId": "order-1001",
     "body": "Order #1001: iPhone 15 Pro",
     "timestamp": "2026-02-03T16:14:50.123Z",
     "retry": 0
@@ -64,7 +67,8 @@ curl -X POST http://localhost:8080/topics/orders/messages \
   -H "Content-Type: application/json" \
   -d '{
     "body": "Order #1001: iPhone 15 Pro",
-    "tag": "electronics"
+    "tag": "electronics",
+    "correlationId": "order-1001"
   }'
 ```
 
@@ -72,22 +76,24 @@ curl -X POST http://localhost:8080/topics/orders/messages \
 
 ### 2. 发送延迟消息
 
-**POST** `/topics/:topic/messages/delay`
+**POST** `/topics/:topic/messages`
 
 **请求体：**
 ```json
 {
   "body": "message content",
   "tag": "message-tag",
-  "delay_sec": 10,     // 延迟秒数（二选一）
-  "delay_ms": 10000    // 延迟毫秒数（二选一）
+  "correlationId": "order-1001-delay",
+  "delaySec": 10,     // 延迟秒数（二选一）
+  "delayMs": 10000    // 延迟毫秒数（二选一）
 }
 ```
 
 **参数校验：**
 - `body`: 必填，不能为空字符串
 - `tag`: 必填
-- `delay_sec` 或 `delay_ms`: 必须指定一个，不能同时指定
+- `correlationId`: 可选，UTF-8 字节数不能超过 128
+- `delaySec` 或 `delayMs`: 必须指定一个，不能同时指定
 - 延迟时间范围：0 ~ 30天
 - `topic`: 同上
 
@@ -100,10 +106,11 @@ curl -X POST http://localhost:8080/topics/orders/messages \
     "id": "019c2291-8fbd-7c0a-8e0a-3b262bf11e96",
     "topic": "orders",
     "tag": "electronics",
-    "scheduled_at": "2026-02-03T16:14:50.123Z",
-    "execute_at": "2026-02-03T16:15:00.123Z",
-    "delay_seconds": 10.0,
-    "delay_ms": 10000
+    "correlationId": "order-1001-delay",
+    "scheduledAt": "2026-02-03T16:14:50.123Z",
+    "executeAt": "2026-02-03T16:15:00.123Z",
+    "delaySeconds": 10.0,
+    "delayMs": 10000
   }
 }
 ```
@@ -116,7 +123,8 @@ curl -X POST http://localhost:8080/topics/notifications/messages/delay \
   -d '{
     "body": "Welcome email",
     "tag": "email",
-    "delay_sec": 10
+    "correlationId": "welcome-email-1",
+    "delaySec": 10
   }'
 
 # 延迟5分钟
@@ -125,7 +133,8 @@ curl -X POST http://localhost:8080/topics/notifications/messages/delay \
   -d '{
     "body": "Password reset link",
     "tag": "security",
-    "delay_ms": 300000
+    "correlationId": "password-reset-1",
+    "delayMs": 300000
   }'
 ```
 
@@ -155,6 +164,7 @@ curl -X POST http://localhost:8080/topics/notifications/messages/delay \
       "id": "019c2291-8fbd-7c0a-8e0a-3b262bf11e96",
       "body": "Order #1001",
       "tag": "electronics",
+      "correlationId": "order-1001",
       "timestamp": "2026-02-03T16:14:50.123Z",
       "retry": 0
     },
@@ -231,6 +241,81 @@ curl -X POST http://localhost:8080/topics/orders/messages/019c2291-8fbd-7c0a-8e0
 **示例：**
 ```bash
 curl -X POST http://localhost:8080/topics/orders/messages/019c2291-8fbd-7c0a-8e0a-3b262bf11e96/nack
+```
+
+---
+
+### 5.1 终止消息（Terminate）
+
+**POST** `/api/v1/consumers/:group/topics/:topic/messages/:id/terminate`
+
+**参数校验：**
+- `id`: 必须是有效的 UUID 格式
+- `group`: 必填，符合消费者组命名规则
+- `topic`: 必填，符合 Topic 命名规则
+
+**行为说明：**
+- 终止成功后，消息状态记为 `cancelled`
+- 终止操作幂等：重复终止同一消息、或消息不存在时，都会返回成功
+- `cancelled` 消息会在消费路径、pending/scheduled 列表中被过滤，确保不可再消费
+
+**响应：**
+```json
+{
+  "code": "ok",
+  "message": "success",
+  "data": {
+    "messageId": "019c2291-8fbd-7c0a-8e0a-3b262bf11e96",
+    "terminated": true,
+    "topic": "orders",
+    "state": "cancelled"
+  }
+}
+```
+
+**示例：**
+```bash
+curl -X POST \
+  http://localhost:8080/api/v1/consumers/consumer-g1/topics/orders/messages/019c2291-8fbd-7c0a-8e0a-3b262bf11e96/terminate
+```
+
+---
+
+### 5.2 查询消息状态
+
+**GET** `/api/v1/consumers/:group/topics/:topic/messages/status?state=:state&queueId=:queueId&tag=:tag`
+
+**支持状态：**
+- `pending`
+- `scheduled`
+- `processing`
+- `completed`
+- `cancelled`
+
+**说明：**
+- `pending` / `scheduled` / `processing` / `completed` / `cancelled` 响应里的消息对象都会返回 `correlationId`
+- 查询 `cancelled` 可看到已终止消息；被终止消息不会出现在 `pending`、`scheduled` 以及实际消费结果中
+
+**`cancelled` 响应示例：**
+```json
+{
+  "code": "ok",
+  "message": "success",
+  "data": {
+    "group": "consumer-g1",
+    "topic": "orders",
+    "state": "cancelled",
+    "messages": [
+      {
+        "id": "019c2291-8fbd-7c0a-8e0a-3b262bf11e96",
+        "body": "Order #1001",
+        "tag": "electronics",
+        "correlationId": "order-1001",
+        "timestamp": "2026-02-03T16:14:50.123Z"
+      }
+    ]
+  }
+}
 ```
 
 ---

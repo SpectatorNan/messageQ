@@ -60,10 +60,12 @@ const (
 	cqEntrySize   = 20
 )
 
-// buildRecordBytes returns record bytes: [totalSize][crc][id(16)][retry][ts][tagLen][tag][bodyLen][body]
+// buildRecordBytes returns record bytes:
+// [totalSize][crc][id(16)][retry][ts][tagLen][tag][bodyLen][body][correlationIdLen][correlationId]
 func buildRecordBytes(msg Message) ([]byte, int64, error) {
 	body := []byte(msg.Body)
 	tag := []byte(msg.Tag)
+	correlationID := []byte(msg.CorrelationID)
 	ts := msg.Timestamp
 	if ts.IsZero() {
 		ts = time.Now()
@@ -80,7 +82,10 @@ func buildRecordBytes(msg Message) ([]byte, int64, error) {
 	if len(tag) > 0xFFFF {
 		return nil, 0, fmt.Errorf("tag too long")
 	}
-	totalSize := uint32(4 + 16 + 2 + 8 + 2 + len(tag) + 4 + len(body))
+	if len(correlationID) > 0xFFFF {
+		return nil, 0, fmt.Errorf("correlation id too long")
+	}
+	totalSize := uint32(4 + 16 + 2 + 8 + 2 + len(tag) + 4 + len(body) + 2 + len(correlationID))
 	buf := make([]byte, 4+totalSize)
 	binary.BigEndian.PutUint32(buf[0:4], totalSize)
 	off := 4
@@ -99,6 +104,10 @@ func buildRecordBytes(msg Message) ([]byte, int64, error) {
 	binary.BigEndian.PutUint32(buf[off:off+4], uint32(len(body)))
 	off += 4
 	copy(buf[off:], body)
+	off += len(body)
+	binary.BigEndian.PutUint16(buf[off:off+2], uint16(len(correlationID)))
+	off += 2
+	copy(buf[off:], correlationID)
 	return buf, int64(len(buf)), nil
 }
 
@@ -134,7 +143,20 @@ func readRecordPayload(payload []byte) (Message, error) {
 	if bodyLen > 0 && crc32.ChecksumIEEE(body) != crc {
 		return Message{ID: msgID, Retry: retry, Tag: tag, Timestamp: time.Unix(0, ts)}, errBadCRC
 	}
+	off += bodyLen
 	msg := Message{ID: msgID, Retry: retry, Tag: tag, Timestamp: time.Unix(0, ts), Body: string(body)}
+	if off == len(payload) {
+		return msg, nil
+	}
+	if off+2 > len(payload) {
+		return msg, errCorruptRecord
+	}
+	correlationIDLen := int(binary.BigEndian.Uint16(payload[off : off+2]))
+	off += 2
+	if off+correlationIDLen > len(payload) {
+		return msg, errCorruptRecord
+	}
+	msg.CorrelationID = string(payload[off : off+correlationIDLen])
 	return msg, nil
 }
 

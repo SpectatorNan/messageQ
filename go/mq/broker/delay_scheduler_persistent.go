@@ -152,14 +152,15 @@ func (ds *PersistentDelayScheduler) Stats() map[string]interface{} {
 
 // persistedDelayMessage is the JSON-serializable version
 type persistedDelayMessage struct {
-	MessageID string    `json:"message_id"`
-	Body      string    `json:"body"`
-	Tag       string    `json:"tag"`
-	Retry     int       `json:"retry"`
-	Timestamp int64     `json:"timestamp"`
-	Topic     string    `json:"topic"`
-	QueueID   int       `json:"queue_id"`
-	ExecuteAt int64     `json:"execute_at"`
+	MessageID     string `json:"message_id"`
+	Body          string `json:"body"`
+	Tag           string `json:"tag"`
+	CorrelationID string `json:"correlation_id,omitempty"`
+	Retry         int    `json:"retry"`
+	Timestamp     int64  `json:"timestamp"`
+	Topic         string `json:"topic"`
+	QueueID       int    `json:"queue_id"`
+	ExecuteAt     int64  `json:"execute_at"`
 }
 
 // persist saves the delay queue to disk
@@ -168,14 +169,15 @@ func (ds *PersistentDelayScheduler) persist() error {
 
 	for _, dm := range ds.delayQueue {
 		messages = append(messages, persistedDelayMessage{
-			MessageID: dm.Message.ID,
-			Body:      dm.Message.Body,
-			Tag:       dm.Message.Tag,
-			Retry:     dm.Message.Retry,
-			Timestamp: dm.Message.Timestamp.Unix(),
-			Topic:     dm.Topic,
-			QueueID:   dm.QueueID,
-			ExecuteAt: dm.ExecuteAt.Unix(),
+			MessageID:     dm.Message.ID,
+			Body:          dm.Message.Body,
+			Tag:           dm.Message.Tag,
+			CorrelationID: dm.Message.CorrelationID,
+			Retry:         dm.Message.Retry,
+			Timestamp:     dm.Message.Timestamp.Unix(),
+			Topic:         dm.Topic,
+			QueueID:       dm.QueueID,
+			ExecuteAt:     dm.ExecuteAt.Unix(),
 		})
 	}
 
@@ -215,11 +217,12 @@ func (ds *PersistentDelayScheduler) load() error {
 	for _, pm := range messages {
 		dm := &DelayedMessage{
 			Message: storage.Message{
-				ID:        pm.MessageID,
-				Body:      pm.Body,
-				Tag:       pm.Tag,
-				Retry:     pm.Retry,
-				Timestamp: time.Unix(pm.Timestamp, 0),
+				ID:            pm.MessageID,
+				Body:          pm.Body,
+				Tag:           pm.Tag,
+				CorrelationID: pm.CorrelationID,
+				Retry:         pm.Retry,
+				Timestamp:     time.Unix(pm.Timestamp, 0),
 			},
 			Topic:     pm.Topic,
 			QueueID:   pm.QueueID,

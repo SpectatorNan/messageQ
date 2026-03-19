@@ -204,7 +204,7 @@ func (ds *BinaryDelayScheduler) ListScheduled(topic string, queueID *int, cursor
 func (ds *BinaryDelayScheduler) persistToCommitLog() error {
 	// Build binary representation
 	var buf []byte
-	
+
 	// Write count
 	count := uint32(ds.delayQueue.Len())
 	countBytes := make([]byte, 4)
@@ -325,7 +325,7 @@ func (ds *BinaryDelayScheduler) loadFromCommitLog() error {
 }
 
 // encodeDelayMessage encodes a message to binary format
-// Format: [id_len:2][id][retry:2][ts:8][tag_len:2][tag][body_len:4][body]
+// Format: [id_len:2][id][retry:2][ts:8][tag_len:2][tag][body_len:4][body][correlation_id_len:2][correlation_id]
 func encodeDelayMessage(msg storage.Message) []byte {
 	var buf []byte
 
@@ -359,6 +359,12 @@ func encodeDelayMessage(msg storage.Message) []byte {
 	binary.BigEndian.PutUint32(bodyLenBytes, uint32(len(bodyBytes)))
 	buf = append(buf, bodyLenBytes...)
 	buf = append(buf, bodyBytes...)
+
+	correlationIDBytes := []byte(msg.CorrelationID)
+	correlationIDLenBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(correlationIDLenBytes, uint16(len(correlationIDBytes)))
+	buf = append(buf, correlationIDLenBytes...)
+	buf = append(buf, correlationIDBytes...)
 
 	return buf
 }
@@ -418,6 +424,20 @@ func decodeDelayMessage(buf []byte) (storage.Message, int) {
 	}
 	msg.Body = string(buf[offset : offset+int(bodyLen)])
 	offset += int(bodyLen)
+
+	if offset == len(buf) {
+		return msg, offset
+	}
+	if offset+2 > len(buf) {
+		return msg, 0
+	}
+	correlationIDLen := binary.BigEndian.Uint16(buf[offset : offset+2])
+	offset += 2
+	if offset+int(correlationIDLen) > len(buf) {
+		return msg, 0
+	}
+	msg.CorrelationID = string(buf[offset : offset+int(correlationIDLen)])
+	offset += int(correlationIDLen)
 
 	return msg, offset
 }

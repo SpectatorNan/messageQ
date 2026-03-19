@@ -2,12 +2,13 @@ package api
 
 import (
 	"fmt"
-	"github.com/SpectatorNan/messageQ/go/mq/errx"
-	"github.com/SpectatorNan/messageQ/go/mq/respx"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/SpectatorNan/messageQ/go/mq/errx"
+	"github.com/SpectatorNan/messageQ/go/mq/respx"
 
 	"go.uber.org/zap"
 
@@ -138,7 +139,7 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 				return
 			}
 
-			msg := b.EnqueueWithDelay(req.Topic, req.Body, req.Tag, delay)
+			msg := b.EnqueueWithDelay(req.Topic, req.Body, req.Tag, req.CorrelationID, delay)
 			logger.Info("Delayed message produced",
 				zap.String("topic", req.Topic),
 				zap.String("message_id", msg.ID),
@@ -146,14 +147,15 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 				zap.Duration("delay", delay))
 
 			resp := ProduceMessageResponse{
-				ID:          msg.ID,
-				Topic:       req.Topic,
-				Tag:         msg.Tag,
-				Body:        msg.Body,
-				Timestamp:   msg.Timestamp.Unix(),
-				Retry:       msg.Retry,
-				ScheduledAt: msg.Timestamp.Add(delay).Unix(),
-				ExecutedAt:  nil,
+				ID:            msg.ID,
+				Topic:         req.Topic,
+				Tag:           msg.Tag,
+				Body:          msg.Body,
+				CorrelationID: msg.CorrelationID,
+				Timestamp:     msg.Timestamp.Unix(),
+				Retry:         msg.Retry,
+				ScheduledAt:   msg.Timestamp.Add(delay).Unix(),
+				ExecutedAt:    nil,
 			}
 
 			c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
@@ -161,21 +163,22 @@ func ProduceHandler(b *broker.Broker) gin.HandlerFunc {
 		}
 
 		// Produce normal message
-		msg := b.Enqueue(req.Topic, req.Body, req.Tag)
+		msg := b.Enqueue(req.Topic, req.Body, req.Tag, req.CorrelationID)
 		logger.Info("Message produced",
 			zap.String("topic", req.Topic),
 			zap.String("message_id", msg.ID),
 			zap.String("tag", req.Tag))
 
 		resp := ProduceMessageResponse{
-			ID:          msg.ID,
-			Topic:       req.Topic,
-			Tag:         msg.Tag,
-			Body:        msg.Body,
-			Timestamp:   msg.Timestamp.Unix(),
-			Retry:       msg.Retry,
-			ScheduledAt: msg.Timestamp.Unix(),
-			ExecutedAt:  nil,
+			ID:            msg.ID,
+			Topic:         req.Topic,
+			Tag:           msg.Tag,
+			Body:          msg.Body,
+			CorrelationID: msg.CorrelationID,
+			Timestamp:     msg.Timestamp.Unix(),
+			Retry:         msg.Retry,
+			ScheduledAt:   msg.Timestamp.Unix(),
+			ExecutedAt:    nil,
 		}
 
 		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
@@ -224,6 +227,10 @@ func ProduceBatchHandler(b *broker.Broker) gin.HandlerFunc {
 					respx.FailGin(c, errx.ErrInvalidMessage)
 					return
 				}
+				if err := validateCorrelationID(item.CorrelationID); err != nil {
+					respx.FailGin(c, err)
+					return
+				}
 
 				delayMs := item.DelayMs
 				delaySec := item.DelaySec
@@ -241,9 +248,10 @@ func ProduceBatchHandler(b *broker.Broker) gin.HandlerFunc {
 				}
 
 				items = append(items, broker.DelayEnqueueItem{
-					Body:  body,
-					Tag:   tag,
-					Delay: delay,
+					Body:          body,
+					Tag:           tag,
+					CorrelationID: item.CorrelationID,
+					Delay:         delay,
 				})
 			}
 
@@ -251,14 +259,15 @@ func ProduceBatchHandler(b *broker.Broker) gin.HandlerFunc {
 			for i, msg := range msgs {
 				delay := items[i].Delay
 				responses = append(responses, ProduceMessageResponse{
-					ID:          msg.ID,
-					Topic:       req.Topic,
-					Tag:         msg.Tag,
-					Body:        msg.Body,
-					Timestamp:   msg.Timestamp.Unix(),
-					Retry:       msg.Retry,
-					ScheduledAt: msg.Timestamp.Add(delay).Unix(),
-					ExecutedAt:  nil,
+					ID:            msg.ID,
+					Topic:         req.Topic,
+					Tag:           msg.Tag,
+					Body:          msg.Body,
+					CorrelationID: msg.CorrelationID,
+					Timestamp:     msg.Timestamp.Unix(),
+					Retry:         msg.Retry,
+					ScheduledAt:   msg.Timestamp.Add(delay).Unix(),
+					ExecutedAt:    nil,
 				})
 			}
 
@@ -274,20 +283,25 @@ func ProduceBatchHandler(b *broker.Broker) gin.HandlerFunc {
 				respx.FailGin(c, errx.ErrInvalidMessage)
 				return
 			}
-			items = append(items, queue.Message{Body: body, Tag: tag})
+			if err := validateCorrelationID(item.CorrelationID); err != nil {
+				respx.FailGin(c, err)
+				return
+			}
+			items = append(items, queue.Message{Body: body, Tag: tag, CorrelationID: item.CorrelationID})
 		}
 
 		msgs := b.EnqueueBatch(req.Topic, items)
 		for _, msg := range msgs {
 			responses = append(responses, ProduceMessageResponse{
-				ID:          msg.ID,
-				Topic:       req.Topic,
-				Tag:         msg.Tag,
-				Body:        msg.Body,
-				Timestamp:   msg.Timestamp.Unix(),
-				Retry:       msg.Retry,
-				ScheduledAt: msg.Timestamp.Unix(),
-				ExecutedAt:  nil,
+				ID:            msg.ID,
+				Topic:         req.Topic,
+				Tag:           msg.Tag,
+				Body:          msg.Body,
+				CorrelationID: msg.CorrelationID,
+				Timestamp:     msg.Timestamp.Unix(),
+				Retry:         msg.Retry,
+				ScheduledAt:   msg.Timestamp.Unix(),
+				ExecutedAt:    nil,
 			})
 		}
 
@@ -320,15 +334,14 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 		}
 
 		tag := req.Tag
-		var msgs []storage.Message
-		var offset, next int64
+		var msgs []storage.MessageWithOffset
 		var queueID int
 		var err error
 
 		if req.QueueId != nil {
 
 			queueID = *req.QueueId
-			msgs, offset, next, err = b.ConsumeWithRetry(req.GroupName, req.Topic, queueID, tag, 1)
+			msgs, err = b.ConsumeVisibleWithRetry(req.GroupName, req.Topic, queueID, tag, 1)
 			if err != nil {
 				logger.Error("Consume error", zap.String("group", req.GroupName), zap.String("topic", req.Topic), zap.Error(err))
 				respx.FailGin(c, errx.ErrOffsetUnsupported)
@@ -340,7 +353,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			start := consumeRRStart(req.GroupName, req.Topic, tag, queueCount)
 			for i := 0; i < queueCount; i++ {
 				idx := (start + i) % queueCount
-				msgs, offset, next, err = b.ConsumeWithRetry(req.GroupName, req.Topic, idx, tag, 1)
+				msgs, err = b.ConsumeVisibleWithRetry(req.GroupName, req.Topic, idx, tag, 1)
 				if err != nil {
 					continue // 跳过出错的队列
 				}
@@ -365,12 +378,15 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 		}
 
 		msg := msgs[0]
+		offset := msg.Offset
+		next := msg.Offset + 1
 		b.BeginProcessing(req.GroupName, req.Topic, queueID, offset, next, queue.Message{
-			ID:        msg.ID,
-			Body:      msg.Body,
-			Tag:       msg.Tag,
-			Retry:     msg.Retry,
-			Timestamp: msg.Timestamp,
+			ID:            msg.ID,
+			Body:          msg.Body,
+			Tag:           msg.Tag,
+			CorrelationID: msg.CorrelationID,
+			Retry:         msg.Retry,
+			Timestamp:     msg.Timestamp,
 		})
 
 		logger.Info("Message consumed",
@@ -382,16 +398,17 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 
 		resp := ConsumeMessageResponse{
 			Message: ConsumeMessage{
-				ID:        msg.ID,
-				Body:      msg.Body,
-				Tag:       msg.Tag,
-				Retry:     msg.Retry,
-				Timestamp: msg.Timestamp.Unix(),
+				ID:            msg.ID,
+				Body:          msg.Body,
+				Tag:           msg.Tag,
+				CorrelationID: msg.CorrelationID,
+				Retry:         msg.Retry,
+				Timestamp:     msg.Timestamp.Unix(),
 			},
 			Group:      req.GroupName,
 			Topic:      req.Topic,
 			QueueID:    queueID,
-			Offset:     offset,
+			Offset:     msg.Offset,
 			NextOffset: next,
 			State:      "processing",
 		}
@@ -436,41 +453,40 @@ func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
 		}
 
 		tag := req.Tag
-		var msgs []storage.Message
-		var offset int64
+		var msgs []storage.MessageWithOffset
 		var queueID int
 		var err error
 		out := make([]ConsumeBatchMessage, 0, max)
-		batchByQueue := make([]queue.Message, 0, max)
 
 		if req.QueueId != nil {
 			queueID = *req.QueueId
-			msgs, offset, _, err = b.ConsumeWithRetry(req.GroupName, req.Topic, queueID, tag, max)
+			msgs, err = b.ConsumeVisibleWithRetry(req.GroupName, req.Topic, queueID, tag, max)
 			if err != nil {
 				logger.Error("Consume batch error", zap.String("group", req.GroupName), zap.String("topic", req.Topic), zap.Error(err))
 				respx.FailGin(c, errx.ErrOffsetUnsupported)
 				return
 			}
-			for i, msg := range msgs {
-				batchByQueue = append(batchByQueue, queue.Message{
-					ID:        msg.ID,
-					Body:      msg.Body,
-					Tag:       msg.Tag,
-					Retry:     msg.Retry,
-					Timestamp: msg.Timestamp,
-				})
+			for _, msg := range msgs {
 				out = append(out, ConsumeBatchMessage{
-					ID:         msg.ID,
-					Body:       msg.Body,
-					Tag:        msg.Tag,
-					Retry:      msg.Retry,
-					Timestamp:  msg.Timestamp.Unix(),
-					QueueID:    queueID,
-					Offset:     offset + int64(i),
-					NextOffset: offset + int64(i) + 1,
+					ID:            msg.ID,
+					Body:          msg.Body,
+					Tag:           msg.Tag,
+					CorrelationID: msg.CorrelationID,
+					Retry:         msg.Retry,
+					Timestamp:     msg.Timestamp.Unix(),
+					QueueID:       queueID,
+					Offset:        msg.Offset,
+					NextOffset:    msg.Offset + 1,
+				})
+				b.BeginProcessing(req.GroupName, req.Topic, queueID, msg.Offset, msg.Offset+1, queue.Message{
+					ID:            msg.ID,
+					Body:          msg.Body,
+					Tag:           msg.Tag,
+					CorrelationID: msg.CorrelationID,
+					Retry:         msg.Retry,
+					Timestamp:     msg.Timestamp,
 				})
 			}
-			b.BeginProcessingBatch(req.GroupName, req.Topic, queueID, offset, batchByQueue)
 		} else {
 			queueCount := b.GetQueueCount(req.Topic)
 			start := consumeRRStart(req.GroupName, req.Topic, tag, queueCount)
@@ -479,34 +495,34 @@ func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
 			for i := 0; i < queueCount && remaining > 0; i++ {
 				idx := (start + i) % queueCount
 				lastIdx = idx
-				msgs, offset, _, err = b.ConsumeWithRetry(req.GroupName, req.Topic, idx, tag, remaining)
+				msgs, err = b.ConsumeVisibleWithRetry(req.GroupName, req.Topic, idx, tag, remaining)
 				if err != nil {
 					continue
 				}
 				if len(msgs) == 0 {
 					continue
 				}
-				batchByQueue = batchByQueue[:0]
-				for j, msg := range msgs {
-					batchByQueue = append(batchByQueue, queue.Message{
-						ID:        msg.ID,
-						Body:      msg.Body,
-						Tag:       msg.Tag,
-						Retry:     msg.Retry,
-						Timestamp: msg.Timestamp,
-					})
+				for _, msg := range msgs {
 					out = append(out, ConsumeBatchMessage{
-						ID:         msg.ID,
-						Body:       msg.Body,
-						Tag:        msg.Tag,
-						Retry:      msg.Retry,
-						Timestamp:  msg.Timestamp.Unix(),
-						QueueID:    idx,
-						Offset:     offset + int64(j),
-						NextOffset: offset + int64(j) + 1,
+						ID:            msg.ID,
+						Body:          msg.Body,
+						Tag:           msg.Tag,
+						CorrelationID: msg.CorrelationID,
+						Retry:         msg.Retry,
+						Timestamp:     msg.Timestamp.Unix(),
+						QueueID:       idx,
+						Offset:        msg.Offset,
+						NextOffset:    msg.Offset + 1,
+					})
+					b.BeginProcessing(req.GroupName, req.Topic, idx, msg.Offset, msg.Offset+1, queue.Message{
+						ID:            msg.ID,
+						Body:          msg.Body,
+						Tag:           msg.Tag,
+						CorrelationID: msg.CorrelationID,
+						Retry:         msg.Retry,
+						Timestamp:     msg.Timestamp,
 					})
 				}
-				b.BeginProcessingBatch(req.GroupName, req.Topic, idx, offset, batchByQueue)
 				remaining = max - len(out)
 			}
 			if queueCount > 0 {
@@ -580,40 +596,40 @@ func ListMessagesHandler(b *broker.Broker) gin.HandlerFunc {
 				qid := queueID
 				off := msg.Offset
 				out = append(out, MessageStatus{
-					ID:        msg.ID,
-					Body:      msg.Body,
-					Tag:       msg.Tag,
-					Retry:     msg.Retry,
-					Timestamp: msg.Timestamp.Unix(),
-					QueueID:   &qid,
-					Offset:    &off,
+					ID:            msg.ID,
+					Body:          msg.Body,
+					Tag:           msg.Tag,
+					CorrelationID: msg.CorrelationID,
+					Retry:         msg.Retry,
+					Timestamp:     msg.Timestamp.Unix(),
+					QueueID:       &qid,
+					Offset:        &off,
 				})
 			}
 			resp.Messages = out
 			resp.NextCursor = &nextCursor
 		case "scheduled":
-			var next *int64
 			queueID := req.QueueId
 			var cursor int64
 			if req.Cursor != nil {
 				cursor = *req.Cursor
 			}
 			if ds := b.GetDelayScheduler(); ds != nil {
-				items, nc := ds.ListScheduled(req.Topic, queueID, cursor, limit)
-				next = nc
+				items, next := b.ListScheduledVisible(req.GroupName, req.Topic, queueID, cursor, limit)
 				resp.State = "scheduled"
 				out := make([]MessageStatus, 0, len(items))
 				for _, item := range items {
 					qid := item.QueueID
 					scheduledAt := item.ExecuteAt.Unix()
 					out = append(out, MessageStatus{
-						ID:          item.Message.ID,
-						Body:        item.Message.Body,
-						Tag:         item.Message.Tag,
-						Retry:       item.Message.Retry,
-						Timestamp:   item.Message.Timestamp.Unix(),
-						ScheduledAt: &scheduledAt,
-						QueueID:     &qid,
+						ID:            item.Message.ID,
+						Body:          item.Message.Body,
+						Tag:           item.Message.Tag,
+						CorrelationID: item.Message.CorrelationID,
+						Retry:         item.Message.Retry,
+						Timestamp:     item.Message.Timestamp.Unix(),
+						ScheduledAt:   &scheduledAt,
+						QueueID:       &qid,
 					})
 				}
 				resp.Messages = out
@@ -660,16 +676,17 @@ func ListMessagesHandler(b *broker.Broker) gin.HandlerFunc {
 				off := entry.Offset
 				next := entry.NextOffset
 				msgs = append(msgs, MessageStatus{
-					ID:         entry.MsgID,
-					Body:       entry.Body,
-					Tag:        entry.Tag,
-					Retry:      entry.Retry,
-					Timestamp:  entry.Timestamp.Unix(),
-					ConsumedAt: &consumedAt,
-					AckedAt:    nil,
-					QueueID:    &qid,
-					Offset:     &off,
-					NextOffset: &next,
+					ID:            entry.MsgID,
+					Body:          entry.Body,
+					Tag:           entry.Tag,
+					CorrelationID: entry.CorrelationID,
+					Retry:         entry.Retry,
+					Timestamp:     entry.Timestamp.Unix(),
+					ConsumedAt:    &consumedAt,
+					AckedAt:       nil,
+					QueueID:       &qid,
+					Offset:        &off,
+					NextOffset:    &next,
 				})
 			}
 			resp.Messages = msgs
@@ -713,24 +730,91 @@ func ListMessagesHandler(b *broker.Broker) gin.HandlerFunc {
 				off := entry.Offset
 				next := entry.NextOffset
 				msgs = append(msgs, MessageStatus{
-					ID:         entry.MsgID,
-					Body:       entry.Body,
-					Tag:        entry.Tag,
-					Retry:      entry.Retry,
-					Timestamp:  entry.Timestamp.Unix(),
-					ConsumedAt: &consumedAt,
-					AckedAt:    &ackedAt,
-					QueueID:    &qid,
-					Offset:     &off,
-					NextOffset: &next,
+					ID:            entry.MsgID,
+					Body:          entry.Body,
+					Tag:           entry.Tag,
+					CorrelationID: entry.CorrelationID,
+					Retry:         entry.Retry,
+					Timestamp:     entry.Timestamp.Unix(),
+					ConsumedAt:    &consumedAt,
+					AckedAt:       &ackedAt,
+					QueueID:       &qid,
+					Offset:        &off,
+					NextOffset:    &next,
 				})
 			}
+			resp.Messages = msgs
+		case "cancelled":
+			entries := b.ListCancelled(req.GroupName, req.Topic, limit)
+			if req.Tag != "" {
+				filtered := entries[:0]
+				for _, entry := range entries {
+					if entry.Tag == req.Tag {
+						filtered = append(filtered, entry)
+					}
+				}
+				entries = filtered
+			}
+			msgs := make([]MessageStatus, 0, len(entries))
+			for _, entry := range entries {
+				var scheduledAt *int64
+				if entry.ScheduledAt != nil {
+					v := entry.ScheduledAt.Unix()
+					scheduledAt = &v
+				}
+				var consumedAt *int64
+				if entry.ConsumedAt != nil {
+					v := entry.ConsumedAt.Unix()
+					consumedAt = &v
+				}
+				msgs = append(msgs, MessageStatus{
+					ID:            entry.MsgID,
+					Body:          entry.Body,
+					Tag:           entry.Tag,
+					CorrelationID: entry.CorrelationID,
+					Retry:         entry.Retry,
+					Timestamp:     entry.Timestamp.Unix(),
+					ScheduledAt:   scheduledAt,
+					ConsumedAt:    consumedAt,
+					QueueID:       entry.QueueID,
+					Offset:        entry.Offset,
+					NextOffset:    entry.NextOffset,
+				})
+			}
+			resp.State = "cancelled"
 			resp.Messages = msgs
 		default:
 			respx.FailGin(c, errx.ErrInvalidMessage)
 			return
 		}
 
+		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
+	}
+}
+
+func TerminateHandler(b *broker.Broker) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req TerminateMessageRequest
+		if err := c.ShouldBindUri(&req); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+		if err := req.Validate(); err != nil {
+			respx.FailGin(c, err)
+			return
+		}
+
+		if !b.TerminateMessage(req.ID, req.GroupName, req.Topic) {
+			respx.FailGin(c, errx.ErrInvalidMessage)
+			return
+		}
+
+		resp := TerminateResponse{
+			MessageID:  req.ID,
+			Terminated: true,
+			Topic:      req.Topic,
+			State:      "cancelled",
+		}
 		c.JSON(http.StatusOK, respx.NewRespSuccess(resp))
 	}
 }

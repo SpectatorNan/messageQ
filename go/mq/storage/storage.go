@@ -4,11 +4,12 @@ import "time"
 
 // Message is storage's serializable representation to avoid importing queue (prevents cycles)
 type Message struct {
-	ID        string    `json:"id"`
-	Body      string    `json:"body"`
-	Tag       string    `json:"tag,omitempty"`
-	Retry     int       `json:"retry"`
-	Timestamp time.Time `json:"timestamp"`
+	ID            string    `json:"id"`
+	Body          string    `json:"body"`
+	Tag           string    `json:"tag,omitempty"`
+	CorrelationID string    `json:"correlationId,omitempty"`
+	Retry         int       `json:"retry"`
+	Timestamp     time.Time `json:"timestamp"`
 }
 
 // MessageWithOffset adds consumequeue offset metadata.

@@ -2,9 +2,10 @@ package client
 
 import (
 	"encoding/json"
-	"github.com/SpectatorNan/messageQ/go/mq/broker"
 	"strconv"
 	"time"
+
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
 )
 
 // FlexibleUnix handles both numeric unix seconds and RFC3339 time strings.
@@ -82,30 +83,33 @@ type ErrResp struct {
 }
 
 type ProduceMessageRequest struct {
-	Body        string        `json:"body"`
-	Tag         string        `json:"tag"`
-	DelayMs     int64         `json:"delayMs"`               // optional: delay in milliseconds
-	DelaySec    int64         `json:"delaySec"`              // optional: delay in seconds
-	ScheduledAt *FlexibleUnix `json:"scheduledAt,omitempty"` // optional: unix seconds or RFC3339
+	Body          string        `json:"body"`
+	Tag           string        `json:"tag"`
+	CorrelationID string        `json:"correlationId,omitempty"`
+	DelayMs       int64         `json:"delayMs"`               // optional: delay in milliseconds
+	DelaySec      int64         `json:"delaySec"`              // optional: delay in seconds
+	ScheduledAt   *FlexibleUnix `json:"scheduledAt,omitempty"` // optional: unix seconds or RFC3339
 }
 type ProduceBatchMessage struct {
-	Body        string        `json:"body"`
-	Tag         string        `json:"tag"`
-	DelayMs     int64         `json:"delayMs"`
-	DelaySec    int64         `json:"delaySec"`
-	ScheduledAt *FlexibleUnix `json:"scheduledAt,omitempty"`
+	Body          string        `json:"body"`
+	Tag           string        `json:"tag"`
+	CorrelationID string        `json:"correlationId,omitempty"`
+	DelayMs       int64         `json:"delayMs"`
+	DelaySec      int64         `json:"delaySec"`
+	ScheduledAt   *FlexibleUnix `json:"scheduledAt,omitempty"`
 }
 type ProduceBatchRequest struct {
 	Messages []ProduceBatchMessage `json:"messages"`
 }
 type ProduceMessageResponse struct {
-	ID           string        `json:"id"`
-	Topic        string        `json:"topic"`
-	Tag          string        `json:"tag"`
-	ScheduledAt  FlexibleUnix  `json:"scheduledAt"`
-	ExecuteAt    *FlexibleUnix `json:"executeAt"`
-	DelaySeconds float64       `json:"delaySeconds"`
-	DelayMs      int64         `json:"delayMs"`
+	ID            string        `json:"id"`
+	Topic         string        `json:"topic"`
+	Tag           string        `json:"tag"`
+	CorrelationID string        `json:"correlationId,omitempty"`
+	ScheduledAt   FlexibleUnix  `json:"scheduledAt"`
+	ExecuteAt     *FlexibleUnix `json:"executeAt"`
+	DelaySeconds  float64       `json:"delaySeconds"`
+	DelayMs       int64         `json:"delayMs"`
 }
 type ProduceBatchResponse struct {
 	Messages []ProduceMessageResponse `json:"messages"`
@@ -149,34 +153,37 @@ type (
 		State    string                `json:"state"`
 	}
 	ConsumeMessage struct {
-		ID        string       `json:"id"`
-		Body      string       `json:"body"`
-		Tag       string       `json:"tag,omitempty"`
-		Retry     int          `json:"retry"`
-		Timestamp FlexibleUnix `json:"timestamp"`
+		ID            string       `json:"id"`
+		Body          string       `json:"body"`
+		Tag           string       `json:"tag,omitempty"`
+		CorrelationID string       `json:"correlationId,omitempty"`
+		Retry         int          `json:"retry"`
+		Timestamp     FlexibleUnix `json:"timestamp"`
 	}
 	ConsumeBatchMessage struct {
-		ID         string       `json:"id"`
-		Body       string       `json:"body"`
-		Tag        string       `json:"tag,omitempty"`
-		Retry      int          `json:"retry"`
-		Timestamp  FlexibleUnix `json:"timestamp"`
-		QueueID    int          `json:"queueId"`
-		Offset     int64        `json:"offset"`
-		NextOffset int64        `json:"nextOffset"`
+		ID            string       `json:"id"`
+		Body          string       `json:"body"`
+		Tag           string       `json:"tag,omitempty"`
+		CorrelationID string       `json:"correlationId,omitempty"`
+		Retry         int          `json:"retry"`
+		Timestamp     FlexibleUnix `json:"timestamp"`
+		QueueID       int          `json:"queueId"`
+		Offset        int64        `json:"offset"`
+		NextOffset    int64        `json:"nextOffset"`
 	}
 	MessageStatus struct {
-		ID          string        `json:"id"`
-		Body        string        `json:"body"`
-		Tag         string        `json:"tag,omitempty"`
-		Retry       int           `json:"retry"`
-		Timestamp   FlexibleUnix  `json:"timestamp"`
-		ScheduledAt *FlexibleUnix `json:"scheduledAt,omitempty"`
-		ConsumedAt  *FlexibleUnix `json:"consumedAt,omitempty"`
-		AckedAt     *FlexibleUnix `json:"ackedAt,omitempty"`
-		QueueID     *int          `json:"queueId,omitempty"`
-		Offset      *int64        `json:"offset,omitempty"`
-		NextOffset  *int64        `json:"nextOffset,omitempty"`
+		ID            string        `json:"id"`
+		Body          string        `json:"body"`
+		Tag           string        `json:"tag,omitempty"`
+		CorrelationID string        `json:"correlationId,omitempty"`
+		Retry         int           `json:"retry"`
+		Timestamp     FlexibleUnix  `json:"timestamp"`
+		ScheduledAt   *FlexibleUnix `json:"scheduledAt,omitempty"`
+		ConsumedAt    *FlexibleUnix `json:"consumedAt,omitempty"`
+		AckedAt       *FlexibleUnix `json:"ackedAt,omitempty"`
+		QueueID       *int          `json:"queueId,omitempty"`
+		Offset        *int64        `json:"offset,omitempty"`
+		NextOffset    *int64        `json:"nextOffset,omitempty"`
 	}
 	ListMessagesResponse struct {
 		Group      string          `json:"group"`
@@ -195,6 +202,12 @@ type (
 		Nacked    bool   `json:"nacked"`
 		Topic     string `json:"topic"`
 		Requeued  bool   `json:"requeued"`
+	}
+	TerminateMessageResponse struct {
+		MessageID  string `json:"messageId"`
+		Terminated bool   `json:"terminated"`
+		Topic      string `json:"topic"`
+		State      string `json:"state"`
 	}
 )
 

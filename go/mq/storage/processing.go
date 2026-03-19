@@ -12,15 +12,16 @@ import (
 
 // ProcessingRecord persists in-flight processing state for crash recovery.
 type ProcessingRecord struct {
-	Group     string    `json:"group"`
-	Topic     string    `json:"topic"`
-	QueueID   int       `json:"queue_id"`
-	MsgID     string    `json:"msg_id"`
-	Body      string    `json:"body"`
-	Tag       string    `json:"tag"`
-	Retry     int       `json:"retry"`
-	Timestamp time.Time `json:"timestamp"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Group         string    `json:"group"`
+	Topic         string    `json:"topic"`
+	QueueID       int       `json:"queue_id"`
+	MsgID         string    `json:"msg_id"`
+	Body          string    `json:"body"`
+	Tag           string    `json:"tag"`
+	CorrelationID string    `json:"correlation_id,omitempty"`
+	Retry         int       `json:"retry"`
+	Timestamp     time.Time `json:"timestamp"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // SaveProcessing persists an in-flight processing record.
