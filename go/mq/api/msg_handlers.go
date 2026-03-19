@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -332,6 +333,19 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			respx.FailGin(c, errx.ErrTopicNotFound)
 			return
 		}
+		if err := b.EnsureSubscription(req.GroupName, req.Topic, req.Tag); err != nil {
+			logger.Warn("Subscription conflict",
+				zap.String("group", req.GroupName),
+				zap.String("topic", req.Topic),
+				zap.String("tag", req.Tag),
+				zap.Error(err))
+			if errors.Is(err, broker.ErrSubscriptionConflict) {
+				respx.FailGin(c, errx.ErrSubscriptionConflict)
+			} else {
+				respx.FailGin(c, err)
+			}
+			return
+		}
 
 		tag := req.Tag
 		var msgs []storage.MessageWithOffset
@@ -437,6 +451,19 @@ func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
 		if _, err := b.GetTopicConfig(req.Topic); err != nil {
 			logger.Warn("Topic not found for consumption", zap.String("topic", req.Topic))
 			respx.FailGin(c, errx.ErrTopicNotFound)
+			return
+		}
+		if err := b.EnsureSubscription(req.GroupName, req.Topic, req.Tag); err != nil {
+			logger.Warn("Subscription conflict",
+				zap.String("group", req.GroupName),
+				zap.String("topic", req.Topic),
+				zap.String("tag", req.Tag),
+				zap.Error(err))
+			if errors.Is(err, broker.ErrSubscriptionConflict) {
+				respx.FailGin(c, errx.ErrSubscriptionConflict)
+			} else {
+				respx.FailGin(c, err)
+			}
 			return
 		}
 
@@ -782,6 +809,45 @@ func ListMessagesHandler(b *broker.Broker) gin.HandlerFunc {
 				})
 			}
 			resp.State = "cancelled"
+			resp.Messages = msgs
+		case "expired":
+			entries := b.ListExpired(req.Topic, limit)
+			if req.Tag != "" {
+				filtered := entries[:0]
+				for _, entry := range entries {
+					if entry.Tag == req.Tag {
+						filtered = append(filtered, entry)
+					}
+				}
+				entries = filtered
+			}
+			msgs := make([]MessageStatus, 0, len(entries))
+			for _, entry := range entries {
+				var scheduledAt *int64
+				if entry.ScheduledAt != nil {
+					v := entry.ScheduledAt.Unix()
+					scheduledAt = &v
+				}
+				var consumedAt *int64
+				if entry.ConsumedAt != nil {
+					v := entry.ConsumedAt.Unix()
+					consumedAt = &v
+				}
+				msgs = append(msgs, MessageStatus{
+					ID:            entry.MsgID,
+					Body:          entry.Body,
+					Tag:           entry.Tag,
+					CorrelationID: entry.CorrelationID,
+					Retry:         entry.Retry,
+					Timestamp:     entry.Timestamp.Unix(),
+					ScheduledAt:   scheduledAt,
+					ConsumedAt:    consumedAt,
+					QueueID:       entry.QueueID,
+					Offset:        entry.Offset,
+					NextOffset:    entry.NextOffset,
+				})
+			}
+			resp.State = "expired"
 			resp.Messages = msgs
 		default:
 			respx.FailGin(c, errx.ErrInvalidMessage)

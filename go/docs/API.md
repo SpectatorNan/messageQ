@@ -154,6 +154,11 @@ curl -X POST http://localhost:8080/topics/notifications/messages/delay \
 - `queue_id`: 必须 >= 0
 - `topic`: 同上
 
+**行为说明：**
+- 新 consumer group 首次消费普通 topic 时，offset 会初始化到当前 queue tail（`latest`），不会回放历史消息
+- 同一 `group + topic` 的订阅 tag 必须一致；一旦某个 group 以某个 tag 建立订阅，后续再用不同 tag 消费会返回 `subscription_conflict`
+- `""` 与 `*` 会被视为同一个“全量订阅”标签
+
 **响应：**
 ```json
 {
@@ -346,11 +351,13 @@ curl -X POST \
 - `processing`
 - `completed`
 - `cancelled`
+- `expired`
 
 **说明：**
-- `pending` / `scheduled` / `processing` / `completed` / `cancelled` 响应里的消息对象都会返回 `correlationId`
+- `pending` / `scheduled` / `processing` / `completed` / `cancelled` / `expired` 响应里的消息对象都会返回 `correlationId`
 - 查询 `cancelled` 可看到 topic 上已终止消息；该视图不区分消费组，同一 topic 的任意 group 查询结果一致
-- 被终止消息不会出现在 `pending`、`scheduled` 以及实际消费结果中
+- 查询 `expired` 可看到超过保留窗口后被系统自动终止的消息
+- 被终止或过期的消息不会出现在 `pending`、`scheduled` 以及实际消费结果中
 
 **`cancelled` 响应示例：**
 ```json
@@ -551,7 +558,7 @@ curl -X DELETE http://localhost:8080/topics/orders
 }
 ```
 
-如果没有offset记录，`offset` 字段为 `null`。
+如果没有 offset 记录，说明该 group 还未初始化到该 queue；首次消费普通 topic 时会自动从 `latest` 初始化并写入 offset。
 
 **示例：**
 ```bash
@@ -652,6 +659,7 @@ curl http://localhost:8080/stats
 | `invalid_group` | 消费者组名无效 |
 | `invalid_offset` | offset值无效 |
 | `offset_unsupported` | 不支持offset存储 |
+| `subscription_conflict` | 同一消费者组在同一 topic 上使用了不一致的 tag 订阅 |
 | `missing_tag` | 缺少tag参数 |
 | `busy` | 消息正在处理中 |
 | `invalid_delay` | 延迟参数无效 |

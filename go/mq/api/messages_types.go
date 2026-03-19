@@ -1,10 +1,11 @@
 package api
 
 import (
+	"strings"
+
 	"github.com/SpectatorNan/messageQ/go/mq/errx"
 	"github.com/SpectatorNan/messageQ/go/mq/logger"
 	client "github.com/SpectatorNan/messageQ/go/sdk"
-	"strings"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -241,7 +242,7 @@ func (r *ListMessagesRequest) Validate() error {
 		logger.Warn("Invalid group name", zap.String("group", r.GroupName))
 		return err
 	}
-	if r.State != "" && r.State != "processing" && r.State != "acked" && r.State != "completed" && r.State != "pending" && r.State != "scheduled" && r.State != "cancelled" {
+	if r.State != "" && r.State != "processing" && r.State != "acked" && r.State != "completed" && r.State != "pending" && r.State != "scheduled" && r.State != "cancelled" && r.State != "expired" {
 		return errx.ErrInvalidMessage
 	}
 	if (r.State == "pending" || r.State == "scheduled") && r.QueueId != nil && *r.QueueId < 0 {

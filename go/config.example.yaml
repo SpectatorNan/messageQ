@@ -20,6 +20,10 @@ broker:
   retry_backoff_base: 1s            # 重试退避基础延迟
   retry_backoff_multiplier: 2.0     # 重试退避指数（每次延迟 = base * multiplier^retry_count）
   retry_backoff_max: 60s            # 重试退避最大延迟
+  message_retention: 168h           # 消息保留窗口（默认7天）
+  message_expiry_factor: 2          # 自动过期倍数：超过 retention * factor 的未终态消息会进入 expired
+  new_group_start_position: latest  # 新 group 首次消费起点：latest 或 earliest
+  cancelled_cache_limit: 10000      # 内存中缓存的 terminal tombstone 数量上限
 
 # 存储配置 (WAL)
 storage:

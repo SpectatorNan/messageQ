@@ -6,6 +6,7 @@ import (
 	"math"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +23,10 @@ const defaultQueueCount = 4
 const defaultMaxRetry = 3
 const defaultProcessingTimeout = 30 * time.Second // 消息处理超时时间
 const defaultCompletedHistorySize = 1000
+const defaultMessageRetention = 7 * 24 * time.Hour
+const defaultMessageExpiryFactor = 2
+const defaultCancelledCacheLimit = 10000
+const defaultNewGroupStartPosition = "latest"
 
 type processingState string
 
@@ -29,6 +34,7 @@ const (
 	stateProcessing processingState = "processing"
 	stateCompleted  processingState = "completed"
 	stateCancelled  processingState = "cancelled"
+	stateExpired    processingState = "expired"
 	stateRetry      processingState = "retry"
 )
 
@@ -68,6 +74,7 @@ type completedEntry struct {
 type cancelledEntry struct {
 	Group         string
 	Topic         string
+	State         string
 	QueueID       *int
 	Offset        *int64
 	NextOffset    *int64
@@ -82,6 +89,14 @@ type cancelledEntry struct {
 	CancelledAt   time.Time
 }
 
+type subscriptionEntry struct {
+	Group     string
+	Topic     string
+	Tag       string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
 type Broker struct {
 	queues                 map[string][]*queue.Queue
 	lock                   sync.Mutex
@@ -93,6 +108,9 @@ type Broker struct {
 	processing             map[string]processingEntry // group:topic:msgID -> entry
 	completed              map[string][]completedEntry
 	cancelled              map[string]cancelledEntry
+	cancelledOrder         []string
+	cancelledCacheLimit    int
+	subscriptions          map[string]subscriptionEntry
 	stats                  map[string]*groupStats // group -> stats
 	retryCounts            map[string]int         // msgID -> retry count (in-memory)
 	maxRetry               int
@@ -101,6 +119,9 @@ type Broker struct {
 	topicManager           *TopicManager          // topic metadata manager
 	dataDir                string                 // data directory for persistence
 	processingTimeout      time.Duration          // message processing timeout
+	messageRetention       time.Duration
+	messageExpiryFactor    int
+	newGroupStartPosition  string
 	completedLimit         int
 	retryBackoffBase       time.Duration // retry backoff base delay
 	retryBackoffMultiplier float64       // retry backoff multiplier
@@ -175,12 +196,17 @@ func NewBrokerWithPersistence(store storage.Storage, queueCount int, dataDir str
 		topicManager:           tm,
 		dataDir:                dataDir,
 		processingTimeout:      defaultProcessingTimeout,
+		messageRetention:       defaultMessageRetention,
+		messageExpiryFactor:    defaultMessageExpiryFactor,
+		newGroupStartPosition:  defaultNewGroupStartPosition,
 		retryBackoffBase:       1 * time.Second,
 		retryBackoffMultiplier: 2.0,
 		retryBackoffMax:        60 * time.Second,
 		stopChan:               make(chan struct{}),
 		completed:              make(map[string][]completedEntry),
 		cancelled:              make(map[string]cancelledEntry),
+		cancelledCacheLimit:    defaultCancelledCacheLimit,
+		subscriptions:          make(map[string]subscriptionEntry),
 		completedLimit:         defaultCompletedHistorySize,
 	}
 
@@ -195,6 +221,7 @@ func NewBrokerWithPersistence(store storage.Storage, queueCount int, dataDir str
 	b.initializeExistingTopics()
 	// 恢复持久化的 processing 记录，避免 crash 丢失
 	b.recoverProcessingRecords()
+	b.recoverSubscriptions()
 	b.recoverCancelledRecords()
 
 	// 启动处理超时检查
@@ -280,7 +307,7 @@ func (b *Broker) recoverProcessingRecords() {
 			Tag:           rec.Tag,
 			CorrelationID: rec.CorrelationID,
 			Retry:         rec.Retry + 1,
-			Timestamp:     time.Now(),
+			Timestamp:     rec.Timestamp,
 		}
 		b.delayScheduler.ScheduleWithDelay(retryTopic, rec.QueueID, msg, delay)
 
@@ -290,37 +317,29 @@ func (b *Broker) recoverProcessingRecords() {
 }
 
 func (b *Broker) recoverCancelledRecords() {
-	cs, ok := b.store.(CancelledStore)
+	// Tombstones are no longer eagerly loaded into memory on startup.
+	// They are resolved from storage on cache miss to avoid linear memory growth.
+}
+
+func (b *Broker) recoverSubscriptions() {
+	ss, ok := b.store.(SubscriptionStore)
 	if !ok {
 		return
 	}
-	records, err := cs.LoadCancelled()
+	records, err := ss.LoadSubscriptions()
 	if err != nil {
-		logger.Warn("Failed to load cancelled records", zap.Error(err))
+		logger.Warn("Failed to load subscriptions", zap.Error(err))
 		return
 	}
-	if len(records) == 0 {
-		return
-	}
-
 	b.lock.Lock()
 	defer b.lock.Unlock()
 	for _, rec := range records {
-		b.cancelled[cancelledKey(rec.Topic, rec.MsgID)] = cancelledEntry{
-			Group:         rec.Group,
-			Topic:         rec.Topic,
-			QueueID:       rec.QueueID,
-			Offset:        rec.Offset,
-			NextOffset:    rec.NextOffset,
-			MsgID:         rec.MsgID,
-			Body:          rec.Body,
-			Tag:           rec.Tag,
-			CorrelationID: rec.CorrelationID,
-			Retry:         rec.Retry,
-			Timestamp:     rec.Timestamp,
-			ScheduledAt:   rec.ScheduledAt,
-			ConsumedAt:    rec.ConsumedAt,
-			CancelledAt:   rec.CancelledAt,
+		b.subscriptions[groupTopicKey(rec.Group, rec.Topic)] = subscriptionEntry{
+			Group:     rec.Group,
+			Topic:     rec.Topic,
+			Tag:       rec.Tag,
+			CreatedAt: rec.CreatedAt,
+			UpdatedAt: rec.UpdatedAt,
 		}
 	}
 }
@@ -338,6 +357,38 @@ func groupTopicKey(group, topic string) string {
 
 func cancelledKey(topic, msgID string) string {
 	return topic + ":" + msgID
+}
+
+func normalizeSubscriptionTag(tag string) string {
+	normalized := strings.TrimSpace(tag)
+	if normalized == "" || normalized == "*" {
+		return "*"
+	}
+	return normalized
+}
+
+func cancelledEntryFromRecord(rec storage.CancelledRecord) cancelledEntry {
+	state := rec.State
+	if state == "" {
+		state = string(stateCancelled)
+	}
+	return cancelledEntry{
+		Group:         rec.Group,
+		Topic:         rec.Topic,
+		State:         state,
+		QueueID:       rec.QueueID,
+		Offset:        rec.Offset,
+		NextOffset:    rec.NextOffset,
+		MsgID:         rec.MsgID,
+		Body:          rec.Body,
+		Tag:           rec.Tag,
+		CorrelationID: rec.CorrelationID,
+		Retry:         rec.Retry,
+		Timestamp:     rec.Timestamp,
+		ScheduledAt:   rec.ScheduledAt,
+		ConsumedAt:    rec.ConsumedAt,
+		CancelledAt:   rec.CancelledAt,
+	}
 }
 
 // getQueues ensures queues exist for a topic.
@@ -565,7 +616,25 @@ type CancelledStore interface {
 	LoadCancelled() ([]storage.CancelledRecord, error)
 }
 
+// CancelledLookupStore provides point/topic lookups for persisted terminal records.
+type CancelledLookupStore interface {
+	LoadCancelledByID(topic, msgID string) (storage.CancelledRecord, bool, error)
+	ListCancelledByTopic(topic, state string, limit int) ([]storage.CancelledRecord, error)
+}
+
+// SubscriptionStore provides persistence for normalized group/topic subscriptions.
+type SubscriptionStore interface {
+	SaveSubscription(rec storage.SubscriptionRecord) error
+	LoadSubscriptions() ([]storage.SubscriptionRecord, error)
+}
+
+// ConsumeQueueDepthStore reports the current consumequeue depth for a topic/queue.
+type ConsumeQueueDepthStore interface {
+	ConsumeQueueDepth(topic string, queueID int) int64
+}
+
 var ErrOffsetUnsupported = errors.New("offset store not supported")
+var ErrSubscriptionConflict = errors.New("subscription conflict")
 
 // CommitOffset persists a consumer group offset if supported by storage.
 func (b *Broker) CommitOffset(group, topic string, queueID int, offset int64) error {
@@ -609,10 +678,77 @@ func (b *Broker) ReadFromConsumeQueueWithOffsets(topic string, queueID int, offs
 	return nil, offset, ErrOffsetUnsupported
 }
 
+// ConsumeQueueDepth returns the current consumequeue depth for a topic/queue.
+func (b *Broker) ConsumeQueueDepth(topic string, queueID int) int64 {
+	if r, ok := b.store.(ConsumeQueueDepthStore); ok {
+		return r.ConsumeQueueDepth(topic, queueID)
+	}
+	return 0
+}
+
 // GetRetryTopicName returns the retry topic name for a group and topic.
 // Example: "orders" + "g1" -> "orders.retry.g1"
 func GetRetryTopicName(group, topic string) string {
 	return topic + ".retry." + group
+}
+
+func isRetryTopicName(group, topic string) bool {
+	return strings.HasSuffix(topic, ".retry."+group)
+}
+
+func (b *Broker) resolveInitialOffset(group, topic string, queueID int) (int64, error) {
+	if strings.EqualFold(b.newGroupStartPosition, "earliest") || isRetryTopicName(group, topic) {
+		return 0, nil
+	}
+	offset := b.ConsumeQueueDepth(topic, queueID)
+	if err := b.CommitOffset(group, topic, queueID, offset); err != nil {
+		return 0, err
+	}
+	return offset, nil
+}
+
+func (b *Broker) EnsureSubscription(group, topic, tag string) error {
+	if group == "" || topic == "" {
+		return fmt.Errorf("invalid subscription")
+	}
+	normalizedTag := normalizeSubscriptionTag(tag)
+	key := groupTopicKey(group, topic)
+	currentTime := now()
+
+	b.lock.Lock()
+	existing, ok := b.subscriptions[key]
+	if ok {
+		b.lock.Unlock()
+		if existing.Tag != normalizedTag {
+			return ErrSubscriptionConflict
+		}
+		return nil
+	}
+	entry := subscriptionEntry{
+		Group:     group,
+		Topic:     topic,
+		Tag:       normalizedTag,
+		CreatedAt: currentTime,
+		UpdatedAt: currentTime,
+	}
+	b.subscriptions[key] = entry
+	b.lock.Unlock()
+
+	if ss, ok := b.store.(SubscriptionStore); ok {
+		if err := ss.SaveSubscription(storage.SubscriptionRecord{
+			Group:     entry.Group,
+			Topic:     entry.Topic,
+			Tag:       entry.Tag,
+			CreatedAt: entry.CreatedAt,
+			UpdatedAt: entry.UpdatedAt,
+		}); err != nil {
+			b.lock.Lock()
+			delete(b.subscriptions, key)
+			b.lock.Unlock()
+			return err
+		}
+	}
+	return nil
 }
 
 // getRetryTopicIfExists checks if retry topic exists for group/topic.
@@ -677,7 +813,10 @@ func (b *Broker) ConsumeWithLock(group, topic string, queueID int, tag string, m
 		return nil, 0, 0, err
 	}
 	if !ok {
-		offset = 0
+		offset, err = b.resolveInitialOffset(group, topic, queueID)
+		if err != nil {
+			return nil, 0, 0, err
+		}
 	}
 
 	// 从consumequeue读取消息
@@ -724,7 +863,10 @@ func (b *Broker) consumeVisibleFromTopic(group, logicalTopic, storageTopic strin
 		return nil, err
 	}
 	if !ok {
-		offset = 0
+		offset, err = b.resolveInitialOffset(group, storageTopic, queueID)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	cursor := offset
@@ -741,7 +883,26 @@ func (b *Broker) consumeVisibleFromTopic(group, logicalTopic, storageTopic strin
 
 		cursor = nextCursor
 		msg := msgs[0]
-		if b.IsCancelled(logicalTopic, msg.ID) {
+		if b.IsTerminal(logicalTopic, msg.ID) {
+			continue
+		}
+		if b.shouldExpire(msg.Timestamp) {
+			qid := queueID
+			off := msg.Offset
+			next := msg.Offset + 1
+			b.recordExpired(cancelledEntry{
+				Topic:         logicalTopic,
+				QueueID:       &qid,
+				Offset:        &off,
+				NextOffset:    &next,
+				MsgID:         msg.ID,
+				Body:          msg.Body,
+				Tag:           msg.Tag,
+				CorrelationID: msg.CorrelationID,
+				Retry:         msg.Retry,
+				Timestamp:     msg.Timestamp,
+				CancelledAt:   now(),
+			})
 			continue
 		}
 		out = append(out, msg)
@@ -868,7 +1029,7 @@ func (b *Broker) RetryProcessing(msgID, group, topic string) bool {
 			Tag:           entry.Tag,
 			CorrelationID: entry.CorrelationID,
 			Retry:         retryCount,
-			Timestamp:     time.Now(),
+			Timestamp:     entry.Timestamp,
 		})
 		return true
 	}
@@ -882,7 +1043,7 @@ func (b *Broker) RetryProcessing(msgID, group, topic string) bool {
 		Tag:           entry.Tag,
 		CorrelationID: entry.CorrelationID,
 		Retry:         retryCount,
-		Timestamp:     time.Now(),
+		Timestamp:     entry.Timestamp,
 	}
 	b.lock.Unlock()
 
@@ -1011,14 +1172,6 @@ func (b *Broker) ListCompleted(group, topic string, limit int) []completedEntry 
 	return entries
 }
 
-// IsCancelled reports whether a message has been terminated for a topic.
-func (b *Broker) IsCancelled(topic, msgID string) bool {
-	b.lock.Lock()
-	defer b.lock.Unlock()
-	_, ok := b.cancelled[cancelledKey(topic, msgID)]
-	return ok
-}
-
 func (b *Broker) topicQueueCount(topic string) int {
 	if count, ok := b.PeekQueueCount(topic); ok && count > 0 {
 		return count
@@ -1027,6 +1180,68 @@ func (b *Broker) topicQueueCount(topic string) int {
 		return cfg.QueueCount
 	}
 	return b.queueCount
+}
+
+func (b *Broker) cacheCancelled(entry cancelledEntry) {
+	if entry.State == "" {
+		entry.State = string(stateCancelled)
+	}
+	key := cancelledKey(entry.Topic, entry.MsgID)
+	b.lock.Lock()
+	if _, ok := b.cancelled[key]; !ok {
+		b.cancelledOrder = append(b.cancelledOrder, key)
+	}
+	b.cancelled[key] = entry
+	for b.cancelledCacheLimit > 0 && len(b.cancelled) > b.cancelledCacheLimit && len(b.cancelledOrder) > 0 {
+		oldest := b.cancelledOrder[0]
+		b.cancelledOrder = b.cancelledOrder[1:]
+		delete(b.cancelled, oldest)
+	}
+	b.lock.Unlock()
+}
+
+func (b *Broker) loadCancelled(topic, msgID string) (cancelledEntry, bool) {
+	key := cancelledKey(topic, msgID)
+	b.lock.Lock()
+	if entry, ok := b.cancelled[key]; ok {
+		b.lock.Unlock()
+		return entry, true
+	}
+	b.lock.Unlock()
+
+	cs, ok := b.store.(CancelledLookupStore)
+	if !ok {
+		return cancelledEntry{}, false
+	}
+	rec, found, err := cs.LoadCancelledByID(topic, msgID)
+	if err != nil || !found {
+		return cancelledEntry{}, false
+	}
+	entry := cancelledEntryFromRecord(rec)
+	b.cacheCancelled(entry)
+	return entry, true
+}
+
+func (b *Broker) IsCancelled(topic, msgID string) bool {
+	entry, ok := b.loadCancelled(topic, msgID)
+	return ok && entry.State == string(stateCancelled)
+}
+
+func (b *Broker) IsExpired(topic, msgID string) bool {
+	entry, ok := b.loadCancelled(topic, msgID)
+	return ok && entry.State == string(stateExpired)
+}
+
+func (b *Broker) IsTerminal(topic, msgID string) bool {
+	entry, ok := b.loadCancelled(topic, msgID)
+	return ok && (entry.State == string(stateCancelled) || entry.State == string(stateExpired))
+}
+
+func (b *Broker) shouldExpire(ts time.Time) bool {
+	if ts.IsZero() || b.messageRetention <= 0 || b.messageExpiryFactor <= 0 {
+		return false
+	}
+	return now().Sub(ts) > time.Duration(b.messageExpiryFactor)*b.messageRetention
 }
 
 func (b *Broker) persistCancelled(entry cancelledEntry) {
@@ -1038,6 +1253,7 @@ func (b *Broker) persistCancelled(entry cancelledEntry) {
 		Group:         entry.Group,
 		Topic:         entry.Topic,
 		MsgID:         entry.MsgID,
+		State:         entry.State,
 		Body:          entry.Body,
 		Tag:           entry.Tag,
 		CorrelationID: entry.CorrelationID,
@@ -1057,11 +1273,19 @@ func (b *Broker) recordCancelled(entry cancelledEntry) {
 		entry.CancelledAt = now()
 	}
 	entry.Group = ""
+	if entry.State == "" {
+		entry.State = string(stateCancelled)
+	}
+	b.cacheCancelled(entry)
 	b.lock.Lock()
-	b.cancelled[cancelledKey(entry.Topic, entry.MsgID)] = entry
 	b.clearRetryCount(entry.MsgID)
 	b.lock.Unlock()
 	b.persistCancelled(entry)
+}
+
+func (b *Broker) recordExpired(entry cancelledEntry) {
+	entry.State = string(stateExpired)
+	b.recordCancelled(entry)
 }
 
 func (b *Broker) cancelProcessing(msgID, topic string) bool {
@@ -1088,6 +1312,7 @@ func (b *Broker) cancelProcessing(msgID, topic string) bool {
 	nextOffset := first.NextOffset
 	cancelled := cancelledEntry{
 		Topic:         first.Topic,
+		State:         string(stateCancelled),
 		QueueID:       &queueID,
 		Offset:        &offset,
 		NextOffset:    &nextOffset,
@@ -1107,7 +1332,6 @@ func (b *Broker) cancelProcessing(msgID, topic string) bool {
 			gs.Processing--
 		}
 	}
-	b.cancelled[cancelledKey(topic, msgID)] = cancelled
 	b.clearRetryCount(msgID)
 	b.lock.Unlock()
 
@@ -1116,6 +1340,7 @@ func (b *Broker) cancelProcessing(msgID, topic string) bool {
 			_ = ps.RemoveProcessing(entry.Group, entry.Topic, entry.QueueID, msgID)
 		}
 	}
+	b.cacheCancelled(cancelled)
 	b.persistCancelled(cancelled)
 	return true
 }
@@ -1189,20 +1414,30 @@ func (b *Broker) findPendingMessage(topic, msgID string) (cancelledEntry, bool) 
 	return cancelledEntry{}, false
 }
 
-// ListCancelled returns recent terminated entries for a topic.
-func (b *Broker) ListCancelled(topic string, limit int) []cancelledEntry {
+func (b *Broker) listTerminalByState(topic, state string, limit int) []cancelledEntry {
 	if limit <= 0 {
 		limit = 50
 	}
+	if cs, ok := b.store.(CancelledLookupStore); ok {
+		records, err := cs.ListCancelledByTopic(topic, state, limit)
+		if err == nil {
+			entries := make([]cancelledEntry, 0, len(records))
+			for _, rec := range records {
+				entry := cancelledEntryFromRecord(rec)
+				b.cacheCancelled(entry)
+				entries = append(entries, entry)
+			}
+			return entries
+		}
+	}
 	b.lock.Lock()
+	defer b.lock.Unlock()
 	entries := make([]cancelledEntry, 0)
 	for _, entry := range b.cancelled {
-		if entry.Topic == topic {
+		if entry.Topic == topic && entry.State == state {
 			entries = append(entries, entry)
 		}
 	}
-	b.lock.Unlock()
-
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].CancelledAt.After(entries[j].CancelledAt)
 	})
@@ -1210,6 +1445,16 @@ func (b *Broker) ListCancelled(topic string, limit int) []cancelledEntry {
 		entries = entries[:limit]
 	}
 	return entries
+}
+
+// ListCancelled returns recent cancelled entries for a topic.
+func (b *Broker) ListCancelled(topic string, limit int) []cancelledEntry {
+	return b.listTerminalByState(topic, string(stateCancelled), limit)
+}
+
+// ListExpired returns recent expired entries for a topic.
+func (b *Broker) ListExpired(topic string, limit int) []cancelledEntry {
+	return b.listTerminalByState(topic, string(stateExpired), limit)
 }
 
 // PeekQueueCount returns the number of queues for a topic if already initialized.
@@ -1513,6 +1758,11 @@ func (b *Broker) ListPending(group, topic string, queueID int, cursor *int64, li
 		}
 		if ok {
 			start = off
+		} else {
+			start, err = b.resolveInitialOffset(group, topic, queueID)
+			if err != nil {
+				return nil, 0, err
+			}
 		}
 	}
 
@@ -1532,7 +1782,26 @@ func (b *Broker) ListPending(group, topic string, queueID int, cursor *int64, li
 		}
 		scanCursor = nextCursor
 		for _, msg := range msgs {
-			if b.IsCancelled(topic, msg.ID) {
+			if b.IsTerminal(topic, msg.ID) {
+				continue
+			}
+			if b.shouldExpire(msg.Timestamp) {
+				qid := queueID
+				off := msg.Offset
+				next := msg.Offset + 1
+				b.recordExpired(cancelledEntry{
+					Topic:         topic,
+					QueueID:       &qid,
+					Offset:        &off,
+					NextOffset:    &next,
+					MsgID:         msg.ID,
+					Body:          msg.Body,
+					Tag:           msg.Tag,
+					CorrelationID: msg.CorrelationID,
+					Retry:         msg.Retry,
+					Timestamp:     msg.Timestamp,
+					CancelledAt:   now(),
+				})
 				continue
 			}
 			out = append(out, msg)
@@ -1566,7 +1835,24 @@ func (b *Broker) ListScheduledVisible(topic string, queueID *int, cursor int64, 
 			return out, next
 		}
 		for _, item := range items {
-			if b.IsCancelled(topic, item.Message.ID) {
+			if b.IsTerminal(topic, item.Message.ID) {
+				continue
+			}
+			if b.shouldExpire(item.Message.Timestamp) {
+				qid := item.QueueID
+				scheduledAt := item.ExecuteAt
+				b.recordExpired(cancelledEntry{
+					Topic:         topic,
+					QueueID:       &qid,
+					MsgID:         item.Message.ID,
+					Body:          item.Message.Body,
+					Tag:           item.Message.Tag,
+					CorrelationID: item.Message.CorrelationID,
+					Retry:         item.Message.Retry,
+					Timestamp:     item.Message.Timestamp,
+					ScheduledAt:   &scheduledAt,
+					CancelledAt:   now(),
+				})
 				continue
 			}
 			out = append(out, item)
@@ -1621,7 +1907,7 @@ func (b *Broker) TerminateMessage(msgID, topic string) bool {
 	if topic == "" || msgID == "" {
 		return false
 	}
-	if b.IsCancelled(topic, msgID) {
+	if b.IsTerminal(topic, msgID) {
 		return true
 	}
 	if b.cancelProcessing(msgID, topic) {
@@ -1778,6 +2064,52 @@ func (b *Broker) SetRetryBackoff(base time.Duration, multiplier float64, max tim
 	b.retryBackoffBase = base
 	b.retryBackoffMultiplier = multiplier
 	b.retryBackoffMax = max
+}
+
+// SetMessageRetention sets the retention window used by terminal-expiry checks.
+func (b *Broker) SetMessageRetention(retention time.Duration) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	if retention > 0 {
+		b.messageRetention = retention
+	}
+}
+
+// SetMessageExpiryFactor sets the multiplier applied to retention before auto-expiring a message.
+func (b *Broker) SetMessageExpiryFactor(factor int) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	if factor > 0 {
+		b.messageExpiryFactor = factor
+	}
+}
+
+// SetNewGroupStartPosition sets the initial offset policy for groups without committed offsets.
+func (b *Broker) SetNewGroupStartPosition(position string) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	switch strings.ToLower(strings.TrimSpace(position)) {
+	case "earliest":
+		b.newGroupStartPosition = "earliest"
+	default:
+		b.newGroupStartPosition = "latest"
+	}
+}
+
+// SetCancelledCacheLimit sets the in-memory terminal cache size.
+func (b *Broker) SetCancelledCacheLimit(limit int) {
+	b.lock.Lock()
+	defer b.lock.Unlock()
+	if limit <= 0 {
+		b.cancelledCacheLimit = defaultCancelledCacheLimit
+		return
+	}
+	b.cancelledCacheLimit = limit
+	for len(b.cancelled) > b.cancelledCacheLimit && len(b.cancelledOrder) > 0 {
+		oldest := b.cancelledOrder[0]
+		b.cancelledOrder = b.cancelledOrder[1:]
+		delete(b.cancelled, oldest)
+	}
 }
 
 // CalculateRetryBackoff returns the retry backoff delay for the given retry count.

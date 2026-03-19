@@ -33,15 +33,19 @@ type BrokerConfig struct {
 	RetryBackoffBase       time.Duration `mapstructure:"retry_backoff_base" yaml:"retry_backoff_base"`
 	RetryBackoffMultiplier float64       `mapstructure:"retry_backoff_multiplier" yaml:"retry_backoff_multiplier"`
 	RetryBackoffMax        time.Duration `mapstructure:"retry_backoff_max" yaml:"retry_backoff_max"`
+	MessageRetention       time.Duration `mapstructure:"message_retention" yaml:"message_retention"`
+	MessageExpiryFactor    int           `mapstructure:"message_expiry_factor" yaml:"message_expiry_factor"`
+	NewGroupStartPosition  string        `mapstructure:"new_group_start_position" yaml:"new_group_start_position"`
+	CancelledCacheLimit    int           `mapstructure:"cancelled_cache_limit" yaml:"cancelled_cache_limit"`
 }
 
 // StorageConfig holds storage configuration.
 type StorageConfig struct {
-	FlushInterval     time.Duration `mapstructure:"flush_interval" yaml:"flush_interval"`
-	CompactInterval   time.Duration `mapstructure:"compact_interval" yaml:"compact_interval"`
-	CompactThreshold  int64         `mapstructure:"compact_threshold" yaml:"compact_threshold"`
-	MaxRecordSize     int           `mapstructure:"max_record_size" yaml:"max_record_size"`
-	BufferSize        int           `mapstructure:"buffer_size" yaml:"buffer_size"`
+	FlushInterval    time.Duration `mapstructure:"flush_interval" yaml:"flush_interval"`
+	CompactInterval  time.Duration `mapstructure:"compact_interval" yaml:"compact_interval"`
+	CompactThreshold int64         `mapstructure:"compact_threshold" yaml:"compact_threshold"`
+	MaxRecordSize    int           `mapstructure:"max_record_size" yaml:"max_record_size"`
+	BufferSize       int           `mapstructure:"buffer_size" yaml:"buffer_size"`
 }
 
 // LoggingConfig holds logging configuration.
@@ -62,15 +66,15 @@ func Load() (*Config, error) {
 	v.SetEnvPrefix("MQ")
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
-	
+
 	// Set defaults
 	v.SetDefault("admin_key", "")
-	
+
 	// Server defaults
 	v.SetDefault("server.port", 8080)
 	v.SetDefault("server.host", "")
 	v.SetDefault("server.shutdown_timeout", "10s")
-	
+
 	// Broker defaults
 	v.SetDefault("broker.queue_count", 4)
 	v.SetDefault("broker.max_retry", 3)
@@ -80,14 +84,18 @@ func Load() (*Config, error) {
 	v.SetDefault("broker.retry_backoff_base", "1s")
 	v.SetDefault("broker.retry_backoff_multiplier", 2.0)
 	v.SetDefault("broker.retry_backoff_max", "60s")
-	
+	v.SetDefault("broker.message_retention", "168h")
+	v.SetDefault("broker.message_expiry_factor", 2)
+	v.SetDefault("broker.new_group_start_position", "latest")
+	v.SetDefault("broker.cancelled_cache_limit", 10000)
+
 	// Storage defaults
 	v.SetDefault("storage.flush_interval", "100ms")
 	v.SetDefault("storage.compact_interval", "5m")
 	v.SetDefault("storage.compact_threshold", 10*1024*1024) // 10MB
 	v.SetDefault("storage.max_record_size", 64*1024*1024)   // 64MB
 	v.SetDefault("storage.buffer_size", 64*1024)            // 64KB
-	
+
 	// Logging defaults
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.output_path", "stdout")

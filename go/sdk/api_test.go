@@ -143,6 +143,14 @@ func (suite *APITestSuite) consumeBatchUntil(topic, group string, deadline time.
 	return nil
 }
 
+func (suite *APITestSuite) primeGroup(topic, group, tag string) {
+	resp, errResp, err := suite.api.ConsumeMessages(topic, group, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(resp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+}
+
 func (suite *APITestSuite) TestListAccessKeys() {
 	resp, errResp, err := suite.api.ListAccessKeys()
 	suite.NoError(err)
@@ -225,6 +233,7 @@ func (suite *APITestSuite) TestDelayProduceWithConsume() {
 	topic := suite.newTopic("delay-produce", broker.TopicTypeDelay)
 	group := suite.newGroup("delay-group")
 	tag := "test-tag"
+	suite.primeGroup(topic, group, tag)
 
 	expected := map[string]string{}
 	for i := 0; i < 2; i++ {
@@ -304,6 +313,7 @@ func (suite *APITestSuite) TestConsumeMessages() {
 	group := suite.newGroup("consume-group")
 	tag := "test-tag"
 	correlationID := "consume-cid-" + uuid.NewString()
+	suite.primeGroup(topic, group, tag)
 
 	produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, "Hello, consume!", client.WithCorrelationID(correlationID))
 	suite.NoError(err)
@@ -323,6 +333,7 @@ func (suite *APITestSuite) TestBatchProduceConsume() {
 	topic := suite.newTopic("batch-topic", broker.TopicTypeNormal)
 	group := suite.newGroup("batch-group")
 	tag := "batch-tag"
+	suite.primeGroup(topic, group, tag)
 
 	messages := []client.ProduceBatchMessage{
 		{Body: "batch-1", Tag: tag, CorrelationID: "batch-cid-1"},
@@ -375,6 +386,8 @@ func (suite *APITestSuite) TestListMessages() {
 
 	normalTopic := suite.newTopic("list-normal", broker.TopicTypeNormal)
 	delayTopic := suite.newTopic("list-delay", broker.TopicTypeDelay)
+	suite.primeGroup(normalTopic, group, tag)
+	suite.primeGroup(delayTopic, group, tag)
 
 	correlations := make([]string, 0, 5)
 	for i := 0; i < 5; i++ {
@@ -580,6 +593,92 @@ func (suite *APITestSuite) TestTerminateBatchMessages() {
 	suite.Nil(consumeResp)
 	suite.NotNil(errResp)
 	suite.Equal("not_found", errResp.Code)
+}
+
+func (suite *APITestSuite) TestNewGroupStartsAtLatest() {
+	topic := suite.newTopic("latest-start-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("latest-start-group")
+	tag := "latest-tag"
+
+	_, errResp, err := suite.api.ProduceMessage(topic, tag, "historical-message")
+	suite.NoError(err)
+	suite.Nil(errResp)
+
+	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, group, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+
+	freshCorrelationID := "latest-cid-" + uuid.NewString()
+	freshResp, errResp, err := suite.api.ProduceMessage(topic, tag, "fresh-message", client.WithCorrelationID(freshCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(freshResp)
+
+	consumeResp = suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(freshResp.Data.ID, consumeResp.Data.Message.ID)
+	suite.Equal(freshCorrelationID, consumeResp.Data.Message.CorrelationID)
+}
+
+func (suite *APITestSuite) TestSubscriptionConflict() {
+	topic := suite.newTopic("subscription-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("subscription-group")
+
+	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, group, "tag-a", client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+
+	consumeResp, errResp, err = suite.api.ConsumeMessages(topic, group, "tag-b", client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("subscription_conflict", errResp.Code)
+}
+
+func (suite *APITestSuite) TestExpiredMessagesAreFiltered() {
+	topic := suite.newTopic("expired-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("expired-group")
+	tag := "expired-tag"
+	suite.primeGroup(topic, group, tag)
+
+	suite.broker.SetMessageRetention(time.Second)
+	suite.broker.SetMessageExpiryFactor(2)
+	defer suite.broker.SetMessageRetention(7 * 24 * time.Hour)
+	defer suite.broker.SetMessageExpiryFactor(2)
+
+	oldID := uuid.NewString()
+	err := suite.store.Append(topic, 0, storage.Message{
+		ID:            oldID,
+		Body:          "expired-message",
+		Tag:           tag,
+		CorrelationID: "expired-cid",
+		Timestamp:     time.Now().Add(-3 * time.Second),
+	})
+	suite.NoError(err)
+
+	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, group, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+
+	expiredResp, errResp, err := suite.api.ListMessages(topic, group, "expired", client.WithListLimit(10))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(expiredResp)
+	suite.Equal("expired", expiredResp.Data.State)
+	foundExpired := false
+	for _, msg := range expiredResp.Data.Messages {
+		if msg.ID == oldID {
+			foundExpired = true
+			suite.Equal("expired-cid", msg.CorrelationID)
+			break
+		}
+	}
+	suite.True(foundExpired)
 }
 
 func (suite *APITestSuite) TestGetFullStats() {

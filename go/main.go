@@ -60,13 +60,21 @@ func main() {
 	b.SetMaxRetry(cfg.Broker.MaxRetry)
 	b.SetProcessingTimeout(cfg.Broker.ProcessingTimeout)
 	b.SetRetryBackoff(cfg.Broker.RetryBackoffBase, cfg.Broker.RetryBackoffMultiplier, cfg.Broker.RetryBackoffMax)
+	b.SetMessageRetention(cfg.Broker.MessageRetention)
+	b.SetMessageExpiryFactor(cfg.Broker.MessageExpiryFactor)
+	b.SetNewGroupStartPosition(cfg.Broker.NewGroupStartPosition)
+	b.SetCancelledCacheLimit(cfg.Broker.CancelledCacheLimit)
 	logger.Info("Broker initialized",
 		zap.Int("queue_count", cfg.Broker.QueueCount),
 		zap.Int("max_retry", cfg.Broker.MaxRetry),
 		zap.Duration("processing_timeout", cfg.Broker.ProcessingTimeout),
 		zap.Duration("retry_backoff_base", cfg.Broker.RetryBackoffBase),
 		zap.Float64("retry_backoff_multiplier", cfg.Broker.RetryBackoffMultiplier),
-		zap.Duration("retry_backoff_max", cfg.Broker.RetryBackoffMax))
+		zap.Duration("retry_backoff_max", cfg.Broker.RetryBackoffMax),
+		zap.Duration("message_retention", cfg.Broker.MessageRetention),
+		zap.Int("message_expiry_factor", cfg.Broker.MessageExpiryFactor),
+		zap.String("new_group_start_position", cfg.Broker.NewGroupStartPosition),
+		zap.Int("cancelled_cache_limit", cfg.Broker.CancelledCacheLimit))
 
 	r := api.NewRouter(b)
 

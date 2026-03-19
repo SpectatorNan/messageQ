@@ -773,6 +773,9 @@ func (w *WALStorage) Stats() (map[string]interface{}, error) {
 // ConsumeQueueDepth returns the number of entries in the consumequeue for a topic/queue.
 // Each entry is cqEntrySize (20) bytes.
 func (w *WALStorage) ConsumeQueueDepth(topic string, queueID int) int64 {
+	if err := w.FlushTopic(topic, queueID); err != nil {
+		return 0
+	}
 	cqPath := w.consumeQueueFile(topic, queueID)
 	info, err := os.Stat(cqPath)
 	if err != nil {
