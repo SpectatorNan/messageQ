@@ -26,6 +26,10 @@ type BinaryDelayScheduler struct {
 	initialized  bool
 }
 
+type delaySnapshotStore interface {
+	ReplaceTopicMessages(topic string, queueID int, msgs []storage.Message) error
+}
+
 // NewBinaryDelayScheduler creates a scheduler using binary CommitLog storage
 func NewBinaryDelayScheduler(store storage.Storage, tm *TopicManager) (*BinaryDelayScheduler, error) {
 	ds := &BinaryDelayScheduler{
@@ -235,9 +239,21 @@ func (ds *BinaryDelayScheduler) persistToCommitLog() error {
 		buf = append(buf, msgBinary...)
 	}
 
-	// Write to system topic (queue 0)
-	// Use special message with body containing the binary data
-	// Generate a proper UUID for the message ID
+	if rs, ok := ds.store.(delaySnapshotStore); ok {
+		if count == 0 {
+			return rs.ReplaceTopicMessages(SystemDelayTopic, 0, nil)
+		}
+		metaMsg := storage.Message{
+			ID:        uuid.New().String(),
+			Body:      string(buf), // Store binary as string
+			Tag:       "__DELAY_META__",
+			Retry:     0,
+			Timestamp: time.Now(),
+		}
+		return rs.ReplaceTopicMessages(SystemDelayTopic, 0, []storage.Message{metaMsg})
+	}
+
+	// Fallback for non-WAL stores keeps the historical append-only snapshot behavior.
 	metaMsg := storage.Message{
 		ID:        uuid.New().String(),
 		Body:      string(buf), // Store binary as string
@@ -245,8 +261,6 @@ func (ds *BinaryDelayScheduler) persistToCommitLog() error {
 		Retry:     0,
 		Timestamp: time.Now(),
 	}
-
-	// Always append to queue 0 of system topic, overwrite by reading latest
 	return ds.store.Append(SystemDelayTopic, 0, metaMsg)
 }
 

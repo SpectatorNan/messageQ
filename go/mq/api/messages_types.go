@@ -161,6 +161,7 @@ type (
 		ScheduledAt   *int64 `json:"scheduledAt,omitempty"`
 		ConsumedAt    *int64 `json:"consumedAt,omitempty"`
 		AckedAt       *int64 `json:"ackedAt,omitempty"`
+		EventAt       *int64 `json:"eventAt,omitempty"`
 		QueueID       *int   `json:"queueId,omitempty"`
 		Offset        *int64 `json:"offset,omitempty"`
 		NextOffset    *int64 `json:"nextOffset,omitempty"`
@@ -242,7 +243,7 @@ func (r *ListMessagesRequest) Validate() error {
 		logger.Warn("Invalid group name", zap.String("group", r.GroupName))
 		return err
 	}
-	if r.State != "" && r.State != "processing" && r.State != "acked" && r.State != "completed" && r.State != "pending" && r.State != "scheduled" && r.State != "cancelled" && r.State != "expired" {
+	if r.State != "" && r.State != "processing" && r.State != "acked" && r.State != "completed" && r.State != "pending" && r.State != "scheduled" && r.State != "cancelled" && r.State != "expired" && r.State != "retry" && r.State != "dlq" {
 		return errx.ErrInvalidMessage
 	}
 	if (r.State == "pending" || r.State == "scheduled") && r.QueueId != nil && *r.QueueId < 0 {

@@ -621,6 +621,85 @@ func (w *WALStorage) withTopicCompaction(topic string, queueID int, fn func() er
 	return fn()
 }
 
+func parseSegmentIDFromPath(path string) (uint32, error) {
+	name := filepath.Base(path)
+	if filepath.Ext(name) != ".wal" {
+		return 0, fmt.Errorf("invalid segment path %s", path)
+	}
+	base := name[:len(name)-len(".wal")]
+	n, err := strconv.ParseUint(base, 10, 32)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(n), nil
+}
+
+func segmentHasMessages(path string) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	return info.Size() > walHeaderSize, nil
+}
+
+func (w *WALStorage) consumedSegmentCandidates(topic string, queueID int, base, cutoffOffset int64, latestSegID uint32) ([]uint32, error) {
+	if cutoffOffset <= base {
+		return nil, nil
+	}
+	cqPath := w.consumeQueueFile(topic, queueID)
+	f, err := os.Open(cqPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	seen := make(map[uint32]struct{})
+	candidates := make([]uint32, 0)
+	logicalOffset := base
+	var currentSeg uint32
+	haveCurrent := false
+
+	for {
+		var buf [cqEntrySize]byte
+		if _, err := io.ReadFull(f, buf[:]); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				if haveCurrent && logicalOffset <= cutoffOffset && currentSeg != latestSegID {
+					if _, ok := seen[currentSeg]; !ok {
+						candidates = append(candidates, currentSeg)
+					}
+				}
+				return candidates, nil
+			}
+			return nil, err
+		}
+		segID := binary.BigEndian.Uint32(buf[0:4])
+		if !haveCurrent {
+			currentSeg = segID
+			haveCurrent = true
+			logicalOffset++
+			continue
+		}
+		if segID != currentSeg {
+			if currentSeg != latestSegID {
+				if logicalOffset <= cutoffOffset {
+					if _, ok := seen[currentSeg]; !ok {
+						seen[currentSeg] = struct{}{}
+						candidates = append(candidates, currentSeg)
+					}
+				}
+			}
+			if logicalOffset >= cutoffOffset {
+				return candidates, nil
+			}
+			currentSeg = segID
+		}
+		logicalOffset++
+	}
+}
+
 func (w *WALStorage) segmentEligibleForPrune(path string, cutoff time.Time) ([]Message, bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -668,6 +747,108 @@ func (w *WALStorage) currentPruneObserver() func(topic string, queueID int, msg 
 	return w.pruneObserver
 }
 
+// PruneConsumedSegments deletes sealed segments whose consumequeue entries are all before cutoffOffset.
+func (w *WALStorage) PruneConsumedSegments(topic string, queueID int, cutoffOffset int64) (int, error) {
+	if cutoffOffset <= 0 || isRetentionExemptTopic(topic) {
+		return 0, nil
+	}
+	deleted := 0
+	err := w.withTopicCompaction(topic, queueID, func() error {
+		if err := w.FlushTopic(topic, queueID); err != nil {
+			return err
+		}
+
+		w.mu.Lock()
+		base, err := w.getConsumeQueueBaseOffsetLocked(topic, queueID)
+		w.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		cqPath := w.consumeQueueFile(topic, queueID)
+		info, err := os.Stat(cqPath)
+		tail := base
+		if err == nil {
+			tail += info.Size() / cqEntrySize
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if cutoffOffset > tail {
+			cutoffOffset = tail
+		}
+		if cutoffOffset <= base {
+			return nil
+		}
+
+		segs, err := w.listTopicSegments(topic, queueID)
+		if err != nil {
+			return err
+		}
+		if len(segs) == 0 {
+			return nil
+		}
+
+		if cutoffOffset >= tail {
+			hasMessages, err := segmentHasMessages(segs[len(segs)-1])
+			if err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			if err == nil && hasMessages {
+				if err := w.rotateSegment(topic, queueID); err != nil {
+					return err
+				}
+				if err := w.FlushTopic(topic, queueID); err != nil {
+					return err
+				}
+				segs, err = w.listTopicSegments(topic, queueID)
+				if err != nil {
+					return err
+				}
+				if len(segs) == 0 {
+					return nil
+				}
+			}
+		}
+
+		latestSegID, err := parseSegmentIDFromPath(segs[len(segs)-1])
+		if err != nil {
+			return err
+		}
+		candidates, err := w.consumedSegmentCandidates(topic, queueID, base, cutoffOffset, latestSegID)
+		if err != nil {
+			return err
+		}
+		if len(candidates) == 0 {
+			return nil
+		}
+
+		candidateSet := make(map[uint32]struct{}, len(candidates))
+		for _, segID := range candidates {
+			candidateSet[segID] = struct{}{}
+		}
+		commitDir := w.commitLogDir(topic, queueID)
+		for _, seg := range segs[:len(segs)-1] {
+			segID, err := parseSegmentIDFromPath(seg)
+			if err != nil {
+				return err
+			}
+			if _, ok := candidateSet[segID]; !ok {
+				continue
+			}
+			if err := os.Remove(seg); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			deleted++
+		}
+		if deleted > 0 {
+			if err := syncDir(commitDir); err != nil {
+				return err
+			}
+		}
+		return w.trimConsumeQueueHead(topic, queueID)
+	})
+	return deleted, err
+}
+
 // Compact no longer rewrites commitlog segments because consumequeue entries retain
 // physical segment positions. Safe retention cleanup happens via PruneExpiredSegments.
 func (w *WALStorage) Compact(topic string, queueID int) error {
@@ -679,6 +860,9 @@ func (w *WALStorage) Compact(topic string, queueID int) error {
 // any missing historical segments.
 func (w *WALStorage) PruneExpiredSegments(topic string, queueID int, cutoff time.Time) error {
 	if cutoff.IsZero() {
+		return nil
+	}
+	if isRetentionExemptTopic(topic) {
 		return nil
 	}
 	return w.withTopicCompaction(topic, queueID, func() error {

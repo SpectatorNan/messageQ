@@ -14,7 +14,10 @@ import (
 type ProcessingRecord struct {
 	Group         string    `json:"group"`
 	Topic         string    `json:"topic"`
+	StorageTopic  string    `json:"storage_topic,omitempty"`
 	QueueID       int       `json:"queue_id"`
+	Offset        *int64    `json:"offset,omitempty"`
+	NextOffset    *int64    `json:"next_offset,omitempty"`
 	MsgID         string    `json:"msg_id"`
 	Body          string    `json:"body"`
 	Tag           string    `json:"tag"`

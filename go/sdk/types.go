@@ -181,6 +181,7 @@ type (
 		ScheduledAt   *FlexibleUnix `json:"scheduledAt,omitempty"`
 		ConsumedAt    *FlexibleUnix `json:"consumedAt,omitempty"`
 		AckedAt       *FlexibleUnix `json:"ackedAt,omitempty"`
+		EventAt       *FlexibleUnix `json:"eventAt,omitempty"`
 		QueueID       *int          `json:"queueId,omitempty"`
 		Offset        *int64        `json:"offset,omitempty"`
 		NextOffset    *int64        `json:"nextOffset,omitempty"`

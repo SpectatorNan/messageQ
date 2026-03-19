@@ -464,6 +464,90 @@ func (suite *APITestSuite) TestListMessages() {
 	suite.Equal(delayCorrelationID, scheduledResp.Data.Messages[0].CorrelationID)
 }
 
+func (suite *APITestSuite) TestListRetryEvents() {
+	topic := suite.newTopic("retry-history-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("retry-history-group")
+	tag := "retry-history-tag"
+	suite.primeGroup(topic, group, tag)
+
+	retryCorrelationID := "retry-history-cid-" + uuid.NewString()
+	produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, "retry-me", client.WithCorrelationID(retryCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(produceResp)
+
+	consumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(produceResp.Data.ID, consumeResp.Data.Message.ID)
+
+	nackResp, errResp, err := suite.api.NackMessage(topic, group, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(nackResp)
+	suite.True(nackResp.Data.Nacked)
+
+	retryResp, errResp, err := suite.api.ListMessages(topic, group, "retry", client.WithListLimit(10))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(retryResp)
+	suite.Equal("retry", retryResp.Data.State)
+
+	foundRetry := false
+	for _, msg := range retryResp.Data.Messages {
+		if msg.ID == produceResp.Data.ID {
+			foundRetry = true
+			suite.Equal(retryCorrelationID, msg.CorrelationID)
+			suite.NotNil(msg.EventAt)
+			suite.NotNil(msg.ScheduledAt)
+			suite.NotNil(msg.ConsumedAt)
+			break
+		}
+	}
+	suite.True(foundRetry)
+}
+
+func (suite *APITestSuite) TestListDLQEvents() {
+	topic := suite.newTopic("dlq-history-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("dlq-history-group")
+	tag := "dlq-history-tag"
+	suite.primeGroup(topic, group, tag)
+
+	suite.broker.SetMaxRetry(0)
+	defer suite.broker.SetMaxRetry(3)
+
+	dlqCorrelationID := "dlq-history-cid-" + uuid.NewString()
+	produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, "dlq-me", client.WithCorrelationID(dlqCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(produceResp)
+
+	consumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(produceResp.Data.ID, consumeResp.Data.Message.ID)
+
+	nackResp, errResp, err := suite.api.NackMessage(topic, group, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(nackResp)
+	suite.True(nackResp.Data.Nacked)
+
+	dlqResp, errResp, err := suite.api.ListMessages(topic, group, "dlq", client.WithListLimit(10))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(dlqResp)
+	suite.Equal("dlq", dlqResp.Data.State)
+
+	foundDLQ := false
+	for _, msg := range dlqResp.Data.Messages {
+		if msg.ID == produceResp.Data.ID {
+			foundDLQ = true
+			suite.Equal(dlqCorrelationID, msg.CorrelationID)
+			suite.NotNil(msg.EventAt)
+			suite.NotNil(msg.ConsumedAt)
+			break
+		}
+	}
+	suite.True(foundDLQ)
+}
+
 func (suite *APITestSuite) TestTerminateMessage() {
 	topic := suite.newTopic("terminate-topic", broker.TopicTypeNormal)
 	groupA := suite.newGroup("terminate-group-a")

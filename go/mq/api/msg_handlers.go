@@ -349,13 +349,14 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 
 		tag := req.Tag
 		var msgs []storage.MessageWithOffset
+		var storageTopic string
 		var queueID int
 		var err error
 
 		if req.QueueId != nil {
 
 			queueID = *req.QueueId
-			msgs, err = b.ConsumeVisibleWithRetry(req.GroupName, req.Topic, queueID, tag, 1)
+			msgs, storageTopic, err = b.ConsumeVisibleWithRetry(req.GroupName, req.Topic, queueID, tag, 1)
 			if err != nil {
 				logger.Error("Consume error", zap.String("group", req.GroupName), zap.String("topic", req.Topic), zap.Error(err))
 				respx.FailGin(c, errx.ErrOffsetUnsupported)
@@ -367,7 +368,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 			start := consumeRRStart(req.GroupName, req.Topic, tag, queueCount)
 			for i := 0; i < queueCount; i++ {
 				idx := (start + i) % queueCount
-				msgs, err = b.ConsumeVisibleWithRetry(req.GroupName, req.Topic, idx, tag, 1)
+				msgs, storageTopic, err = b.ConsumeVisibleWithRetry(req.GroupName, req.Topic, idx, tag, 1)
 				if err != nil {
 					continue // 跳过出错的队列
 				}
@@ -394,7 +395,7 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 		msg := msgs[0]
 		offset := msg.Offset
 		next := msg.Offset + 1
-		b.BeginProcessing(req.GroupName, req.Topic, queueID, offset, next, queue.Message{
+		b.BeginProcessing(req.GroupName, req.Topic, storageTopic, queueID, offset, next, queue.Message{
 			ID:            msg.ID,
 			Body:          msg.Body,
 			Tag:           msg.Tag,
@@ -481,13 +482,14 @@ func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
 
 		tag := req.Tag
 		var msgs []storage.MessageWithOffset
+		var storageTopic string
 		var queueID int
 		var err error
 		out := make([]ConsumeBatchMessage, 0, max)
 
 		if req.QueueId != nil {
 			queueID = *req.QueueId
-			msgs, err = b.ConsumeVisibleWithRetry(req.GroupName, req.Topic, queueID, tag, max)
+			msgs, storageTopic, err = b.ConsumeVisibleWithRetry(req.GroupName, req.Topic, queueID, tag, max)
 			if err != nil {
 				logger.Error("Consume batch error", zap.String("group", req.GroupName), zap.String("topic", req.Topic), zap.Error(err))
 				respx.FailGin(c, errx.ErrOffsetUnsupported)
@@ -505,7 +507,7 @@ func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
 					Offset:        msg.Offset,
 					NextOffset:    msg.Offset + 1,
 				})
-				b.BeginProcessing(req.GroupName, req.Topic, queueID, msg.Offset, msg.Offset+1, queue.Message{
+				b.BeginProcessing(req.GroupName, req.Topic, storageTopic, queueID, msg.Offset, msg.Offset+1, queue.Message{
 					ID:            msg.ID,
 					Body:          msg.Body,
 					Tag:           msg.Tag,
@@ -522,7 +524,7 @@ func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
 			for i := 0; i < queueCount && remaining > 0; i++ {
 				idx := (start + i) % queueCount
 				lastIdx = idx
-				msgs, err = b.ConsumeVisibleWithRetry(req.GroupName, req.Topic, idx, tag, remaining)
+				msgs, storageTopic, err = b.ConsumeVisibleWithRetry(req.GroupName, req.Topic, idx, tag, remaining)
 				if err != nil {
 					continue
 				}
@@ -541,7 +543,7 @@ func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
 						Offset:        msg.Offset,
 						NextOffset:    msg.Offset + 1,
 					})
-					b.BeginProcessing(req.GroupName, req.Topic, idx, msg.Offset, msg.Offset+1, queue.Message{
+					b.BeginProcessing(req.GroupName, req.Topic, storageTopic, idx, msg.Offset, msg.Offset+1, queue.Message{
 						ID:            msg.ID,
 						Body:          msg.Body,
 						Tag:           msg.Tag,
@@ -771,6 +773,67 @@ func ListMessagesHandler(b *broker.Broker) gin.HandlerFunc {
 				})
 			}
 			resp.Messages = msgs
+		case "retry", "dlq":
+			entries := b.ListDeliveryEvents(req.GroupName, req.Topic, req.State, limit)
+			if req.Tag != "" {
+				filtered := entries[:0]
+				for _, entry := range entries {
+					if entry.Tag == req.Tag {
+						filtered = append(filtered, entry)
+					}
+				}
+				entries = filtered
+			}
+			cursor := int64(0)
+			if req.Cursor != nil {
+				cursor = *req.Cursor
+			}
+			start := int(cursor)
+			if start < 0 {
+				start = 0
+			}
+			if start > len(entries) {
+				start = len(entries)
+			}
+			end := start + limit
+			if end > len(entries) {
+				end = len(entries)
+			}
+			page := entries[start:end]
+			if end < len(entries) {
+				nc := int64(end)
+				resp.NextCursor = &nc
+			}
+			msgs := make([]MessageStatus, 0, len(page))
+			for _, entry := range page {
+				eventAt := entry.EventAt.Unix()
+				var scheduledAt *int64
+				if entry.ScheduledAt != nil {
+					v := entry.ScheduledAt.Unix()
+					scheduledAt = &v
+				}
+				var consumedAt *int64
+				if entry.ConsumedAt != nil {
+					v := entry.ConsumedAt.Unix()
+					consumedAt = &v
+				}
+				msgs = append(msgs, MessageStatus{
+					ID:            entry.MsgID,
+					Body:          entry.Body,
+					Tag:           entry.Tag,
+					CorrelationID: entry.CorrelationID,
+					Retry:         entry.Retry,
+					Timestamp:     entry.Timestamp.Unix(),
+					ScheduledAt:   scheduledAt,
+					ConsumedAt:    consumedAt,
+					EventAt:       &eventAt,
+					QueueID:       entry.QueueID,
+					Offset:        entry.Offset,
+					NextOffset:    entry.NextOffset,
+				})
+			}
+			resp.State = req.State
+			resp.Messages = msgs
 		case "cancelled":
 			entries := b.ListCancelled(req.Topic, limit)
 			if req.Tag != "" {
@@ -930,7 +993,13 @@ func AckHandler(b *broker.Broker) gin.HandlerFunc {
 			return
 		}
 
-		if !b.CompleteProcessing(req.ID, req.GroupName, req.Topic) {
+		acked, err := b.CompleteProcessing(req.ID, req.GroupName, req.Topic)
+		if err != nil {
+			logger.Error("Ack failed - persist ack state", zap.String("message_id", req.ID), zap.Error(err))
+			respx.FailGin(c, err)
+			return
+		}
+		if !acked {
 			logger.Error("Ack failed - message not found", zap.String("message_id", req.ID))
 			respx.FailGin(c, errx.ErrNotFound)
 			return

@@ -15,6 +15,7 @@ import (
 type CancelledRecord struct {
 	Group         string     `json:"group"`
 	Topic         string     `json:"topic"`
+	StorageTopic  string     `json:"storage_topic,omitempty"`
 	MsgID         string     `json:"msg_id"`
 	State         string     `json:"state,omitempty"`
 	Body          string     `json:"body,omitempty"`
@@ -33,6 +34,9 @@ type CancelledRecord struct {
 func normalizeCancelledRecord(rec *CancelledRecord) {
 	if rec.State == "" {
 		rec.State = "cancelled"
+	}
+	if rec.StorageTopic == "" {
+		rec.StorageTopic = rec.Topic
 	}
 }
 
@@ -196,4 +200,21 @@ func (w *WALStorage) ListCancelledByTopic(topic, state string, limit int) ([]Can
 		entries = entries[:limit]
 	}
 	return entries, nil
+}
+
+// DeleteCancelled removes a persisted terminal record for a topic/message.
+func (w *WALStorage) DeleteCancelled(topic, msgID string) error {
+	if topic == "" || msgID == "" {
+		return fmt.Errorf("invalid cancelled key")
+	}
+	path := filepath.Join(w.baseDir, "cancelled", topic, msgID+".json")
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	dir := filepath.Dir(path)
+	_ = syncDir(dir)
+	return nil
 }

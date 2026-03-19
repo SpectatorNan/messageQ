@@ -350,13 +350,17 @@ curl -X POST \
 - `scheduled`
 - `processing`
 - `completed`
+- `retry`
+- `dlq`
 - `cancelled`
 - `expired`
 
 **说明：**
-- `pending` / `scheduled` / `processing` / `completed` / `cancelled` / `expired` 响应里的消息对象都会返回 `correlationId`
+- `pending` / `scheduled` / `processing` / `completed` / `retry` / `dlq` / `cancelled` / `expired` 响应里的消息对象都会返回 `correlationId`
 - 查询 `cancelled` 可看到 topic 上已终止消息；该视图不区分消费组，同一 topic 的任意 group 查询结果一致
 - 查询 `expired` 可看到超过保留窗口后被系统自动终止的消息；这些消息也可能在后台 retention sweep 删除旧 segment 前被补记为 `expired`
+- 对于长期未 ack 的 `processing` 消息，若其原始消息时间已经超过过期窗口，则超时检查会直接将其记为 `expired`，而不是继续无限重试
+- 查询 `retry` / `dlq` 返回该 `group+topic` 的最近投递事件视图，来源于持久化 delivery event log；`retry` 事件会返回 `eventAt`（进入重试的时间）和 `scheduledAt`（下一次计划投递时间），并且包含 broker 重启恢复时补发的 retry 事件；`dlq` 事件会返回 `eventAt`（进入死信队列的时间）
 - 被终止或过期的消息不会出现在 `pending`、`scheduled` 以及实际消费结果中
 
 **`cancelled` 响应示例：**
