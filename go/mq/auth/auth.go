@@ -1,9 +1,10 @@
 package auth
 
 import (
+	"strings"
+
 	"github.com/SpectatorNan/messageQ/go/mq/errx"
 	"github.com/SpectatorNan/messageQ/go/mq/respx"
-	"strings"
 
 	"github.com/SpectatorNan/messageQ/go/mq/broker"
 
@@ -25,7 +26,8 @@ func AuthMiddleware(b *broker.Broker, adminAK string) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if ak == adminAK || b.IsAKValid(ak) {
+		isAccess := b.IsAKValid(ak)
+		if ak == adminAK || isAccess {
 			c.Next()
 			return
 		}

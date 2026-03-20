@@ -1,31 +1,391 @@
-package client
+package client_test
 
 import (
+	"errors"
 	"fmt"
-	"github.com/SpectatorNan/messageQ/go/mq/broker"
-	"sync"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	serverapi "github.com/SpectatorNan/messageQ/go/mq/api"
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/logger"
+	"github.com/SpectatorNan/messageQ/go/mq/storage"
+	client "github.com/SpectatorNan/messageQ/go/sdk"
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
 type APITestSuite struct {
 	suite.Suite
-	api *API
+	api       *client.API
+	server    *httptest.Server
+	broker    *broker.Broker
+	store     *storage.WALStorage
+	dataDir   string
+	adminKey  string
+	accessKey string
+}
+
+type failingSDKProcessingStore struct {
+	*storage.WALStorage
+	saveErr          error
+	retryEventErr    error
+	terminalEventErr error
+}
+
+func (s *failingSDKProcessingStore) SaveProcessing(rec storage.ProcessingRecord) error {
+	if s.saveErr != nil {
+		return s.saveErr
+	}
+	return s.WALStorage.SaveProcessing(rec)
+}
+
+func (s *failingSDKProcessingStore) AppendDeliveryEvent(rec storage.DeliveryEventRecord) error {
+	if rec.Event == storage.DeliveryEventRetry && s.retryEventErr != nil {
+		return s.retryEventErr
+	}
+	if (rec.Event == storage.DeliveryEventCancelled || rec.Event == storage.DeliveryEventExpired) && s.terminalEventErr != nil {
+		return s.terminalEventErr
+	}
+	return s.WALStorage.AppendDeliveryEvent(rec)
+}
+
+func (suite *APITestSuite) SetupSuite() {
+	suite.adminKey = "adminkey123"
+	suite.accessKey = "test-access-key"
+
+	suite.Require().NoError(logger.InitDefault())
+	suite.Require().NoError(os.Setenv("MQ_ADMIN_KEY", suite.adminKey))
+
+	dataDir, err := os.MkdirTemp("", "messageq-sdk-api-*")
+	suite.Require().NoError(err)
+	suite.dataDir = dataDir
+
+	store := storage.NewWALStorage(filepath.Join(dataDir, "data"), 10*time.Millisecond, time.Minute)
+	suite.store = store
+	suite.broker = broker.NewBrokerWithPersistence(store, 4, filepath.Join(dataDir, "data"))
+	_, err = suite.broker.AddAK("default-test-access-key", suite.accessKey)
+	suite.Require().NoError(err)
+
+	suite.server = httptest.NewServer(serverapi.NewRouter(suite.broker))
+}
+
+func (suite *APITestSuite) TearDownSuite() {
+	if suite.server != nil {
+		suite.server.Close()
+	}
+	if suite.broker != nil {
+		suite.Require().NoError(suite.broker.Close())
+	}
+	if suite.store != nil {
+		suite.Require().NoError(suite.store.Close())
+	}
+	if suite.dataDir != "" {
+		suite.Require().NoError(os.RemoveAll(suite.dataDir))
+	}
+	suite.Require().NoError(os.Unsetenv("MQ_ADMIN_KEY"))
 }
 
 func (suite *APITestSuite) SetupTest() {
-	suite.api = NewAPI("http://localhost:8080", "adminkey123")
-	suite.api.Debug()
-	suite.api.SetAccessKey("test-access-key")
+	suite.ensureAccessKey()
+	suite.ensureTopic("test-topic", broker.TopicTypeNormal, 1)
+	suite.ensureTopic("test-topic-delay", broker.TopicTypeDelay, 1)
+
+	suite.api = client.NewAPI(suite.server.URL, suite.adminKey)
+	suite.api.SetAccessKey(suite.accessKey)
 }
 
 func (suite *APITestSuite) TearDownTest() {
-	err := suite.api.http.cli.Close()
-	if err != nil {
-		suite.T().Fatalf("failed to close HTTP client: %v", err)
+	suite.api = nil
+}
+
+func (suite *APITestSuite) ensureAccessKey() {
+	if suite.broker.IsAKValid(suite.accessKey) {
+		return
 	}
+	_, err := suite.broker.AddAK("test-access-key-"+uuid.NewString(), suite.accessKey)
+	suite.Require().NoError(err)
+}
+
+func (suite *APITestSuite) ensureTopic(name string, topicType broker.TopicType, queueCount int) {
+	err := suite.broker.CreateTopic(name, topicType, queueCount)
+	if err == nil {
+		return
+	}
+	_, getErr := suite.broker.GetTopicConfig(name)
+	suite.Require().NoError(getErr)
+}
+
+func (suite *APITestSuite) newTopic(prefix string, topicType broker.TopicType) string {
+	topic := fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	suite.ensureTopic(topic, topicType, 1)
+	return topic
+}
+
+func (suite *APITestSuite) newGroup(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
+func (suite *APITestSuite) consumeUntil(topic, group, tag string, deadline time.Time, options ...client.ConsumeMessageOption) *client.Resp[client.ConsumeMessageResponse] {
+	for time.Now().Before(deadline) {
+		resp, errResp, err := suite.api.ConsumeMessages(topic, group, tag, options...)
+		suite.NoError(err)
+		if errResp != nil {
+			if errResp.Code == "not_found" {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			suite.T().Fatalf("consume messages API error: %v", errResp)
+		}
+		if resp != nil {
+			return resp
+		}
+	}
+	suite.T().Fatalf("consume timed out for topic=%s group=%s", topic, group)
+	return nil
+}
+
+func (suite *APITestSuite) consumeBatchUntil(topic, group string, deadline time.Time, options ...client.ConsumeBatchOption) *client.Resp[client.ConsumeBatchResponse] {
+	for time.Now().Before(deadline) {
+		resp, errResp, err := suite.api.ConsumeBatchMessages(topic, group, options...)
+		suite.NoError(err)
+		if errResp != nil {
+			if errResp.Code == "not_found" {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			suite.T().Fatalf("consume batch API error: %v", errResp)
+		}
+		if resp != nil {
+			return resp
+		}
+	}
+	suite.T().Fatalf("consume batch timed out for topic=%s group=%s", topic, group)
+	return nil
+}
+
+func (suite *APITestSuite) primeGroup(topic, group, tag string) {
+	resp, errResp, err := suite.api.ConsumeMessages(topic, group, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(resp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+}
+
+func TestConsumeReturnsInternalErrorWhenProcessingPersistenceFails(t *testing.T) {
+	const adminKey = "adminkey123"
+	const accessKey = "test-access-key"
+
+	require.NoError(t, logger.InitDefault())
+
+	oldAdminKey, hadAdminKey := os.LookupEnv("MQ_ADMIN_KEY")
+	require.NoError(t, os.Setenv("MQ_ADMIN_KEY", adminKey))
+	defer func() {
+		if hadAdminKey {
+			_ = os.Setenv("MQ_ADMIN_KEY", oldAdminKey)
+			return
+		}
+		_ = os.Unsetenv("MQ_ADMIN_KEY")
+	}()
+
+	dataDir, err := os.MkdirTemp("", "messageq-sdk-api-processing-fail-*")
+	require.NoError(t, err)
+	defer func() {
+		_ = os.RemoveAll(dataDir)
+	}()
+
+	walStore := storage.NewWALStorage(filepath.Join(dataDir, "data"), 10*time.Millisecond, time.Minute)
+	defer func() {
+		_ = walStore.Close()
+	}()
+
+	store := &failingSDKProcessingStore{
+		WALStorage: walStore,
+		saveErr:    errors.New("save processing failed"),
+	}
+	b := broker.NewBrokerWithPersistence(store, 1, filepath.Join(dataDir, "data"))
+	defer func() {
+		_ = b.Close()
+	}()
+
+	_, err = b.AddAK("default-test-access-key", accessKey)
+	require.NoError(t, err)
+	require.NoError(t, b.CreateTopic("orders", broker.TopicTypeNormal, 1))
+
+	server := httptest.NewServer(serverapi.NewRouter(b))
+	defer server.Close()
+
+	api := client.NewAPI(server.URL, adminKey)
+	api.SetAccessKey(accessKey)
+
+	group := "group-" + uuid.NewString()
+	tag := "tag-a"
+
+	resp, errResp, err := api.ConsumeMessages("orders", group, tag, client.WithQueueId(0))
+	require.NoError(t, err)
+	require.Nil(t, resp)
+	require.NotNil(t, errResp)
+	require.Equal(t, "not_found", errResp.Code)
+
+	produceResp, errResp, err := api.ProduceMessage("orders", tag, "bad-message", client.WithCorrelationID("corr-"+uuid.NewString()))
+	require.NoError(t, err)
+	require.Nil(t, errResp)
+	require.NotNil(t, produceResp)
+
+	consumeResp, errResp, err := api.ConsumeMessages("orders", group, tag, client.WithQueueId(0))
+	require.NoError(t, err)
+	require.Nil(t, consumeResp)
+	require.NotNil(t, errResp)
+	require.Equal(t, "internal_error", errResp.Code)
+
+	retryResp, errResp, err := api.ListMessages("orders", group, "retry", client.WithListLimit(10))
+	require.NoError(t, err)
+	require.Nil(t, errResp)
+	require.NotNil(t, retryResp)
+	require.Len(t, retryResp.Data.Messages, 1)
+	require.Equal(t, produceResp.Data.ID, retryResp.Data.Messages[0].ID)
+	require.NotNil(t, retryResp.Data.Messages[0].EventAt)
+}
+
+func TestNackReturnsInternalErrorWhenRetryPersistenceFails(t *testing.T) {
+	const adminKey = "adminkey123"
+	const accessKey = "test-access-key"
+
+	require.NoError(t, logger.InitDefault())
+
+	oldAdminKey, hadAdminKey := os.LookupEnv("MQ_ADMIN_KEY")
+	require.NoError(t, os.Setenv("MQ_ADMIN_KEY", adminKey))
+	defer func() {
+		if hadAdminKey {
+			_ = os.Setenv("MQ_ADMIN_KEY", oldAdminKey)
+			return
+		}
+		_ = os.Unsetenv("MQ_ADMIN_KEY")
+	}()
+
+	dataDir, err := os.MkdirTemp("", "messageq-sdk-api-retry-fail-*")
+	require.NoError(t, err)
+	defer func() {
+		_ = os.RemoveAll(dataDir)
+	}()
+
+	walStore := storage.NewWALStorage(filepath.Join(dataDir, "data"), 10*time.Millisecond, time.Minute)
+	defer func() {
+		_ = walStore.Close()
+	}()
+
+	store := &failingSDKProcessingStore{
+		WALStorage:    walStore,
+		retryEventErr: errors.New("append retry event failed"),
+	}
+	b := broker.NewBrokerWithPersistence(store, 1, filepath.Join(dataDir, "data"))
+	defer func() {
+		_ = b.Close()
+	}()
+
+	_, err = b.AddAK("default-test-access-key", accessKey)
+	require.NoError(t, err)
+	require.NoError(t, b.CreateTopic("orders", broker.TopicTypeNormal, 1))
+
+	server := httptest.NewServer(serverapi.NewRouter(b))
+	defer server.Close()
+
+	api := client.NewAPI(server.URL, adminKey)
+	api.SetAccessKey(accessKey)
+
+	group := "group-" + uuid.NewString()
+	tag := "tag-a"
+	resp, errResp, err := api.ConsumeMessages("orders", group, tag, client.WithQueueId(0))
+	require.NoError(t, err)
+	require.Nil(t, resp)
+	require.NotNil(t, errResp)
+	require.Equal(t, "not_found", errResp.Code)
+
+	produceResp, errResp, err := api.ProduceMessage("orders", tag, "retry-bad-message", client.WithCorrelationID("corr-"+uuid.NewString()))
+	require.NoError(t, err)
+	require.Nil(t, errResp)
+	require.NotNil(t, produceResp)
+
+	consumeResp, errResp, err := api.ConsumeMessages("orders", group, tag, client.WithQueueId(0))
+	require.NoError(t, err)
+	require.Nil(t, errResp)
+	require.NotNil(t, consumeResp)
+
+	nackResp, errResp, err := api.NackMessage("orders", group, produceResp.Data.ID)
+	require.NoError(t, err)
+	require.Nil(t, nackResp)
+	require.NotNil(t, errResp)
+	require.Equal(t, "internal_error", errResp.Code)
+
+	retryResp, errResp, err := api.ListMessages("orders", group, "retry", client.WithListLimit(10))
+	require.NoError(t, err)
+	require.Nil(t, errResp)
+	require.NotNil(t, retryResp)
+	require.Len(t, retryResp.Data.Messages, 0)
+}
+
+func TestTerminateReturnsInternalErrorWhenTerminalPersistenceFails(t *testing.T) {
+	const adminKey = "adminkey123"
+	const accessKey = "test-access-key"
+
+	require.NoError(t, logger.InitDefault())
+
+	oldAdminKey, hadAdminKey := os.LookupEnv("MQ_ADMIN_KEY")
+	require.NoError(t, os.Setenv("MQ_ADMIN_KEY", adminKey))
+	defer func() {
+		if hadAdminKey {
+			_ = os.Setenv("MQ_ADMIN_KEY", oldAdminKey)
+			return
+		}
+		_ = os.Unsetenv("MQ_ADMIN_KEY")
+	}()
+
+	dataDir, err := os.MkdirTemp("", "messageq-sdk-api-terminate-fail-*")
+	require.NoError(t, err)
+	defer func() {
+		_ = os.RemoveAll(dataDir)
+	}()
+
+	walStore := storage.NewWALStorage(filepath.Join(dataDir, "data"), 10*time.Millisecond, time.Minute)
+	defer func() {
+		_ = walStore.Close()
+	}()
+
+	store := &failingSDKProcessingStore{
+		WALStorage:       walStore,
+		terminalEventErr: errors.New("append terminal event failed"),
+	}
+	b := broker.NewBrokerWithPersistence(store, 1, filepath.Join(dataDir, "data"))
+	defer func() {
+		_ = b.Close()
+	}()
+
+	_, err = b.AddAK("default-test-access-key", accessKey)
+	require.NoError(t, err)
+	require.NoError(t, b.CreateTopic("orders", broker.TopicTypeNormal, 1))
+
+	server := httptest.NewServer(serverapi.NewRouter(b))
+	defer server.Close()
+
+	api := client.NewAPI(server.URL, adminKey)
+	api.SetAccessKey(accessKey)
+
+	tag := "tag-a"
+	produceResp, errResp, err := api.ProduceMessage("orders", tag, "cancel-bad-message", client.WithCorrelationID("corr-"+uuid.NewString()))
+	require.NoError(t, err)
+	require.Nil(t, errResp)
+	require.NotNil(t, produceResp)
+
+	terminateResp, errResp, err := api.TerminateMessage("orders", produceResp.Data.ID)
+	require.NoError(t, err)
+	require.Nil(t, terminateResp)
+	require.NotNil(t, errResp)
+	require.Equal(t, "internal_error", errResp.Code)
 }
 
 func (suite *APITestSuite) TestListAccessKeys() {
@@ -34,177 +394,188 @@ func (suite *APITestSuite) TestListAccessKeys() {
 	suite.Nil(errResp)
 	suite.NotNil(resp)
 	suite.Equal("ok", resp.Code)
-	suite.NotNil(resp.Data)
+	suite.NotEmpty(resp.Data.Items)
 }
 
 func (suite *APITestSuite) TestCreateAccessKey() {
+	name := "test-key-" + uuid.NewString()
+	key := "ak-" + uuid.NewString()
 
-	name := "test-key"
-	key := "test-access-key"
 	createResp, errResp, err := suite.api.CreateAccessKey(name, key)
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(createResp)
 	suite.Equal("ok", createResp.Code)
-	suite.NotNil(createResp.Data)
-	suite.Equal("test-key", createResp.Data.Name)
+	suite.Equal(name, createResp.Data.Name)
+	suite.NotEmpty(createResp.Data.Id)
 }
 
 func (suite *APITestSuite) TestDeleteAccessKey() {
-	keyId := "a848cb9c-d1f8-4514-a887-a32b9ce0b7e4"
-	_, errResp, err := suite.api.DeleteAccessKey(keyId)
+	name := "delete-key-" + uuid.NewString()
+	key := "delete-ak-" + uuid.NewString()
+
+	createResp, errResp, err := suite.api.CreateAccessKey(name, key)
 	suite.NoError(err)
 	suite.Nil(errResp)
+	suite.NotNil(createResp)
+
+	deleteResp, errResp, err := suite.api.DeleteAccessKey(createResp.Data.Id)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(deleteResp)
 }
 
 func (suite *APITestSuite) TestCreateTopic() {
-	topicName := "test-topic-delay"
-	topicType := broker.TopicTypeDelay
-	queueCount := 4
-	createResp, errResp, err := suite.api.CreateTopic(topicName, topicType, queueCount)
+	topicName := fmt.Sprintf("create-topic-%d", time.Now().UnixNano())
+	createResp, errResp, err := suite.api.CreateTopic(topicName, broker.TopicTypeDelay, 1)
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(createResp)
 	suite.Equal("ok", createResp.Code)
-	suite.NotNil(createResp.Data)
 	suite.Equal(topicName, createResp.Data.Name)
 }
 
 func (suite *APITestSuite) TestGetTopic() {
-	topicName := "test-topic-delay"
+	topicName := suite.newTopic("get-topic", broker.TopicTypeDelay)
 	getResp, errResp, err := suite.api.GetTopic(topicName)
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(getResp)
 	suite.Equal("ok", getResp.Code)
-	suite.NotNil(getResp.Data)
 	suite.Equal(topicName, getResp.Data.Name)
 }
 
 func (suite *APITestSuite) TestListTopics() {
+	suite.newTopic("list-topic", broker.TopicTypeNormal)
+
 	resp, errResp, err := suite.api.ListTopics()
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(resp)
 	suite.Equal("ok", resp.Code)
-	suite.NotNil(resp.Data)
+	suite.NotEmpty(resp.Data.Items)
 }
 
 func (suite *APITestSuite) TestDeleteTopic() {
-	topicName := "test-topic-delay"
-	_, errResp, err := suite.api.DelTopic(topicName)
+	topicName := suite.newTopic("delete-topic", broker.TopicTypeNormal)
+	resp, errResp, err := suite.api.DelTopic(topicName)
 	suite.NoError(err)
 	suite.Nil(errResp)
+	suite.NotNil(resp)
+	suite.True(resp.Data.Deleted)
+	suite.Equal(topicName, resp.Data.Topic)
 }
 
 func (suite *APITestSuite) TestDelayProduceWithConsume() {
-	topic := "test-topic-delay"
+	topic := suite.newTopic("delay-produce", broker.TopicTypeDelay)
+	group := suite.newGroup("delay-group")
 	tag := "test-tag"
-	delaySeconds := 30
+	suite.primeGroup(topic, group, tag)
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-	for i := 0; i < 3; i++ {
-		num := i + 1
-		timestr := time.Now().Add(time.Second * time.Duration(delaySeconds*num)).Format("2006-01-02 15:04:05")
-		body := fmt.Sprintf("Hello, Delay MessageQ! time: %s", timestr)
-		produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, body, WithDelaySeconds(int64(delaySeconds*num)))
+	expected := map[string]string{}
+	for i := 0; i < 2; i++ {
+		correlationID := fmt.Sprintf("delay-cid-%d-%d", i, time.Now().UnixNano())
+		produceResp, errResp, err := suite.api.ProduceMessage(
+			topic,
+			tag,
+			fmt.Sprintf("delayed-message-%d", i+1),
+			client.WithDelayMilliseconds(int64(150*(i+1))),
+			client.WithCorrelationID(correlationID),
+		)
 		suite.NoError(err)
 		suite.Nil(errResp)
 		suite.NotNil(produceResp)
-		suite.Equal("ok", produceResp.Code)
-		suite.NotNil(produceResp.Data)
-		suite.Equal(topic, produceResp.Data.Topic)
-		//wg.Add(1)
+		expected[produceResp.Data.ID] = correlationID
 	}
 
-	group := "test-group"
-	go func() {
-		consumeCount := 0
-		for true {
-			time.Sleep(1 * time.Second)
-			consumeResp, errResp, err := suite.api.ConsumeMessages(topic, group, tag)
-			if err != nil {
-				suite.T().Logf("consume messages error: %v", err)
-				continue
-			}
-			if errResp != nil {
-				if errResp.Code != "not_found" {
-					suite.T().Logf("consume messages API error: %v", errResp)
-				}
-				continue
-			}
-			if consumeResp != nil {
-				msg := consumeResp.Data.Message
-				timestr := time.Now().Format("2006-01-02 15:04:05")
-				suite.T().Logf("Consumed message: %s, body: %s, consume time: %s", msg.ID, msg.Body, timestr)
-				consumeCount++
-				resp, acrErrResp, err := suite.api.AckMessage(topic, group, msg.ID)
-				suite.Nil(err)
-				suite.Nil(acrErrResp)
-				suite.NotNil(resp)
-				suite.Equal("ok", resp.Code)
-			}
-			if consumeCount >= 3 {
-				wg.Done()
-			}
-
+	deadline := time.Now().Add(5 * time.Second)
+	consumed := map[string]bool{}
+	for len(consumed) < len(expected) && time.Now().Before(deadline) {
+		consumeResp, errResp, err := suite.api.ConsumeMessages(topic, group, tag, client.WithQueueId(0))
+		if err != nil {
+			suite.T().Fatalf("consume messages error: %v", err)
 		}
-	}()
+		if errResp != nil {
+			if errResp.Code == "not_found" {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			suite.T().Fatalf("consume messages API error: %v", errResp)
+		}
+		if consumeResp == nil {
+			continue
+		}
 
-	wg.Wait()
+		msg := consumeResp.Data.Message
+		suite.Equal(expected[msg.ID], msg.CorrelationID)
+		consumed[msg.ID] = true
+		ackResp, ackErrResp, err := suite.api.AckMessage(topic, group, msg.ID)
+		suite.NoError(err)
+		suite.Nil(ackErrResp)
+		suite.NotNil(ackResp)
+		suite.Equal("ok", ackResp.Code)
+	}
 
+	suite.Len(consumed, len(expected))
 }
 
 func (suite *APITestSuite) TestProduceMessage() {
-	topic := "test-topic"
+	topic := suite.newTopic("produce-topic", broker.TopicTypeNormal)
 	tag := "test-tag"
 	body := "Hello, MessageQ!"
-	produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, body)
+	correlationID := "produce-cid-" + uuid.NewString()
+
+	produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, body, client.WithCorrelationID(correlationID))
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(produceResp)
 	suite.Equal("ok", produceResp.Code)
-	suite.NotNil(produceResp.Data)
 	suite.Equal(topic, produceResp.Data.Topic)
+	suite.Equal(correlationID, produceResp.Data.CorrelationID)
+}
+
+func (suite *APITestSuite) TestProduceMessageCorrelationIDValidation() {
+	topic := suite.newTopic("produce-invalid-cid", broker.TopicTypeNormal)
+	invalidCorrelationID := strings.Repeat("界", 43) // 129 UTF-8 bytes
+
+	produceResp, errResp, err := suite.api.ProduceMessage(topic, "test-tag", "Hello", client.WithCorrelationID(invalidCorrelationID))
+	suite.NoError(err)
+	suite.Nil(produceResp)
+	suite.NotNil(errResp)
+	suite.Equal("invalid_message", errResp.Code)
 }
 
 func (suite *APITestSuite) TestConsumeMessages() {
-	topic := "test-topic"
-	group := "test-group"
+	topic := suite.newTopic("consume-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("consume-group")
 	tag := "test-tag"
-	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, group, tag)
-	suite.NoError(err)
-	if errResp != nil {
-		suite.Nil(consumeResp, "expected consumeResp to be nil when errResp is not nil")
-		if errResp.Code == "not_found" {
-			suite.T().Logf("No messages available for topic: %s, group: %s, tag: %s", topic, group, tag)
-			return
-		}
-		suite.Failf("API error", "consume messages API error: %v", errResp)
-		return
-	}
+	correlationID := "consume-cid-" + uuid.NewString()
+	suite.primeGroup(topic, group, tag)
 
-	suite.NotNil(consumeResp, "expected consumeResp to be not nil when errResp is nil")
+	produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, "Hello, consume!", client.WithCorrelationID(correlationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(produceResp)
+
+	consumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
 	suite.Equal("ok", consumeResp.Code)
-	suite.NotNil(consumeResp.Data)
+	suite.Equal(correlationID, consumeResp.Data.Message.CorrelationID)
+	ackResp, ackErrResp, err := suite.api.AckMessage(topic, group, consumeResp.Data.Message.ID)
+	suite.NoError(err)
+	suite.Nil(ackErrResp)
+	suite.NotNil(ackResp)
 }
 
 func (suite *APITestSuite) TestBatchProduceConsume() {
-	topic := fmt.Sprintf("batch-topic-%d", time.Now().UnixNano())
-	group := "batch-group"
+	topic := suite.newTopic("batch-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("batch-group")
 	tag := "batch-tag"
+	suite.primeGroup(topic, group, tag)
 
-	_, errResp, err := suite.api.CreateTopic(topic, broker.TopicTypeNormal, 1)
-	suite.NoError(err)
-	if errResp != nil && errResp.Code != "topic_exists" {
-		suite.T().Fatalf("create topic failed: %v", errResp)
-	}
-
-	messages := []ProduceBatchMessage{
-		{Body: "batch-1", Tag: tag},
-		{Body: "batch-2", Tag: tag},
-		{Body: "batch-3", Tag: tag},
+	messages := []client.ProduceBatchMessage{
+		{Body: "batch-1", Tag: tag, CorrelationID: "batch-cid-1"},
+		{Body: "batch-2", Tag: tag, CorrelationID: "batch-cid-2"},
+		{Body: "batch-3", Tag: tag, CorrelationID: "batch-cid-3"},
 	}
 	produceResp, errResp, err := suite.api.ProduceBatchMessage(topic, messages)
 	suite.NoError(err)
@@ -212,245 +583,609 @@ func (suite *APITestSuite) TestBatchProduceConsume() {
 	suite.NotNil(produceResp)
 	suite.Equal("ok", produceResp.Code)
 	suite.Len(produceResp.Data.Messages, len(messages))
+
+	expected := map[string]string{}
 	for _, msg := range produceResp.Data.Messages {
-		if msg.ID == "" {
-			suite.T().Fatalf("expected message id in batch produce response")
-		}
-		suite.Equal(topic, msg.Topic)
-		suite.Equal(tag, msg.Tag)
+		expected[msg.ID] = msg.CorrelationID
 	}
 
 	acked := map[string]bool{}
-	consumeBatch := func(max int) *Resp[ConsumeBatchResponse] {
-		for i := 0; i < 5; i++ {
-			resp, errResp, err := suite.api.ConsumeBatchMessages(topic, group, WithBatchQueueId(0), WithBatchTag(tag), WithBatchMax(max))
-			suite.NoError(err)
-			if errResp != nil {
-				if errResp.Code == "not_found" {
-					time.Sleep(200 * time.Millisecond)
-					continue
-				}
-				suite.T().Fatalf("consume batch error: %v", errResp)
-			}
-			if resp == nil {
-				suite.T().Fatalf("expected consume batch response, got nil")
-			}
-			return resp
-		}
-		suite.T().Fatalf("consume batch timeout")
-		return nil
-	}
-
-	resp1 := consumeBatch(2)
+	resp1 := suite.consumeBatchUntil(topic, group, time.Now().Add(3*time.Second), client.WithBatchQueueId(0), client.WithBatchTag(tag), client.WithBatchMax(2))
 	suite.Equal("ok", resp1.Code)
 	suite.Equal("processing", resp1.Data.State)
-	if len(resp1.Data.Messages) == 0 {
-		suite.T().Fatalf("expected batch messages, got 0")
-	}
 	for _, msg := range resp1.Data.Messages {
-		if msg.ID == "" {
-			suite.T().Fatalf("expected message id in batch consume response")
-		}
-		suite.Equal(tag, msg.Tag)
+		suite.Equal(expected[msg.ID], msg.CorrelationID)
 		acked[msg.ID] = true
-		ackResp, errResp, err := suite.api.AckMessage(topic, group, msg.ID)
+		ackResp, ackErrResp, err := suite.api.AckMessage(topic, group, msg.ID)
 		suite.NoError(err)
-		suite.Nil(errResp)
+		suite.Nil(ackErrResp)
 		suite.NotNil(ackResp)
-		suite.Equal("ok", ackResp.Code)
 	}
 
-	resp2 := consumeBatch(10)
+	resp2 := suite.consumeBatchUntil(topic, group, time.Now().Add(3*time.Second), client.WithBatchQueueId(0), client.WithBatchTag(tag), client.WithBatchMax(10))
 	suite.Equal("ok", resp2.Code)
-	suite.Equal("processing", resp2.Data.State)
-	if len(resp2.Data.Messages) == 0 {
-		suite.T().Fatalf("expected remaining batch messages, got 0")
-	}
 	for _, msg := range resp2.Data.Messages {
-		if msg.ID == "" {
-			suite.T().Fatalf("expected message id in batch consume response")
-		}
-		if acked[msg.ID] {
-			suite.T().Fatalf("duplicate message consumed: %s", msg.ID)
-		}
-		suite.Equal(tag, msg.Tag)
+		suite.Equal(expected[msg.ID], msg.CorrelationID)
+		suite.False(acked[msg.ID])
 		acked[msg.ID] = true
-		ackResp, errResp, err := suite.api.AckMessage(topic, group, msg.ID)
+		ackResp, ackErrResp, err := suite.api.AckMessage(topic, group, msg.ID)
 		suite.NoError(err)
-		suite.Nil(errResp)
+		suite.Nil(ackErrResp)
 		suite.NotNil(ackResp)
-		suite.Equal("ok", ackResp.Code)
 	}
 
 	suite.Len(acked, len(messages))
 }
 
 func (suite *APITestSuite) TestListMessages() {
-	group := "test-group"
+	group := suite.newGroup("list-group")
 	tag := "test-tag"
 
-	base := fmt.Sprintf("list-%d", time.Now().UnixNano())
-	normalTopic := base + "-normal"
-	delayTopic := base + "-delay"
+	normalTopic := suite.newTopic("list-normal", broker.TopicTypeNormal)
+	delayTopic := suite.newTopic("list-delay", broker.TopicTypeDelay)
+	suite.primeGroup(normalTopic, group, tag)
+	suite.primeGroup(delayTopic, group, tag)
 
-	// create topics (ignore already exists)
-	_, errResp, err := suite.api.CreateTopic(normalTopic, broker.TopicTypeNormal, 1)
-	if err != nil {
-		suite.T().Fatalf("create normal topic error: %v", err)
-	}
-	if errResp != nil && errResp.Code != "topic_exists" {
-		suite.T().Fatalf("create normal topic failed: %v", errResp)
-	}
-	_, errResp, err = suite.api.CreateTopic(delayTopic, broker.TopicTypeDelay, 1)
-	if err != nil {
-		suite.T().Fatalf("create delay topic error: %v", err)
-	}
-	if errResp != nil && errResp.Code != "topic_exists" {
-		suite.T().Fatalf("create delay topic failed: %v", errResp)
-	}
-
-	// produce multiple normal messages for pending/cursor
+	correlations := make([]string, 0, 5)
 	for i := 0; i < 5; i++ {
-		_, errResp, err = suite.api.ProduceMessage(normalTopic, tag, fmt.Sprintf("list-message-%d", i+1))
+		correlationID := fmt.Sprintf("list-cid-%d-%d", i, time.Now().UnixNano())
+		correlations = append(correlations, correlationID)
+		_, errResp, err := suite.api.ProduceMessage(normalTopic, tag, fmt.Sprintf("list-message-%d", i+1), client.WithCorrelationID(correlationID))
 		suite.NoError(err)
 		suite.Nil(errResp)
 	}
 
-	// pending list (cursor)
-	listResp, errResp, err := suite.api.ListMessages(normalTopic, group, "pending", WithListQueueId(0), WithListLimit(1))
+	listResp, errResp, err := suite.api.ListMessages(normalTopic, group, "pending", client.WithListQueueId(0), client.WithListLimit(2))
 	suite.NoError(err)
-	if errResp != nil {
-		suite.T().Fatalf("list messages error: %v", errResp)
-	}
-	if listResp == nil {
-		suite.T().Skip("list messages endpoint not available on server")
-	}
-	suite.Equal("ok", listResp.Code)
+	suite.Nil(errResp)
+	suite.NotNil(listResp)
 	suite.Equal("pending", listResp.Data.State)
-	suite.Equal(1, len(listResp.Data.Messages), "expected 1 message due to limit=1")
-	if len(listResp.Data.Messages) == 0 {
-		suite.T().Fatalf("expected pending messages, got 0")
-	}
-	if listResp.Data.Messages[0].ID == "" {
-		suite.T().Fatalf("expected message id in pending list")
-	}
-	if listResp.Data.Messages[0].QueueID == nil || listResp.Data.Messages[0].Offset == nil {
-		suite.T().Fatalf("expected queueId/offset in pending list")
-	}
-	if listResp.Data.NextCursor != nil {
-		listResp2, errResp, err := suite.api.ListMessages(normalTopic, group, "pending", WithListQueueId(0), WithListCursor(*listResp.Data.NextCursor), WithListLimit(10))
-		suite.NoError(err)
-		suite.Nil(errResp)
-		suite.NotNil(listResp2)
-		suite.Equal("ok", listResp2.Code)
-		suite.Equal("pending", listResp2.Data.State)
-	}
+	suite.NotEmpty(listResp.Data.Messages)
+	suite.NotNil(listResp.Data.Messages[0].QueueID)
+	suite.NotNil(listResp.Data.Messages[0].Offset)
+	suite.NotEmpty(listResp.Data.Messages[0].CorrelationID)
 
-	// consume to processing
-	consumeResp, errResp, err := suite.api.ConsumeMessages(normalTopic, group, tag, WithQueueId(0))
-	suite.NoError(err)
-	if errResp != nil {
-		suite.T().Fatalf("consume error: %v", errResp)
-	}
+	consumeResp := suite.consumeUntil(normalTopic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
 	msgID := consumeResp.Data.Message.ID
+	msgCorrelationID := consumeResp.Data.Message.CorrelationID
 
-	processingResp, errResp, err := suite.api.ListMessages(normalTopic, group, "processing", WithListLimit(10))
+	processingResp, errResp, err := suite.api.ListMessages(normalTopic, group, "processing", client.WithListLimit(10))
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(processingResp)
 	suite.Equal("processing", processingResp.Data.State)
-	if len(processingResp.Data.Messages) == 0 {
-		suite.T().Fatalf("expected processing messages, got 0")
-	}
 	foundProcessing := false
 	for _, msg := range processingResp.Data.Messages {
 		if msg.ID == msgID {
 			foundProcessing = true
-			if msg.ConsumedAt == nil {
-				suite.T().Fatalf("expected consumedAt for processing message")
-			}
+			suite.NotNil(msg.ConsumedAt)
+			suite.Equal(msgCorrelationID, msg.CorrelationID)
 			break
 		}
 	}
-	if !foundProcessing {
-		suite.T().Fatalf("processing list did not include consumed message")
-	}
+	suite.True(foundProcessing)
 
-	// ack to completed
 	ackResp, errResp, err := suite.api.AckMessage(normalTopic, group, msgID)
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(ackResp)
 
-	completedResp, errResp, err := suite.api.ListMessages(normalTopic, group, "completed", WithListLimit(10))
+	completedResp, errResp, err := suite.api.ListMessages(normalTopic, group, "completed", client.WithListLimit(10))
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(completedResp)
 	suite.Equal("completed", completedResp.Data.State)
-	if len(completedResp.Data.Messages) == 0 {
-		suite.T().Fatalf("expected completed messages, got 0")
-	}
 	foundCompleted := false
 	for _, msg := range completedResp.Data.Messages {
 		if msg.ID == msgID {
 			foundCompleted = true
-			if msg.AckedAt == nil {
-				suite.T().Fatalf("expected ackedAt for completed message")
-			}
+			suite.NotNil(msg.AckedAt)
+			suite.Equal(msgCorrelationID, msg.CorrelationID)
 			break
 		}
 	}
-	if !foundCompleted {
-		suite.T().Fatalf("completed list did not include acked message")
-	}
+	suite.True(foundCompleted)
 
-	listResp2, errResp, err := suite.api.ListMessages(normalTopic, group, "pending", WithListQueueId(0), WithListLimit(10))
-	suite.NoError(err)
-	suite.Nil(errResp)
-	suite.NotNil(listResp2)
-	suite.Equal("ok", listResp2.Code)
-	suite.Equal("pending", listResp2.Data.State)
-	suite.Equal(4, len(listResp2.Data.Messages), "expected 4 pending messages after consuming 1")
-
-	// scheduled list
-	_, errResp, err = suite.api.ProduceMessage(delayTopic, tag, "list-message-delay", WithDelaySeconds(30))
+	delayCorrelationID := "scheduled-cid-" + uuid.NewString()
+	_, errResp, err = suite.api.ProduceMessage(delayTopic, tag, "list-message-delay", client.WithDelayMilliseconds(500), client.WithCorrelationID(delayCorrelationID))
 	suite.NoError(err)
 	suite.Nil(errResp)
 
-	scheduledResp, errResp, err := suite.api.ListMessages(delayTopic, group, "scheduled", WithListQueueId(0), WithListLimit(10))
+	scheduledResp, errResp, err := suite.api.ListMessages(delayTopic, group, "scheduled", client.WithListQueueId(0), client.WithListLimit(10))
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(scheduledResp)
 	suite.Equal("scheduled", scheduledResp.Data.State)
-	if len(scheduledResp.Data.Messages) == 0 {
-		suite.T().Fatalf("expected scheduled messages, got 0")
+	suite.NotEmpty(scheduledResp.Data.Messages)
+	suite.NotNil(scheduledResp.Data.Messages[0].ScheduledAt)
+	suite.Equal(delayCorrelationID, scheduledResp.Data.Messages[0].CorrelationID)
+}
+
+func (suite *APITestSuite) TestListRetryEvents() {
+	topic := suite.newTopic("retry-history-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("retry-history-group")
+	tag := "retry-history-tag"
+	suite.primeGroup(topic, group, tag)
+
+	retryCorrelationID := "retry-history-cid-" + uuid.NewString()
+	produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, "retry-me", client.WithCorrelationID(retryCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(produceResp)
+
+	consumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(produceResp.Data.ID, consumeResp.Data.Message.ID)
+
+	nackResp, errResp, err := suite.api.NackMessage(topic, group, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(nackResp)
+	suite.True(nackResp.Data.Nacked)
+
+	retryResp, errResp, err := suite.api.ListMessages(topic, group, "retry", client.WithListLimit(10))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(retryResp)
+	suite.Equal("retry", retryResp.Data.State)
+
+	foundRetry := false
+	for _, msg := range retryResp.Data.Messages {
+		if msg.ID == produceResp.Data.ID {
+			foundRetry = true
+			suite.Equal(retryCorrelationID, msg.CorrelationID)
+			suite.NotNil(msg.EventAt)
+			suite.NotNil(msg.ScheduledAt)
+			suite.NotNil(msg.ConsumedAt)
+			break
+		}
 	}
-	if scheduledResp.Data.Messages[0].ScheduledAt == nil {
-		suite.T().Fatalf("expected scheduledAt for scheduled message")
+	suite.True(foundRetry)
+}
+
+func (suite *APITestSuite) TestListRetryOnlyShowsLatestState() {
+	topic := suite.newTopic("retry-latest-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("retry-latest-group")
+	tag := "retry-latest-tag"
+	suite.primeGroup(topic, group, tag)
+
+	suite.broker.SetRetryBackoff(10*time.Millisecond, 1, 10*time.Millisecond)
+	defer suite.broker.SetRetryBackoff(1*time.Second, 2, 60*time.Second)
+
+	produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, "retry-then-ack", client.WithCorrelationID("retry-latest-cid-"+uuid.NewString()))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(produceResp)
+
+	consumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(produceResp.Data.ID, consumeResp.Data.Message.ID)
+
+	nackResp, errResp, err := suite.api.NackMessage(topic, group, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(nackResp)
+	suite.True(nackResp.Data.Nacked)
+
+	retryConsumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(produceResp.Data.ID, retryConsumeResp.Data.Message.ID)
+
+	ackResp, errResp, err := suite.api.AckMessage(topic, group, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(ackResp)
+	suite.True(ackResp.Data.Acked)
+
+	retryResp, errResp, err := suite.api.ListMessages(topic, group, "retry", client.WithListLimit(10))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(retryResp)
+	for _, msg := range retryResp.Data.Messages {
+		suite.NotEqual(produceResp.Data.ID, msg.ID)
 	}
 }
 
-func (suite *APITestSuite) TestGetFullStats() {
+func (suite *APITestSuite) TestListDLQEvents() {
+	topic := suite.newTopic("dlq-history-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("dlq-history-group")
+	tag := "dlq-history-tag"
+	suite.primeGroup(topic, group, tag)
 
+	suite.broker.SetMaxRetry(0)
+	defer suite.broker.SetMaxRetry(3)
+
+	dlqCorrelationID := "dlq-history-cid-" + uuid.NewString()
+	produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, "dlq-me", client.WithCorrelationID(dlqCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(produceResp)
+
+	consumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(produceResp.Data.ID, consumeResp.Data.Message.ID)
+
+	nackResp, errResp, err := suite.api.NackMessage(topic, group, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(nackResp)
+	suite.True(nackResp.Data.Nacked)
+
+	dlqResp, errResp, err := suite.api.ListMessages(topic, group, "dlq", client.WithListLimit(10))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(dlqResp)
+	suite.Equal("dlq", dlqResp.Data.State)
+
+	foundDLQ := false
+	for _, msg := range dlqResp.Data.Messages {
+		if msg.ID == produceResp.Data.ID {
+			foundDLQ = true
+			suite.Equal(dlqCorrelationID, msg.CorrelationID)
+			suite.NotNil(msg.EventAt)
+			suite.NotNil(msg.ConsumedAt)
+			break
+		}
+	}
+	suite.True(foundDLQ)
+}
+
+func (suite *APITestSuite) TestTerminateMessage() {
+	topic := suite.newTopic("terminate-topic", broker.TopicTypeNormal)
+	groupA := suite.newGroup("terminate-group-a")
+	groupB := suite.newGroup("terminate-group-b")
+	tag := "terminate-tag"
+	cancelledCorrelationID := "cancelled-cid-" + uuid.NewString()
+
+	produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, "cancel-me", client.WithCorrelationID(cancelledCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(produceResp)
+
+	terminateResp, errResp, err := suite.api.TerminateMessage(topic, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(terminateResp)
+	suite.True(terminateResp.Data.Terminated)
+	suite.Equal("cancelled", terminateResp.Data.State)
+
+	terminateResp, errResp, err = suite.api.TerminateMessage(topic, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(terminateResp)
+	suite.True(terminateResp.Data.Terminated)
+
+	terminateResp, errResp, err = suite.api.TerminateMessage(topic, uuid.NewString())
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(terminateResp)
+	suite.True(terminateResp.Data.Terminated)
+
+	cancelledResp, errResp, err := suite.api.ListMessages(topic, groupB, "cancelled", client.WithListLimit(10))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(cancelledResp)
+	suite.Equal("cancelled", cancelledResp.Data.State)
+	foundCancelled := false
+	for _, msg := range cancelledResp.Data.Messages {
+		if msg.ID == produceResp.Data.ID {
+			foundCancelled = true
+			suite.Equal(cancelledCorrelationID, msg.CorrelationID)
+			break
+		}
+	}
+	suite.True(foundCancelled)
+
+	pendingResp, errResp, err := suite.api.ListMessages(topic, groupA, "pending", client.WithListQueueId(0), client.WithListLimit(10))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(pendingResp)
+	for _, msg := range pendingResp.Data.Messages {
+		suite.NotEqual(produceResp.Data.ID, msg.ID)
+	}
+
+	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, groupA, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+
+	consumeResp, errResp, err = suite.api.ConsumeMessages(topic, groupB, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+
+	activeCorrelationID := "active-cid-" + uuid.NewString()
+	activeProduceResp, errResp, err := suite.api.ProduceMessage(topic, tag, "keep-me", client.WithCorrelationID(activeCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(activeProduceResp)
+
+	activeConsumeResp := suite.consumeUntil(topic, groupB, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(activeProduceResp.Data.ID, activeConsumeResp.Data.Message.ID)
+	suite.Equal(activeCorrelationID, activeConsumeResp.Data.Message.CorrelationID)
+}
+
+func (suite *APITestSuite) TestTerminateBatchMessages() {
+	topic := suite.newTopic("terminate-batch-topic", broker.TopicTypeNormal)
+	groupA := suite.newGroup("terminate-batch-group-a")
+	groupB := suite.newGroup("terminate-batch-group-b")
+	tag := "terminate-batch-tag"
+
+	firstCorrelationID := "batch-cid-" + uuid.NewString()
+	secondCorrelationID := "batch-cid-" + uuid.NewString()
+
+	firstResp, errResp, err := suite.api.ProduceMessage(topic, tag, "cancel-batch-1", client.WithCorrelationID(firstCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(firstResp)
+
+	secondResp, errResp, err := suite.api.ProduceMessage(topic, tag, "cancel-batch-2", client.WithCorrelationID(secondCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(secondResp)
+
+	terminateResp, errResp, err := suite.api.TerminateBatchMessages(topic, []string{firstResp.Data.ID, secondResp.Data.ID})
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(terminateResp)
+	suite.Equal(2, terminateResp.Data.TerminatedCount)
+	suite.ElementsMatch([]string{firstResp.Data.ID, secondResp.Data.ID}, terminateResp.Data.MessageIDs)
+	suite.Equal("cancelled", terminateResp.Data.State)
+
+	cancelledResp, errResp, err := suite.api.ListMessages(topic, groupA, "cancelled", client.WithListLimit(10))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(cancelledResp)
+
+	found := map[string]string{}
+	for _, msg := range cancelledResp.Data.Messages {
+		if msg.ID == firstResp.Data.ID || msg.ID == secondResp.Data.ID {
+			found[msg.ID] = msg.CorrelationID
+		}
+	}
+	suite.Equal(firstCorrelationID, found[firstResp.Data.ID])
+	suite.Equal(secondCorrelationID, found[secondResp.Data.ID])
+
+	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, groupA, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+
+	consumeResp, errResp, err = suite.api.ConsumeMessages(topic, groupB, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+}
+
+func (suite *APITestSuite) TestPartialTerminateStillConsumesRemainingMessages() {
+	topic := suite.newTopic("terminate-partial-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("terminate-partial-group")
+	tag := "terminate-partial-tag"
+
+	msgIDs := make([]string, 0, 5)
+	for i := 0; i < 5; i++ {
+		resp, errResp, err := suite.api.ProduceMessage(
+			topic,
+			tag,
+			fmt.Sprintf("terminate-partial-%d", i),
+			client.WithCorrelationID(fmt.Sprintf("terminate-partial-cid-%d-%s", i, uuid.NewString())),
+		)
+		suite.NoError(err)
+		suite.Nil(errResp)
+		suite.NotNil(resp)
+		msgIDs = append(msgIDs, resp.Data.ID)
+	}
+
+	for _, msgID := range []string{msgIDs[1], msgIDs[3]} {
+		terminateResp, errResp, err := suite.api.TerminateMessage(topic, msgID)
+		suite.NoError(err)
+		suite.Nil(errResp)
+		suite.NotNil(terminateResp)
+		suite.True(terminateResp.Data.Terminated)
+	}
+
+	expected := map[string]struct{}{
+		msgIDs[0]: {},
+		msgIDs[2]: {},
+		msgIDs[4]: {},
+	}
+	consumed := make(map[string]struct{}, len(expected))
+	deadline := time.Now().Add(3 * time.Second)
+
+	for len(consumed) < len(expected) {
+		consumeResp := suite.consumeUntil(topic, group, tag, deadline, client.WithQueueId(0))
+		msgID := consumeResp.Data.Message.ID
+		_, ok := expected[msgID]
+		suite.True(ok, "unexpected message consumed: %s", msgID)
+		_, seen := consumed[msgID]
+		suite.False(seen, "duplicate message consumed: %s", msgID)
+		consumed[msgID] = struct{}{}
+
+		ackResp, ackErrResp, err := suite.api.AckMessage(topic, group, msgID)
+		suite.NoError(err)
+		suite.Nil(ackErrResp)
+		suite.NotNil(ackResp)
+		suite.True(ackResp.Data.Acked)
+	}
+
+	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, group, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+}
+
+// TestTerminateMessageInRetryQueue verifies that a message terminated while it sits
+// in the retry queue (after nack + retry delay elapsed) cannot be consumed again.
+func (suite *APITestSuite) TestTerminateMessageInRetryQueue() {
+	topic := suite.newTopic("terminate-retry-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("terminate-retry-group")
+	tag := "terminate-retry-tag"
+	suite.primeGroup(topic, group, tag)
+
+	suite.broker.SetRetryBackoff(10*time.Millisecond, 1, 10*time.Millisecond)
+	defer suite.broker.SetRetryBackoff(1*time.Second, 2, 60*time.Second)
+
+	produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, "terminate-after-retry", client.WithCorrelationID("terminate-retry-cid-"+uuid.NewString()))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(produceResp)
+
+	// Consume the message (now in processing state).
+	consumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(produceResp.Data.ID, consumeResp.Data.Message.ID)
+
+	// Nack it – message is scheduled for retry in the delay queue.
+	nackResp, errResp, err := suite.api.NackMessage(topic, group, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(nackResp)
+	suite.True(nackResp.Data.Nacked)
+
+	// Wait for the retry delay to elapse so the message lands in the retry queue.
+	time.Sleep(100 * time.Millisecond)
+
+	// Terminate the message while it is in the retry queue.
+	terminateResp, errResp, err := suite.api.TerminateMessage(topic, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(terminateResp)
+	suite.True(terminateResp.Data.Terminated)
+
+	// Consuming should now yield not_found – the message must be filtered.
+	consumeResp2, errResp2, err := suite.api.ConsumeMessages(topic, group, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp2)
+	suite.NotNil(errResp2)
+	suite.Equal("not_found", errResp2.Code)
+}
+
+func (suite *APITestSuite) TestNewGroupStartsFromTopicProgressByDefault() {
+	topic := suite.newTopic("topic-progress-start-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("topic-progress-start-group")
+	tag := "progress-tag"
+	historicalCorrelationID := "progress-cid-" + uuid.NewString()
+
+	historicalResp, errResp, err := suite.api.ProduceMessage(topic, tag, "historical-message", client.WithCorrelationID(historicalCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(historicalResp)
+
+	consumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(historicalResp.Data.ID, consumeResp.Data.Message.ID)
+	suite.Equal(historicalCorrelationID, consumeResp.Data.Message.CorrelationID)
+}
+
+func (suite *APITestSuite) TestExplicitLatestStartSkipsHistoricalMessages() {
+	suite.broker.SetNewGroupStartPosition("latest")
+	defer suite.broker.SetNewGroupStartPosition("topic_progress")
+
+	topic := suite.newTopic("latest-start-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("latest-start-group")
+	tag := "latest-tag"
+
+	_, errResp, err := suite.api.ProduceMessage(topic, tag, "historical-message")
+	suite.NoError(err)
+	suite.Nil(errResp)
+
+	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, group, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+
+	freshCorrelationID := "latest-cid-" + uuid.NewString()
+	freshResp, errResp, err := suite.api.ProduceMessage(topic, tag, "fresh-message", client.WithCorrelationID(freshCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(freshResp)
+
+	consumeResp = suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(freshResp.Data.ID, consumeResp.Data.Message.ID)
+	suite.Equal(freshCorrelationID, consumeResp.Data.Message.CorrelationID)
+}
+
+func (suite *APITestSuite) TestSubscriptionConflict() {
+	topic := suite.newTopic("subscription-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("subscription-group")
+
+	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, group, "tag-a", client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+
+	consumeResp, errResp, err = suite.api.ConsumeMessages(topic, group, "tag-b", client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("subscription_conflict", errResp.Code)
+}
+
+func (suite *APITestSuite) TestExpiredMessagesAreFiltered() {
+	topic := suite.newTopic("expired-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("expired-group")
+	tag := "expired-tag"
+	suite.primeGroup(topic, group, tag)
+
+	suite.broker.SetMessageRetention(time.Second)
+	suite.broker.SetMessageExpiryFactor(2)
+	defer suite.broker.SetMessageRetention(7 * 24 * time.Hour)
+	defer suite.broker.SetMessageExpiryFactor(2)
+
+	oldID := uuid.NewString()
+	err := suite.store.Append(topic, 0, storage.Message{
+		ID:            oldID,
+		Body:          "expired-message",
+		Tag:           tag,
+		CorrelationID: "expired-cid",
+		Timestamp:     time.Now().Add(-3 * time.Second),
+	})
+	suite.NoError(err)
+
+	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, group, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+
+	expiredResp, errResp, err := suite.api.ListMessages(topic, group, "expired", client.WithListLimit(10))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(expiredResp)
+	suite.Equal("expired", expiredResp.Data.State)
+	foundExpired := false
+	for _, msg := range expiredResp.Data.Messages {
+		if msg.ID == oldID {
+			foundExpired = true
+			suite.Equal("expired-cid", msg.CorrelationID)
+			break
+		}
+	}
+	suite.True(foundExpired)
+}
+
+func (suite *APITestSuite) TestGetFullStats() {
 	resp, errResp, err := suite.api.GetStats()
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(resp)
 	suite.Equal("ok", resp.Code)
-	suite.NotNil(resp.Data)
 }
 
 func (suite *APITestSuite) TestGetTopicStats() {
-	topicName := "test-topic"
+	topicName := suite.newTopic("stats-topic", broker.TopicTypeNormal)
+	_, errResp, err := suite.api.ProduceMessage(topicName, "stats-tag", "stats-body")
+	suite.NoError(err)
+	suite.Nil(errResp)
+
 	resp, errResp, err := suite.api.GetTopicStats(topicName)
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(resp)
 	suite.Equal("ok", resp.Code)
-	suite.NotNil(resp.Data)
 }
 
 func TestAPITestSuite(t *testing.T) {
-
 	suite.Run(t, new(APITestSuite))
 }

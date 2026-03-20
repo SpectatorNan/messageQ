@@ -1,10 +1,11 @@
 package api
 
 import (
+	"strings"
+
 	"github.com/SpectatorNan/messageQ/go/mq/errx"
 	"github.com/SpectatorNan/messageQ/go/mq/logger"
 	client "github.com/SpectatorNan/messageQ/go/sdk"
-	"strings"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -19,21 +20,23 @@ type (
 		ScheduledAt *client.FlexibleUnix `json:"scheduledAt,omitempty"`
 	}
 	ProduceMessageResponse struct {
-		ID          string `json:"id"`
-		Topic       string `json:"topic"`
-		Tag         string `json:"tag"`
-		Body        string `json:"body"`
-		Timestamp   int64  `json:"timestamp"`
-		Retry       int    `json:"retry"`
-		ScheduledAt int64  `json:"scheduledAt"`
-		ExecutedAt  *int64 `json:"executedAt"`
+		ID            string `json:"id"`
+		Topic         string `json:"topic"`
+		Tag           string `json:"tag"`
+		Body          string `json:"body"`
+		CorrelationID string `json:"correlationId,omitempty"`
+		Timestamp     int64  `json:"timestamp"`
+		Retry         int    `json:"retry"`
+		ScheduledAt   int64  `json:"scheduledAt"`
+		ExecutedAt    *int64 `json:"executedAt"`
 	}
 	ProduceBatchMessage struct {
-		Body        string               `json:"body"`
-		Tag         string               `json:"tag"`
-		DelayMs     int64                `json:"delayMs"`
-		DelaySec    int64                `json:"delaySec"`
-		ScheduledAt *client.FlexibleUnix `json:"scheduledAt,omitempty"`
+		Body          string               `json:"body"`
+		Tag           string               `json:"tag"`
+		CorrelationID string               `json:"correlationId,omitempty"`
+		DelayMs       int64                `json:"delayMs"`
+		DelaySec      int64                `json:"delaySec"`
+		ScheduledAt   *client.FlexibleUnix `json:"scheduledAt,omitempty"`
 	}
 	ProduceBatchRequest struct {
 		Topic    string                `uri:"topic" binding:"required"`
@@ -99,6 +102,26 @@ type (
 		Topic     string `json:"topic"`
 		Requeued  bool   `json:"requeued"`
 	}
+	TerminateMessageRequest struct {
+		ID    string `uri:"id" binding:"required"`
+		Topic string `uri:"topic" binding:"required"`
+	}
+	TerminateResponse struct {
+		MessageID  string `json:"messageId"`
+		Terminated bool   `json:"terminated"`
+		Topic      string `json:"topic"`
+		State      string `json:"state"`
+	}
+	TerminateBatchRequest struct {
+		Topic      string   `uri:"topic" binding:"required"`
+		MessageIDs []string `json:"messageIds"`
+	}
+	TerminateBatchResponse struct {
+		MessageIDs      []string `json:"messageIds"`
+		TerminatedCount int      `json:"terminatedCount"`
+		Topic           string   `json:"topic"`
+		State           string   `json:"state"`
+	}
 	// ConsumeMessageResponse is the response for consuming a message
 	ConsumeMessageResponse struct {
 		Message    ConsumeMessage `json:"message"` // storage.Message
@@ -110,34 +133,38 @@ type (
 		State      string         `json:"state"`
 	}
 	ConsumeMessage struct {
-		ID        string `json:"id"`
-		Body      string `json:"body"`
-		Tag       string `json:"tag,omitempty"`
-		Retry     int    `json:"retry"`
-		Timestamp int64  `json:"timestamp"`
+		ID            string `json:"id"`
+		Body          string `json:"body"`
+		Tag           string `json:"tag,omitempty"`
+		CorrelationID string `json:"correlationId,omitempty"`
+		Retry         int    `json:"retry"`
+		Timestamp     int64  `json:"timestamp"`
 	}
 	ConsumeBatchMessage struct {
-		ID         string `json:"id"`
-		Body       string `json:"body"`
-		Tag        string `json:"tag,omitempty"`
-		Retry      int    `json:"retry"`
-		Timestamp  int64  `json:"timestamp"`
-		QueueID    int    `json:"queueId"`
-		Offset     int64  `json:"offset"`
-		NextOffset int64  `json:"nextOffset"`
+		ID            string `json:"id"`
+		Body          string `json:"body"`
+		Tag           string `json:"tag,omitempty"`
+		CorrelationID string `json:"correlationId,omitempty"`
+		Retry         int    `json:"retry"`
+		Timestamp     int64  `json:"timestamp"`
+		QueueID       int    `json:"queueId"`
+		Offset        int64  `json:"offset"`
+		NextOffset    int64  `json:"nextOffset"`
 	}
 	MessageStatus struct {
-		ID          string `json:"id"`
-		Body        string `json:"body"`
-		Tag         string `json:"tag,omitempty"`
-		Retry       int    `json:"retry"`
-		Timestamp   int64  `json:"timestamp"`
-		ScheduledAt *int64 `json:"scheduledAt,omitempty"`
-		ConsumedAt  *int64 `json:"consumedAt,omitempty"`
-		AckedAt     *int64 `json:"ackedAt,omitempty"`
-		QueueID     *int   `json:"queueId,omitempty"`
-		Offset      *int64 `json:"offset,omitempty"`
-		NextOffset  *int64 `json:"nextOffset,omitempty"`
+		ID            string `json:"id"`
+		Body          string `json:"body"`
+		Tag           string `json:"tag,omitempty"`
+		CorrelationID string `json:"correlationId,omitempty"`
+		Retry         int    `json:"retry"`
+		Timestamp     int64  `json:"timestamp"`
+		ScheduledAt   *int64 `json:"scheduledAt,omitempty"`
+		ConsumedAt    *int64 `json:"consumedAt,omitempty"`
+		AckedAt       *int64 `json:"ackedAt,omitempty"`
+		EventAt       *int64 `json:"eventAt,omitempty"`
+		QueueID       *int   `json:"queueId,omitempty"`
+		Offset        *int64 `json:"offset,omitempty"`
+		NextOffset    *int64 `json:"nextOffset,omitempty"`
 	}
 	ConsumeBatchResponse struct {
 		Messages []ConsumeBatchMessage `json:"messages"`
@@ -154,6 +181,8 @@ type (
 	}
 )
 
+const maxCorrelationIDBytes = 128
+
 func (r *ProduceMessageRequest) Validate() error {
 
 	if err := validateTopicName(r.Topic); err != nil {
@@ -166,6 +195,9 @@ func (r *ProduceMessageRequest) Validate() error {
 	}
 	if strings.TrimSpace(r.Tag) == "" {
 		return errx.ErrInvalidMessage
+	}
+	if err := validateCorrelationID(r.CorrelationID); err != nil {
+		return err
 	}
 
 	return nil
@@ -211,7 +243,7 @@ func (r *ListMessagesRequest) Validate() error {
 		logger.Warn("Invalid group name", zap.String("group", r.GroupName))
 		return err
 	}
-	if r.State != "" && r.State != "processing" && r.State != "acked" && r.State != "completed" && r.State != "pending" && r.State != "scheduled" {
+	if r.State != "" && r.State != "processing" && r.State != "acked" && r.State != "completed" && r.State != "pending" && r.State != "scheduled" && r.State != "cancelled" && r.State != "expired" && r.State != "retry" && r.State != "dlq" {
 		return errx.ErrInvalidMessage
 	}
 	if (r.State == "pending" || r.State == "scheduled") && r.QueueId != nil && *r.QueueId < 0 {
@@ -287,6 +319,42 @@ func (r *NackMessageRequest) Validate() error {
 	if _, err := uuid.Parse(r.ID); err != nil {
 		logger.Warn("Invalid message ID format", zap.String("message_id", r.ID), zap.Error(err))
 		return errx.ErrInvalidID
+	}
+	return nil
+}
+
+func (r *TerminateMessageRequest) Validate() error {
+	if err := validateTopicName(r.Topic); err != nil {
+		logger.Warn("Invalid topic name", zap.String("topic", r.Topic))
+		return err
+	}
+	if _, err := uuid.Parse(r.ID); err != nil {
+		logger.Warn("Invalid message ID format", zap.String("message_id", r.ID), zap.Error(err))
+		return errx.ErrInvalidID
+	}
+	return nil
+}
+
+func (r *TerminateBatchRequest) Validate() error {
+	if err := validateTopicName(r.Topic); err != nil {
+		logger.Warn("Invalid topic name", zap.String("topic", r.Topic))
+		return err
+	}
+	if len(r.MessageIDs) == 0 {
+		return errx.ErrInvalidMessage
+	}
+	for _, id := range r.MessageIDs {
+		if _, err := uuid.Parse(id); err != nil {
+			logger.Warn("Invalid message ID format", zap.String("message_id", id), zap.Error(err))
+			return errx.ErrInvalidID
+		}
+	}
+	return nil
+}
+
+func validateCorrelationID(correlationID string) error {
+	if len([]byte(correlationID)) > maxCorrelationIDBytes {
+		return errx.ErrInvalidMessage
 	}
 	return nil
 }

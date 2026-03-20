@@ -107,6 +107,7 @@ Binary record per segment:
 
 Each entry is 20 bytes:
 
+
 ```
 [segId:4][pos:8][size:4][tagHash:4]
 ```

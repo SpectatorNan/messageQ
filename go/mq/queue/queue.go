@@ -51,11 +51,12 @@ func NewQueueWithStorage(store storage.Storage, topic string, queueID int) *Queu
 			// convert storage.Message to queue.Message
 			for _, sm := range msgs {
 				qm := Message{
-					ID:        sm.ID,
-					Body:      sm.Body,
-					Tag:       sm.Tag,
-					Retry:     sm.Retry,
-					Timestamp: sm.Timestamp,
+					ID:            sm.ID,
+					Body:          sm.Body,
+					Tag:           sm.Tag,
+					CorrelationID: sm.CorrelationID,
+					Retry:         sm.Retry,
+					Timestamp:     sm.Timestamp,
 				}
 				q.data = append(q.data, qm)
 			}
@@ -76,8 +77,8 @@ func (q *Queue) TryDequeue() (Message, bool) {
 	return msg, true
 }
 
-// Enqueue adds a message with an optional tag.
-func (q *Queue) Enqueue(body string, tag string) Message {
+// Enqueue adds a message with an optional correlation id.
+func (q *Queue) Enqueue(body string, tag string, correlationID string) Message {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -93,20 +94,22 @@ func (q *Queue) Enqueue(body string, tag string) Message {
 		uid = uuid.New()
 	}
 	msg := Message{
-		ID:        uid.String(),
-		Body:      body,
-		Tag:       tag,
-		Timestamp: time.Now(),
+		ID:            uid.String(),
+		Body:          body,
+		Tag:           tag,
+		CorrelationID: correlationID,
+		Timestamp:     time.Now(),
 	}
 
 	q.data = append(q.data, msg)
 	if q.store != nil {
 		sm := storage.Message{
-			ID:        msg.ID,
-			Body:      msg.Body,
-			Tag:       msg.Tag,
-			Retry:     msg.Retry,
-			Timestamp: msg.Timestamp,
+			ID:            msg.ID,
+			Body:          msg.Body,
+			Tag:           msg.Tag,
+			CorrelationID: msg.CorrelationID,
+			Retry:         msg.Retry,
+			Timestamp:     msg.Timestamp,
 		}
 		_ = q.store.Append(q.topic, q.queueID, sm)
 	}
@@ -116,7 +119,7 @@ func (q *Queue) Enqueue(body string, tag string) Message {
 
 // EnqueueBody keeps backward compatibility for callers without tags.
 func (q *Queue) EnqueueBody(body string) Message {
-	return q.Enqueue(body, "")
+	return q.Enqueue(body, "", "")
 }
 
 // Dequeue is deprecated - system uses ConsumeQueue + Offset pattern
@@ -182,11 +185,12 @@ func (q *Queue) persistRetry(msg Message) {
 		return
 	}
 	sm := storage.Message{
-		ID:        msg.ID,
-		Body:      msg.Body,
-		Tag:       msg.Tag,
-		Retry:     msg.Retry,
-		Timestamp: msg.Timestamp,
+		ID:            msg.ID,
+		Body:          msg.Body,
+		Tag:           msg.Tag,
+		CorrelationID: msg.CorrelationID,
+		Retry:         msg.Retry,
+		Timestamp:     msg.Timestamp,
 	}
 	if err := q.store.Append(q.topic, q.queueID, sm); err != nil {
 		logger.Error("Failed to persist retry message",
@@ -203,11 +207,12 @@ func (q *Queue) persistDLQ(msg Message) {
 	}
 	topicDLQ := q.topic + ".dlq"
 	sm := storage.Message{
-		ID:        msg.ID,
-		Body:      msg.Body,
-		Tag:       msg.Tag,
-		Retry:     msg.Retry,
-		Timestamp: msg.Timestamp,
+		ID:            msg.ID,
+		Body:          msg.Body,
+		Tag:           msg.Tag,
+		CorrelationID: msg.CorrelationID,
+		Retry:         msg.Retry,
+		Timestamp:     msg.Timestamp,
 	}
 	if err := q.store.Append(topicDLQ, 0, sm); err != nil {
 		logger.Error("Failed to append message to DLQ",

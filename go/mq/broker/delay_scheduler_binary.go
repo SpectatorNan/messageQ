@@ -26,6 +26,10 @@ type BinaryDelayScheduler struct {
 	initialized  bool
 }
 
+type delaySnapshotStore interface {
+	ReplaceTopicMessages(topic string, queueID int, msgs []storage.Message) error
+}
+
 // NewBinaryDelayScheduler creates a scheduler using binary CommitLog storage
 func NewBinaryDelayScheduler(store storage.Storage, tm *TopicManager) (*BinaryDelayScheduler, error) {
 	ds := &BinaryDelayScheduler{
@@ -109,6 +113,23 @@ func (ds *BinaryDelayScheduler) Schedule(dm *DelayedMessage) {
 	}
 }
 
+// ScheduleStrict adds a delayed message and rolls the in-memory queue back if persistence fails.
+func (ds *BinaryDelayScheduler) ScheduleStrict(dm *DelayedMessage) error {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	heap.Push(&ds.delayQueue, dm)
+	if !ds.initialized {
+		return nil
+	}
+	if err := ds.persistToCommitLog(); err != nil {
+		if idx := ds.indexOfDelayedMessage(dm.Topic, dm.QueueID, dm.Message.ID); idx >= 0 {
+			heap.Remove(&ds.delayQueue, idx)
+		}
+		return err
+	}
+	return nil
+}
+
 // ScheduleWithDelay schedules a message with relative delay from now
 func (ds *BinaryDelayScheduler) ScheduleWithDelay(topic string, queueID int, msg storage.Message, delay time.Duration) {
 	dm := &DelayedMessage{
@@ -118,6 +139,45 @@ func (ds *BinaryDelayScheduler) ScheduleWithDelay(topic string, queueID int, msg
 		ExecuteAt: time.Now().Add(delay),
 	}
 	ds.Schedule(dm)
+}
+
+// ScheduleWithDelayStrict schedules a message with rollback on persistence failure.
+func (ds *BinaryDelayScheduler) ScheduleWithDelayStrict(topic string, queueID int, msg storage.Message, delay time.Duration) error {
+	dm := &DelayedMessage{
+		Message:   msg,
+		Topic:     topic,
+		QueueID:   queueID,
+		ExecuteAt: time.Now().Add(delay),
+	}
+	return ds.ScheduleStrict(dm)
+}
+
+func (ds *BinaryDelayScheduler) indexOfDelayedMessage(topic string, queueID int, msgID string) int {
+	for i, dm := range ds.delayQueue {
+		if dm.Topic == topic && dm.QueueID == queueID && dm.Message.ID == msgID {
+			return i
+		}
+	}
+	return -1
+}
+
+// RemoveScheduled removes a scheduled message and rolls the removal back if persistence fails.
+func (ds *BinaryDelayScheduler) RemoveScheduled(topic string, queueID int, msgID string) error {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	idx := ds.indexOfDelayedMessage(topic, queueID, msgID)
+	if idx < 0 {
+		return nil
+	}
+	removed := heap.Remove(&ds.delayQueue, idx).(*DelayedMessage)
+	if !ds.initialized {
+		return nil
+	}
+	if err := ds.persistToCommitLog(); err != nil {
+		heap.Push(&ds.delayQueue, removed)
+		return err
+	}
+	return nil
 }
 
 // Stop gracefully shuts down the scheduler
@@ -204,7 +264,7 @@ func (ds *BinaryDelayScheduler) ListScheduled(topic string, queueID *int, cursor
 func (ds *BinaryDelayScheduler) persistToCommitLog() error {
 	// Build binary representation
 	var buf []byte
-	
+
 	// Write count
 	count := uint32(ds.delayQueue.Len())
 	countBytes := make([]byte, 4)
@@ -235,9 +295,21 @@ func (ds *BinaryDelayScheduler) persistToCommitLog() error {
 		buf = append(buf, msgBinary...)
 	}
 
-	// Write to system topic (queue 0)
-	// Use special message with body containing the binary data
-	// Generate a proper UUID for the message ID
+	if rs, ok := ds.store.(delaySnapshotStore); ok {
+		if count == 0 {
+			return rs.ReplaceTopicMessages(SystemDelayTopic, 0, nil)
+		}
+		metaMsg := storage.Message{
+			ID:        uuid.New().String(),
+			Body:      string(buf), // Store binary as string
+			Tag:       "__DELAY_META__",
+			Retry:     0,
+			Timestamp: time.Now(),
+		}
+		return rs.ReplaceTopicMessages(SystemDelayTopic, 0, []storage.Message{metaMsg})
+	}
+
+	// Fallback for non-WAL stores keeps the historical append-only snapshot behavior.
 	metaMsg := storage.Message{
 		ID:        uuid.New().String(),
 		Body:      string(buf), // Store binary as string
@@ -245,8 +317,6 @@ func (ds *BinaryDelayScheduler) persistToCommitLog() error {
 		Retry:     0,
 		Timestamp: time.Now(),
 	}
-
-	// Always append to queue 0 of system topic, overwrite by reading latest
 	return ds.store.Append(SystemDelayTopic, 0, metaMsg)
 }
 
@@ -325,7 +395,7 @@ func (ds *BinaryDelayScheduler) loadFromCommitLog() error {
 }
 
 // encodeDelayMessage encodes a message to binary format
-// Format: [id_len:2][id][retry:2][ts:8][tag_len:2][tag][body_len:4][body]
+// Format: [id_len:2][id][retry:2][ts:8][tag_len:2][tag][body_len:4][body][correlation_id_len:2][correlation_id]
 func encodeDelayMessage(msg storage.Message) []byte {
 	var buf []byte
 
@@ -359,6 +429,12 @@ func encodeDelayMessage(msg storage.Message) []byte {
 	binary.BigEndian.PutUint32(bodyLenBytes, uint32(len(bodyBytes)))
 	buf = append(buf, bodyLenBytes...)
 	buf = append(buf, bodyBytes...)
+
+	correlationIDBytes := []byte(msg.CorrelationID)
+	correlationIDLenBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(correlationIDLenBytes, uint16(len(correlationIDBytes)))
+	buf = append(buf, correlationIDLenBytes...)
+	buf = append(buf, correlationIDBytes...)
 
 	return buf
 }
@@ -418,6 +494,20 @@ func decodeDelayMessage(buf []byte) (storage.Message, int) {
 	}
 	msg.Body = string(buf[offset : offset+int(bodyLen)])
 	offset += int(bodyLen)
+
+	if offset == len(buf) {
+		return msg, offset
+	}
+	if offset+2 > len(buf) {
+		return msg, 0
+	}
+	correlationIDLen := binary.BigEndian.Uint16(buf[offset : offset+2])
+	offset += 2
+	if offset+int(correlationIDLen) > len(buf) {
+		return msg, 0
+	}
+	msg.CorrelationID = string(buf[offset : offset+int(correlationIDLen)])
+	offset += int(correlationIDLen)
 
 	return msg, offset
 }

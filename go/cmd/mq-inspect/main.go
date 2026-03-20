@@ -53,6 +53,24 @@ func listSegments(dir string, topic string, queueID int) ([]string, error) {
 	return segs, nil
 }
 
+func consumeQueueBaseOffsetPath(dir, topic string, queueID int) string {
+	return filepath.Join(dir, "consumequeue", topic, fmt.Sprintf("%d", queueID), "base.offset")
+}
+
+func readConsumeQueueBaseOffset(dir, topic string, queueID int) (int64, error) {
+	b, err := os.ReadFile(consumeQueueBaseOffsetPath(dir, topic, queueID))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if len(b) < 8 {
+		return 0, fmt.Errorf("invalid consumequeue base offset file")
+	}
+	return int64(binary.BigEndian.Uint64(b[:8])), nil
+}
+
 func inspectSegment(path string, showPayload bool) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -131,13 +149,19 @@ func inspectSegment(path string, showPayload bool) error {
 	return nil
 }
 
-func inspectConsumeQueue(path string) error {
+func inspectConsumeQueue(dir, topic string, queueID int) error {
+	path := consumeQueuePath(dir, topic, queueID)
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	baseOffset, err := readConsumeQueueBaseOffset(dir, topic, queueID)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("ConsumeQueue: %s\n", path)
+	fmt.Printf("  baseOffset=%d\n", baseOffset)
 	idx := 0
 	for {
 		var buf [cqEntrySize]byte
@@ -152,8 +176,19 @@ func inspectConsumeQueue(path string) error {
 		pos := binary.BigEndian.Uint64(buf[4:12])
 		size := binary.BigEndian.Uint32(buf[12:16])
 		tagHash := binary.BigEndian.Uint32(buf[16:20])
-		fmt.Printf("  %d: seg=%08d pos=%d size=%d tagHash=%08x\n", idx, segID, pos, size, tagHash)
+		logicalOffset := baseOffset + int64(idx-1)
+		segPath := filepath.Join(dir, "commitlog", topic, fmt.Sprintf("%d", queueID), fmt.Sprintf("%08d.wal", segID))
+		status := "present"
+		if _, err := os.Stat(segPath); err != nil {
+			if os.IsNotExist(err) {
+				status = "missing"
+			} else {
+				status = "error"
+			}
+		}
+		fmt.Printf("  %d: logicalOffset=%d seg=%08d pos=%d size=%d tagHash=%08x segment=%s\n", idx, logicalOffset, segID, pos, size, tagHash, status)
 	}
+	fmt.Printf("  logicalTail=%d\n", baseOffset+int64(idx))
 	return nil
 }
 
@@ -166,8 +201,16 @@ func inspectOffsets(dir, group, topic string, queueID int) error {
 	if len(b) < 8 {
 		return fmt.Errorf("invalid offset file")
 	}
-	offset := binary.BigEndian.Uint64(b[:8])
-	fmt.Printf("Offset: group=%s topic=%s queue=%d offset=%d\n", group, topic, queueID, offset)
+	offset := int64(binary.BigEndian.Uint64(b[:8]))
+	baseOffset, err := readConsumeQueueBaseOffset(dir, topic, queueID)
+	if err != nil {
+		return err
+	}
+	effectiveOffset := offset
+	if effectiveOffset < baseOffset {
+		effectiveOffset = baseOffset
+	}
+	fmt.Printf("Offset: group=%s topic=%s queue=%d raw=%d effective=%d baseOffset=%d\n", group, topic, queueID, offset, effectiveOffset, baseOffset)
 	return nil
 }
 
@@ -176,7 +219,6 @@ func consumeQueuePath(dir, topic string, queueID int) string {
 }
 
 func inspectDelayMessages(dir string) error {
-	// Read from system delay topic
 	segs, err := listSegments(dir, SystemDelayTopic, 0)
 	if err != nil {
 		return fmt.Errorf("failed to list delay topic segments: %v", err)
@@ -186,58 +228,57 @@ func inspectDelayMessages(dir string) error {
 		return nil
 	}
 
-	// Read the latest segment (contains the current state)
-	latestSeg := segs[len(segs)-1]
-	f, err := os.Open(latestSeg)
-	if err != nil {
-		return fmt.Errorf("failed to open segment: %v", err)
-	}
-	defer f.Close()
-
 	fmt.Printf("Delay Messages (from %s):\n", SystemDelayTopic)
 	fmt.Println(strings.Repeat("=", 80))
 
-	// Read and validate WAL header
-	var hdr [8]byte
-	if _, err := io.ReadFull(f, hdr[:]); err != nil {
-		return fmt.Errorf("failed to read header: %v", err)
-	}
-	if string(hdr[0:4]) != "MQW1" {
-		return fmt.Errorf("invalid wal magic")
-	}
-
-	// Read all messages and find the last one with __DELAY_META__ tag
 	var lastMetaPayload []byte
-	for {
-		var lenBuf [4]byte
-		if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
-			break
+	for _, seg := range segs {
+		f, err := os.Open(seg)
+		if err != nil {
+			return fmt.Errorf("failed to open segment: %v", err)
 		}
-		total := binary.BigEndian.Uint32(lenBuf[:])
-		payload := make([]byte, total)
-		if _, err := io.ReadFull(f, payload); err != nil {
-			break
+		var hdr [8]byte
+		if _, err := io.ReadFull(f, hdr[:]); err != nil {
+			_ = f.Close()
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				continue
+			}
+			return fmt.Errorf("failed to read header: %v", err)
 		}
+		if string(hdr[0:4]) != "MQW1" {
+			_ = f.Close()
+			return fmt.Errorf("invalid wal magic")
+		}
+		for {
+			var lenBuf [4]byte
+			if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
+				break
+			}
+			total := binary.BigEndian.Uint32(lenBuf[:])
+			payload := make([]byte, total)
+			if _, err := io.ReadFull(f, payload); err != nil {
+				break
+			}
 
-		// Parse message to check tag
-		off := 4 + 16 + 2 + 8 // skip crc + uuid + retry + ts
-		if off+2 > len(payload) {
-			continue
+			off := 4 + 16 + 2 + 8 // skip crc + uuid + retry + ts
+			if off+2 > len(payload) {
+				continue
+			}
+			tagLen := int(binary.BigEndian.Uint16(payload[off : off+2]))
+			off += 2
+			if off+tagLen > len(payload) {
+				continue
+			}
+			tag := string(payload[off : off+tagLen])
+			if tag == "__DELAY_META__" {
+				lastMetaPayload = payload
+			}
 		}
-		tagLen := int(binary.BigEndian.Uint16(payload[off : off+2]))
-		off += 2
-		if off+tagLen > len(payload) {
-			continue
-		}
-		tag := string(payload[off : off+tagLen])
-		
-		if tag == "__DELAY_META__" {
-			lastMetaPayload = payload
-		}
+		_ = f.Close()
 	}
 
 	if lastMetaPayload == nil {
-		fmt.Println("No delay meta message found")
+		fmt.Println("No delayed messages found")
 		return nil
 	}
 
@@ -416,8 +457,7 @@ func main() {
 		return
 	}
 	if *showCQ {
-		cqPath := consumeQueuePath(*dir, *topic, *queueID)
-		if err := inspectConsumeQueue(cqPath); err != nil {
+		if err := inspectConsumeQueue(*dir, *topic, *queueID); err != nil {
 			fmt.Fprintf(os.Stderr, "error inspecting consumequeue: %v\n", err)
 			os.Exit(2)
 		}
