@@ -66,6 +66,34 @@ func consumeRRAdvance(group string, topic string, tag string, queueCount int, ne
 	consumeQueueRR.mu.Unlock()
 }
 
+func beginConsumedMessageProcessing(b *broker.Broker, group, logicalTopic, storageTopic string, queueID int, msg storage.MessageWithOffset) error {
+	return b.BeginProcessing(group, logicalTopic, storageTopic, queueID, msg.Offset, msg.Offset+1, queue.Message{
+		ID:            msg.ID,
+		Body:          msg.Body,
+		Tag:           msg.Tag,
+		CorrelationID: msg.CorrelationID,
+		Retry:         msg.Retry,
+		Timestamp:     msg.Timestamp,
+	})
+}
+
+func rollbackConsumedMessages(b *broker.Broker, group, topic string, msgIDs []string) {
+	for _, msgID := range msgIDs {
+		if ok, err := b.RetryProcessing(msgID, group, topic); err != nil {
+			logger.Error("Failed to roll back consumed message after processing persistence error",
+				zap.String("group", group),
+				zap.String("topic", topic),
+				zap.String("message_id", msgID),
+				zap.Error(err))
+		} else if !ok {
+			logger.Error("Failed to roll back consumed message after processing persistence error",
+				zap.String("group", group),
+				zap.String("topic", topic),
+				zap.String("message_id", msgID))
+		}
+	}
+}
+
 func resolveDelay(delayMs int64, delaySec int64, scheduledAt *client.FlexibleUnix) (time.Duration, error) {
 	if scheduledAt != nil {
 		if delayMs != 0 || delaySec != 0 {
@@ -395,14 +423,19 @@ func ConsumeHandler(b *broker.Broker) gin.HandlerFunc {
 		msg := msgs[0]
 		offset := msg.Offset
 		next := msg.Offset + 1
-		b.BeginProcessing(req.GroupName, req.Topic, storageTopic, queueID, offset, next, queue.Message{
-			ID:            msg.ID,
-			Body:          msg.Body,
-			Tag:           msg.Tag,
-			CorrelationID: msg.CorrelationID,
-			Retry:         msg.Retry,
-			Timestamp:     msg.Timestamp,
-		})
+		if err := beginConsumedMessageProcessing(b, req.GroupName, req.Topic, storageTopic, queueID, msg); err != nil {
+			logger.Error("Failed to persist processing state",
+				zap.String("group", req.GroupName),
+				zap.String("topic", req.Topic),
+				zap.String("storage_topic", storageTopic),
+				zap.String("message_id", msg.ID),
+				zap.Int("queue_id", queueID),
+				zap.Int64("offset", offset),
+				zap.Error(err))
+			rollbackConsumedMessages(b, req.GroupName, req.Topic, []string{msg.ID})
+			respx.FailGin(c, errx.ErrInternal)
+			return
+		}
 
 		logger.Info("Message consumed",
 			zap.String("group", req.GroupName),
@@ -486,6 +519,25 @@ func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
 		var queueID int
 		var err error
 		out := make([]ConsumeBatchMessage, 0, max)
+		startedIDs := make([]string, 0, max)
+		beginAndTrack := func(storageTopic string, queueID int, msg storage.MessageWithOffset) bool {
+			if err := beginConsumedMessageProcessing(b, req.GroupName, req.Topic, storageTopic, queueID, msg); err != nil {
+				logger.Error("Failed to persist processing state",
+					zap.String("group", req.GroupName),
+					zap.String("topic", req.Topic),
+					zap.String("storage_topic", storageTopic),
+					zap.String("message_id", msg.ID),
+					zap.Int("queue_id", queueID),
+					zap.Int64("offset", msg.Offset),
+					zap.Error(err))
+				rollbackIDs := append(append([]string(nil), startedIDs...), msg.ID)
+				rollbackConsumedMessages(b, req.GroupName, req.Topic, rollbackIDs)
+				respx.FailGin(c, errx.ErrInternal)
+				return false
+			}
+			startedIDs = append(startedIDs, msg.ID)
+			return true
+		}
 
 		if req.QueueId != nil {
 			queueID = *req.QueueId
@@ -496,6 +548,9 @@ func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
 				return
 			}
 			for _, msg := range msgs {
+				if !beginAndTrack(storageTopic, queueID, msg) {
+					return
+				}
 				out = append(out, ConsumeBatchMessage{
 					ID:            msg.ID,
 					Body:          msg.Body,
@@ -506,14 +561,6 @@ func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
 					QueueID:       queueID,
 					Offset:        msg.Offset,
 					NextOffset:    msg.Offset + 1,
-				})
-				b.BeginProcessing(req.GroupName, req.Topic, storageTopic, queueID, msg.Offset, msg.Offset+1, queue.Message{
-					ID:            msg.ID,
-					Body:          msg.Body,
-					Tag:           msg.Tag,
-					CorrelationID: msg.CorrelationID,
-					Retry:         msg.Retry,
-					Timestamp:     msg.Timestamp,
 				})
 			}
 		} else {
@@ -532,6 +579,9 @@ func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
 					continue
 				}
 				for _, msg := range msgs {
+					if !beginAndTrack(storageTopic, idx, msg) {
+						return
+					}
 					out = append(out, ConsumeBatchMessage{
 						ID:            msg.ID,
 						Body:          msg.Body,
@@ -542,14 +592,6 @@ func ConsumeBatchHandler(b *broker.Broker) gin.HandlerFunc {
 						QueueID:       idx,
 						Offset:        msg.Offset,
 						NextOffset:    msg.Offset + 1,
-					})
-					b.BeginProcessing(req.GroupName, req.Topic, storageTopic, idx, msg.Offset, msg.Offset+1, queue.Message{
-						ID:            msg.ID,
-						Body:          msg.Body,
-						Tag:           msg.Tag,
-						CorrelationID: msg.CorrelationID,
-						Retry:         msg.Retry,
-						Timestamp:     msg.Timestamp,
 					})
 				}
 				remaining = max - len(out)
@@ -644,7 +686,11 @@ func ListMessagesHandler(b *broker.Broker) gin.HandlerFunc {
 				cursor = *req.Cursor
 			}
 			if ds := b.GetDelayScheduler(); ds != nil {
-				items, next := b.ListScheduledVisible(req.Topic, queueID, cursor, limit)
+				items, next, err := b.ListScheduledVisible(req.Topic, queueID, cursor, limit)
+				if err != nil {
+					respx.FailGin(c, errx.ErrInternal)
+					return
+				}
 				resp.State = "scheduled"
 				out := make([]MessageStatus, 0, len(items))
 				for _, item := range items {
@@ -933,7 +979,12 @@ func TerminateHandler(b *broker.Broker) gin.HandlerFunc {
 			return
 		}
 
-		if !b.TerminateMessage(req.ID, req.Topic) {
+		terminated, err := b.TerminateMessage(req.ID, req.Topic)
+		if err != nil {
+			respx.FailGin(c, errx.ErrInternal)
+			return
+		}
+		if !terminated {
 			respx.FailGin(c, errx.ErrInvalidMessage)
 			return
 		}
@@ -964,7 +1015,11 @@ func TerminateBatchHandler(b *broker.Broker) gin.HandlerFunc {
 			return
 		}
 
-		terminatedCount := b.TerminateMessages(req.Topic, req.MessageIDs)
+		terminatedCount, err := b.TerminateMessages(req.Topic, req.MessageIDs)
+		if err != nil {
+			respx.FailGin(c, errx.ErrInternal)
+			return
+		}
 		resp := TerminateBatchResponse{
 			MessageIDs:      req.MessageIDs,
 			TerminatedCount: terminatedCount,
@@ -1038,7 +1093,15 @@ func NackHandler(b *broker.Broker) gin.HandlerFunc {
 			return
 		}
 
-		if !b.RetryProcessing(req.ID, req.GroupName, req.Topic) {
+		nacked, err := b.RetryProcessing(req.ID, req.GroupName, req.Topic)
+		if err != nil {
+			logger.Error("Nack failed - persist retry state",
+				zap.String("message_id", req.ID),
+				zap.Error(err))
+			respx.FailGin(c, errx.ErrInternal)
+			return
+		}
+		if !nacked {
 			logger.Error("Nack failed - message not found", zap.String("message_id", req.ID))
 			respx.FailGin(c, errx.ErrNotFound)
 			return

@@ -1,6 +1,7 @@
 package client_test
 
 import (
+	"errors"
 	"fmt"
 	"net/http/httptest"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/SpectatorNan/messageQ/go/mq/storage"
 	client "github.com/SpectatorNan/messageQ/go/sdk"
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -27,6 +29,30 @@ type APITestSuite struct {
 	dataDir   string
 	adminKey  string
 	accessKey string
+}
+
+type failingSDKProcessingStore struct {
+	*storage.WALStorage
+	saveErr          error
+	retryEventErr    error
+	terminalEventErr error
+}
+
+func (s *failingSDKProcessingStore) SaveProcessing(rec storage.ProcessingRecord) error {
+	if s.saveErr != nil {
+		return s.saveErr
+	}
+	return s.WALStorage.SaveProcessing(rec)
+}
+
+func (s *failingSDKProcessingStore) AppendDeliveryEvent(rec storage.DeliveryEventRecord) error {
+	if rec.Event == storage.DeliveryEventRetry && s.retryEventErr != nil {
+		return s.retryEventErr
+	}
+	if (rec.Event == storage.DeliveryEventCancelled || rec.Event == storage.DeliveryEventExpired) && s.terminalEventErr != nil {
+		return s.terminalEventErr
+	}
+	return s.WALStorage.AppendDeliveryEvent(rec)
 }
 
 func (suite *APITestSuite) SetupSuite() {
@@ -149,6 +175,218 @@ func (suite *APITestSuite) primeGroup(topic, group, tag string) {
 	suite.Nil(resp)
 	suite.NotNil(errResp)
 	suite.Equal("not_found", errResp.Code)
+}
+
+func TestConsumeReturnsInternalErrorWhenProcessingPersistenceFails(t *testing.T) {
+	const adminKey = "adminkey123"
+	const accessKey = "test-access-key"
+
+	require.NoError(t, logger.InitDefault())
+
+	oldAdminKey, hadAdminKey := os.LookupEnv("MQ_ADMIN_KEY")
+	require.NoError(t, os.Setenv("MQ_ADMIN_KEY", adminKey))
+	defer func() {
+		if hadAdminKey {
+			_ = os.Setenv("MQ_ADMIN_KEY", oldAdminKey)
+			return
+		}
+		_ = os.Unsetenv("MQ_ADMIN_KEY")
+	}()
+
+	dataDir, err := os.MkdirTemp("", "messageq-sdk-api-processing-fail-*")
+	require.NoError(t, err)
+	defer func() {
+		_ = os.RemoveAll(dataDir)
+	}()
+
+	walStore := storage.NewWALStorage(filepath.Join(dataDir, "data"), 10*time.Millisecond, time.Minute)
+	defer func() {
+		_ = walStore.Close()
+	}()
+
+	store := &failingSDKProcessingStore{
+		WALStorage: walStore,
+		saveErr:    errors.New("save processing failed"),
+	}
+	b := broker.NewBrokerWithPersistence(store, 1, filepath.Join(dataDir, "data"))
+	defer func() {
+		_ = b.Close()
+	}()
+
+	_, err = b.AddAK("default-test-access-key", accessKey)
+	require.NoError(t, err)
+	require.NoError(t, b.CreateTopic("orders", broker.TopicTypeNormal, 1))
+
+	server := httptest.NewServer(serverapi.NewRouter(b))
+	defer server.Close()
+
+	api := client.NewAPI(server.URL, adminKey)
+	api.SetAccessKey(accessKey)
+
+	group := "group-" + uuid.NewString()
+	tag := "tag-a"
+
+	resp, errResp, err := api.ConsumeMessages("orders", group, tag, client.WithQueueId(0))
+	require.NoError(t, err)
+	require.Nil(t, resp)
+	require.NotNil(t, errResp)
+	require.Equal(t, "not_found", errResp.Code)
+
+	produceResp, errResp, err := api.ProduceMessage("orders", tag, "bad-message", client.WithCorrelationID("corr-"+uuid.NewString()))
+	require.NoError(t, err)
+	require.Nil(t, errResp)
+	require.NotNil(t, produceResp)
+
+	consumeResp, errResp, err := api.ConsumeMessages("orders", group, tag, client.WithQueueId(0))
+	require.NoError(t, err)
+	require.Nil(t, consumeResp)
+	require.NotNil(t, errResp)
+	require.Equal(t, "internal_error", errResp.Code)
+
+	retryResp, errResp, err := api.ListMessages("orders", group, "retry", client.WithListLimit(10))
+	require.NoError(t, err)
+	require.Nil(t, errResp)
+	require.NotNil(t, retryResp)
+	require.Len(t, retryResp.Data.Messages, 1)
+	require.Equal(t, produceResp.Data.ID, retryResp.Data.Messages[0].ID)
+	require.NotNil(t, retryResp.Data.Messages[0].EventAt)
+}
+
+func TestNackReturnsInternalErrorWhenRetryPersistenceFails(t *testing.T) {
+	const adminKey = "adminkey123"
+	const accessKey = "test-access-key"
+
+	require.NoError(t, logger.InitDefault())
+
+	oldAdminKey, hadAdminKey := os.LookupEnv("MQ_ADMIN_KEY")
+	require.NoError(t, os.Setenv("MQ_ADMIN_KEY", adminKey))
+	defer func() {
+		if hadAdminKey {
+			_ = os.Setenv("MQ_ADMIN_KEY", oldAdminKey)
+			return
+		}
+		_ = os.Unsetenv("MQ_ADMIN_KEY")
+	}()
+
+	dataDir, err := os.MkdirTemp("", "messageq-sdk-api-retry-fail-*")
+	require.NoError(t, err)
+	defer func() {
+		_ = os.RemoveAll(dataDir)
+	}()
+
+	walStore := storage.NewWALStorage(filepath.Join(dataDir, "data"), 10*time.Millisecond, time.Minute)
+	defer func() {
+		_ = walStore.Close()
+	}()
+
+	store := &failingSDKProcessingStore{
+		WALStorage:    walStore,
+		retryEventErr: errors.New("append retry event failed"),
+	}
+	b := broker.NewBrokerWithPersistence(store, 1, filepath.Join(dataDir, "data"))
+	defer func() {
+		_ = b.Close()
+	}()
+
+	_, err = b.AddAK("default-test-access-key", accessKey)
+	require.NoError(t, err)
+	require.NoError(t, b.CreateTopic("orders", broker.TopicTypeNormal, 1))
+
+	server := httptest.NewServer(serverapi.NewRouter(b))
+	defer server.Close()
+
+	api := client.NewAPI(server.URL, adminKey)
+	api.SetAccessKey(accessKey)
+
+	group := "group-" + uuid.NewString()
+	tag := "tag-a"
+	resp, errResp, err := api.ConsumeMessages("orders", group, tag, client.WithQueueId(0))
+	require.NoError(t, err)
+	require.Nil(t, resp)
+	require.NotNil(t, errResp)
+	require.Equal(t, "not_found", errResp.Code)
+
+	produceResp, errResp, err := api.ProduceMessage("orders", tag, "retry-bad-message", client.WithCorrelationID("corr-"+uuid.NewString()))
+	require.NoError(t, err)
+	require.Nil(t, errResp)
+	require.NotNil(t, produceResp)
+
+	consumeResp, errResp, err := api.ConsumeMessages("orders", group, tag, client.WithQueueId(0))
+	require.NoError(t, err)
+	require.Nil(t, errResp)
+	require.NotNil(t, consumeResp)
+
+	nackResp, errResp, err := api.NackMessage("orders", group, produceResp.Data.ID)
+	require.NoError(t, err)
+	require.Nil(t, nackResp)
+	require.NotNil(t, errResp)
+	require.Equal(t, "internal_error", errResp.Code)
+
+	retryResp, errResp, err := api.ListMessages("orders", group, "retry", client.WithListLimit(10))
+	require.NoError(t, err)
+	require.Nil(t, errResp)
+	require.NotNil(t, retryResp)
+	require.Len(t, retryResp.Data.Messages, 0)
+}
+
+func TestTerminateReturnsInternalErrorWhenTerminalPersistenceFails(t *testing.T) {
+	const adminKey = "adminkey123"
+	const accessKey = "test-access-key"
+
+	require.NoError(t, logger.InitDefault())
+
+	oldAdminKey, hadAdminKey := os.LookupEnv("MQ_ADMIN_KEY")
+	require.NoError(t, os.Setenv("MQ_ADMIN_KEY", adminKey))
+	defer func() {
+		if hadAdminKey {
+			_ = os.Setenv("MQ_ADMIN_KEY", oldAdminKey)
+			return
+		}
+		_ = os.Unsetenv("MQ_ADMIN_KEY")
+	}()
+
+	dataDir, err := os.MkdirTemp("", "messageq-sdk-api-terminate-fail-*")
+	require.NoError(t, err)
+	defer func() {
+		_ = os.RemoveAll(dataDir)
+	}()
+
+	walStore := storage.NewWALStorage(filepath.Join(dataDir, "data"), 10*time.Millisecond, time.Minute)
+	defer func() {
+		_ = walStore.Close()
+	}()
+
+	store := &failingSDKProcessingStore{
+		WALStorage:       walStore,
+		terminalEventErr: errors.New("append terminal event failed"),
+	}
+	b := broker.NewBrokerWithPersistence(store, 1, filepath.Join(dataDir, "data"))
+	defer func() {
+		_ = b.Close()
+	}()
+
+	_, err = b.AddAK("default-test-access-key", accessKey)
+	require.NoError(t, err)
+	require.NoError(t, b.CreateTopic("orders", broker.TopicTypeNormal, 1))
+
+	server := httptest.NewServer(serverapi.NewRouter(b))
+	defer server.Close()
+
+	api := client.NewAPI(server.URL, adminKey)
+	api.SetAccessKey(accessKey)
+
+	group := "group-" + uuid.NewString()
+	tag := "tag-a"
+	produceResp, errResp, err := api.ProduceMessage("orders", tag, "cancel-bad-message", client.WithCorrelationID("corr-"+uuid.NewString()))
+	require.NoError(t, err)
+	require.Nil(t, errResp)
+	require.NotNil(t, produceResp)
+
+	terminateResp, errResp, err := api.TerminateMessage("orders", group, produceResp.Data.ID)
+	require.NoError(t, err)
+	require.Nil(t, terminateResp)
+	require.NotNil(t, errResp)
+	require.Equal(t, "internal_error", errResp.Code)
 }
 
 func (suite *APITestSuite) TestListAccessKeys() {
@@ -503,6 +741,47 @@ func (suite *APITestSuite) TestListRetryEvents() {
 		}
 	}
 	suite.True(foundRetry)
+}
+
+func (suite *APITestSuite) TestListRetryOnlyShowsLatestState() {
+	topic := suite.newTopic("retry-latest-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("retry-latest-group")
+	tag := "retry-latest-tag"
+	suite.primeGroup(topic, group, tag)
+
+	suite.broker.SetRetryBackoff(10*time.Millisecond, 1, 10*time.Millisecond)
+	defer suite.broker.SetRetryBackoff(1*time.Second, 2, 60*time.Second)
+
+	produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, "retry-then-ack", client.WithCorrelationID("retry-latest-cid-"+uuid.NewString()))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(produceResp)
+
+	consumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(produceResp.Data.ID, consumeResp.Data.Message.ID)
+
+	nackResp, errResp, err := suite.api.NackMessage(topic, group, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(nackResp)
+	suite.True(nackResp.Data.Nacked)
+
+	retryConsumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(produceResp.Data.ID, retryConsumeResp.Data.Message.ID)
+
+	ackResp, errResp, err := suite.api.AckMessage(topic, group, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(ackResp)
+	suite.True(ackResp.Data.Acked)
+
+	retryResp, errResp, err := suite.api.ListMessages(topic, group, "retry", client.WithListLimit(10))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(retryResp)
+	for _, msg := range retryResp.Data.Messages {
+		suite.NotEqual(produceResp.Data.ID, msg.ID)
+	}
 }
 
 func (suite *APITestSuite) TestListDLQEvents() {

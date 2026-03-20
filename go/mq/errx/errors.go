@@ -2,6 +2,7 @@ package errx
 
 var (
 	ErrInvalidApi           = NewRespErr(ErrCodeInvalidApi, "invalid API endpoint or method")
+	ErrInternal             = NewRespErr(ErrCodeInternal, "internal server error")
 	ErrMissingTopic         = NewRespErr(ErrCodeMissingTopic, "missing topic parameter")
 	ErrInvalidMessage       = NewRespErr(ErrCodeInvalidMsg, "invalid message format or empty body")
 	ErrInvalidID            = NewRespErr(ErrCodeInvalidID, "invalid message id format")
@@ -31,6 +32,7 @@ var (
 // Optionally define error codes for API responses
 const (
 	ErrCodeInvalidApi           = "invalid_api"
+	ErrCodeInternal             = "internal_error"
 	ErrCodeMissingTopic         = "missing_topic"
 	ErrCodeInvalidMsg           = "invalid_message"
 	ErrCodeInvalidID            = "invalid_id"

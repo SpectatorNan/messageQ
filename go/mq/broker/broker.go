@@ -61,6 +61,7 @@ type processingEntry struct {
 type completedEntry struct {
 	Group         string
 	Topic         string
+	StorageTopic  string
 	QueueID       int
 	Offset        int64
 	NextOffset    int64
@@ -298,68 +299,174 @@ func (b *Broker) initializeExistingTopics() {
 
 // recoverProcessingRecords loads persisted processing records and schedules retries.
 func (b *Broker) recoverProcessingRecords() {
-	ps, ok := b.store.(ProcessingStore)
-	if !ok {
-		return
-	}
-	records, err := ps.LoadProcessing()
-	if err != nil {
-		logger.Warn("Failed to load processing records", zap.Error(err))
-		return
-	}
-	if len(records) == 0 {
-		return
+	var ps ProcessingStore
+	if store, ok := b.store.(ProcessingStore); ok {
+		ps = store
 	}
 
-	for _, rec := range records {
-		if b.shouldExpire(rec.Timestamp) {
-			b.recordExpired(terminalEntryFromProcessingRecord(rec, now()))
-			_ = ps.RemoveProcessing(rec.Group, rec.Topic, rec.QueueID, rec.MsgID)
-			continue
+	var records []storage.ProcessingRecord
+	if ps != nil {
+		var err error
+		records, err = ps.LoadProcessing()
+		if err != nil {
+			logger.Warn("Failed to load processing records", zap.Error(err))
+		}
+	}
+
+	latestByGroupTopic := make(map[string]map[string]storage.DeliveryEventRecord)
+	loadLatest := func(group, topic string) map[string]storage.DeliveryEventRecord {
+		key := groupTopicKey(group, topic)
+		if latest, ok := latestByGroupTopic[key]; ok {
+			return latest
+		}
+		latest, supported, err := b.latestGroupTopicDeliveryEvents(group, topic)
+		if err != nil {
+			logger.Warn("Failed to load delivery events for recovery",
+				zap.String("group", group),
+				zap.String("topic", topic),
+				zap.Error(err))
+			latestByGroupTopic[key] = nil
+			return nil
+		}
+		if !supported {
+			latestByGroupTopic[key] = nil
+			return nil
+		}
+		latestByGroupTopic[key] = latest
+		return latest
+	}
+
+	recoverRecord := func(persisted *storage.ProcessingRecord, effective storage.ProcessingRecord) {
+		removePersisted := func() {
+			if ps == nil || persisted == nil {
+				return
+			}
+			_ = ps.RemoveProcessing(persisted.Group, persisted.Topic, persisted.QueueID, persisted.MsgID)
+		}
+		if b.shouldExpire(effective.Timestamp) {
+			if err := b.recordExpired(terminalEntryFromProcessingRecord(effective, now())); err != nil {
+				logger.Error("Failed to record expired processing during recovery",
+					zap.String("group", effective.Group),
+					zap.String("topic", effective.Topic),
+					zap.String("message_id", effective.MsgID),
+					zap.Error(err))
+				return
+			}
+			removePersisted()
+			return
 		}
 
-		retryTopic, err := b.ensureRetryTopic(rec.Group, rec.Topic)
+		retryTopic, err := b.ensureRetryTopic(effective.Group, effective.Topic)
 		if err != nil {
 			logger.Error("Failed to ensure retry topic on recovery",
-				zap.String("group", rec.Group),
-				zap.String("topic", rec.Topic),
+				zap.String("group", effective.Group),
+				zap.String("topic", effective.Topic),
 				zap.Error(err))
-			continue
+			return
 		}
 
 		// schedule retry with remaining timeout window
-		deadline := rec.UpdatedAt.Add(b.processingTimeout)
+		deadline := effective.UpdatedAt.Add(b.processingTimeout)
 		delay := time.Until(deadline)
 		if delay < 0 {
 			delay = 0
 		}
-		retryCount := rec.Retry + 1
+		retryCount := effective.Retry + 1
 		msg := storage.Message{
-			ID:            rec.MsgID,
-			Body:          rec.Body,
-			Tag:           rec.Tag,
-			CorrelationID: rec.CorrelationID,
+			ID:            effective.MsgID,
+			Body:          effective.Body,
+			Tag:           effective.Tag,
+			CorrelationID: effective.CorrelationID,
 			Retry:         retryCount,
-			Timestamp:     rec.Timestamp,
+			Timestamp:     effective.Timestamp,
 		}
-		b.delayScheduler.ScheduleWithDelay(retryTopic, rec.QueueID, msg, delay)
-		b.retryCounts[rec.MsgID] = retryCount
+		if err := b.delayScheduler.ScheduleWithDelayStrict(retryTopic, effective.QueueID, msg, delay); err != nil {
+			logger.Error("Failed to schedule retry during recovery",
+				zap.String("group", effective.Group),
+				zap.String("topic", effective.Topic),
+				zap.String("message_id", effective.MsgID),
+				zap.Error(err))
+			return
+		}
+		b.retryCounts[effective.MsgID] = retryCount
 
 		eventAt := now()
-		retryEvent := deliveryEventFromProcessingRecord(storage.DeliveryEventRetry, rec, eventAt)
+		retryEvent := deliveryEventFromProcessingRecord(storage.DeliveryEventRetry, effective, eventAt)
 		retryEvent.Retry = retryCount
 		scheduledAt := eventAt.Add(delay)
 		retryEvent.ScheduledAt = &scheduledAt
 		if err := b.appendDeliveryEvent(retryEvent); err != nil {
+			if rollbackErr := b.delayScheduler.RemoveScheduled(retryTopic, effective.QueueID, effective.MsgID); rollbackErr != nil {
+				logger.Error("Failed to rollback scheduled retry during recovery",
+					zap.String("group", effective.Group),
+					zap.String("topic", effective.Topic),
+					zap.String("message_id", effective.MsgID),
+					zap.Error(rollbackErr))
+			}
 			logger.Error("Failed to append retry delivery event during recovery",
-				zap.String("group", rec.Group),
-				zap.String("topic", rec.Topic),
-				zap.String("message_id", rec.MsgID),
+				zap.String("group", effective.Group),
+				zap.String("topic", effective.Topic),
+				zap.String("message_id", effective.MsgID),
 				zap.Error(err))
+			return
 		}
 
-		// remove persisted processing record after scheduling
-		_ = ps.RemoveProcessing(rec.Group, rec.Topic, rec.QueueID, rec.MsgID)
+		removePersisted()
+	}
+
+	seen := make(map[string]struct{}, len(records))
+	for _, rec := range records {
+		key := processingKey(rec.Group, rec.Topic, rec.MsgID)
+		seen[key] = struct{}{}
+
+		effective := rec
+		if latestEvents := loadLatest(rec.Group, rec.Topic); latestEvents != nil {
+			if latest, ok := latestEvents[rec.MsgID]; ok {
+				if isSettlingDeliveryEvent(latest.Event) {
+					if ps != nil {
+						_ = ps.RemoveProcessing(rec.Group, rec.Topic, rec.QueueID, rec.MsgID)
+					}
+					continue
+				}
+				if replayRec, ok := processingRecordFromDeliveryEvent(latest); ok {
+					effective = replayRec
+				}
+			}
+		}
+		recoverRecord(&rec, effective)
+	}
+
+	gls, ok := b.store.(GroupDeliveryTopicStore)
+	if !ok {
+		return
+	}
+	namespaces, err := gls.ListGroupDeliveryTopics()
+	if err != nil {
+		logger.Warn("Failed to enumerate delivery event namespaces for recovery", zap.Error(err))
+		return
+	}
+	for group, topics := range namespaces {
+		for _, topic := range topics {
+			latestEvents := loadLatest(group, topic)
+			if latestEvents == nil {
+				continue
+			}
+			for msgID, latest := range latestEvents {
+				if latest.Event != storage.DeliveryEventProcessing {
+					continue
+				}
+				key := processingKey(group, topic, msgID)
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				replayRec, ok := processingRecordFromDeliveryEvent(latest)
+				if !ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				recoverRecord(nil, replayRec)
+			}
+		}
 	}
 }
 
@@ -558,6 +665,10 @@ func completedEntryFromDeliveryEvent(rec storage.DeliveryEventRecord) (completed
 	if rec.Event != storage.DeliveryEventAck || rec.QueueID == nil || rec.Offset == nil || rec.NextOffset == nil {
 		return completedEntry{}, false
 	}
+	storageTopic := rec.StorageTopic
+	if storageTopic == "" {
+		storageTopic = rec.Topic
+	}
 	consumedAt := rec.EventAt
 	if rec.ConsumedAt != nil && !rec.ConsumedAt.IsZero() {
 		consumedAt = *rec.ConsumedAt
@@ -565,6 +676,7 @@ func completedEntryFromDeliveryEvent(rec storage.DeliveryEventRecord) (completed
 	return completedEntry{
 		Group:         rec.Group,
 		Topic:         rec.Topic,
+		StorageTopic:  storageTopic,
 		QueueID:       *rec.QueueID,
 		Offset:        *rec.Offset,
 		NextOffset:    *rec.NextOffset,
@@ -577,6 +689,118 @@ func completedEntryFromDeliveryEvent(rec storage.DeliveryEventRecord) (completed
 		ConsumedAt:    consumedAt,
 		AckedAt:       rec.EventAt,
 	}, true
+}
+
+func processingEntryFromDeliveryEvent(rec storage.DeliveryEventRecord) (processingEntry, bool) {
+	if rec.Event != storage.DeliveryEventProcessing || strings.TrimSpace(rec.Group) == "" || rec.QueueID == nil || rec.Offset == nil || rec.NextOffset == nil {
+		return processingEntry{}, false
+	}
+	storageTopic := rec.StorageTopic
+	if storageTopic == "" {
+		storageTopic = rec.Topic
+	}
+	consumedAt := rec.EventAt
+	if rec.ConsumedAt != nil && !rec.ConsumedAt.IsZero() {
+		consumedAt = *rec.ConsumedAt
+	}
+	return processingEntry{
+		Group:         rec.Group,
+		Topic:         rec.Topic,
+		StorageTopic:  storageTopic,
+		QueueID:       *rec.QueueID,
+		Offset:        *rec.Offset,
+		NextOffset:    *rec.NextOffset,
+		MsgID:         rec.MsgID,
+		Body:          rec.Body,
+		Tag:           rec.Tag,
+		CorrelationID: rec.CorrelationID,
+		Retry:         rec.Retry,
+		Timestamp:     rec.Timestamp,
+		ConsumedAt:    consumedAt,
+		State:         stateProcessing,
+		UpdatedAt:     rec.EventAt,
+	}, true
+}
+
+func deliveryEventLatestSortRank(rec storage.DeliveryEventRecord) int {
+	if isSettlingDeliveryEvent(rec.Event) {
+		return 2
+	}
+	if rec.Event == storage.DeliveryEventProcessing {
+		return 1
+	}
+	return 0
+}
+
+func sortLatestDeliveryEvents(records []storage.DeliveryEventRecord) {
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].EventAt.Equal(records[j].EventAt) {
+			return deliveryEventLatestSortRank(records[i]) > deliveryEventLatestSortRank(records[j])
+		}
+		return records[i].EventAt.After(records[j].EventAt)
+	})
+}
+
+func latestDeliveryEventsByMsgID(records []storage.DeliveryEventRecord) map[string]storage.DeliveryEventRecord {
+	sortLatestDeliveryEvents(records)
+	latest := make(map[string]storage.DeliveryEventRecord, len(records))
+	for _, rec := range records {
+		if rec.MsgID == "" {
+			continue
+		}
+		if _, ok := latest[rec.MsgID]; ok {
+			continue
+		}
+		latest[rec.MsgID] = rec
+	}
+	return latest
+}
+
+func processingRecordFromDeliveryEvent(rec storage.DeliveryEventRecord) (storage.ProcessingRecord, bool) {
+	entry, ok := processingEntryFromDeliveryEvent(rec)
+	if !ok {
+		return storage.ProcessingRecord{}, false
+	}
+	offset := entry.Offset
+	nextOffset := entry.NextOffset
+	return storage.ProcessingRecord{
+		Group:         entry.Group,
+		Topic:         entry.Topic,
+		StorageTopic:  entry.StorageTopic,
+		QueueID:       entry.QueueID,
+		Offset:        &offset,
+		NextOffset:    &nextOffset,
+		MsgID:         entry.MsgID,
+		Body:          entry.Body,
+		Tag:           entry.Tag,
+		CorrelationID: entry.CorrelationID,
+		Retry:         entry.Retry,
+		Timestamp:     entry.Timestamp,
+		UpdatedAt:     entry.ConsumedAt,
+	}, true
+}
+
+func (b *Broker) latestGroupTopicDeliveryEvents(group, topic string) (map[string]storage.DeliveryEventRecord, bool, error) {
+	if strings.TrimSpace(group) == "" || topic == "" {
+		return nil, false, nil
+	}
+	ds, ok := b.store.(GroupDeliveryEventStore)
+	if !ok {
+		return nil, false, nil
+	}
+	allEventLimit := int(^uint(0) >> 1)
+	records, err := ds.ListGroupDeliveryEvents(group, topic, "", allEventLimit)
+	if err != nil {
+		return nil, true, err
+	}
+	if ts, ok := b.store.(TopicDeliveryEventStore); ok {
+		topicRecords, err := ts.ListTopicDeliveryEvents(topic, "", allEventLimit)
+		if err != nil {
+			return nil, true, err
+		}
+		records = append(records, topicRecords...)
+	}
+	return latestDeliveryEventsByMsgID(records), true, nil
 }
 
 func deliveryEventEntryFromRecord(rec storage.DeliveryEventRecord) (deliveryEventEntry, bool) {
@@ -923,6 +1147,16 @@ type GroupDeliveryEventStore interface {
 	ListGroupDeliveryEvents(group, topic, event string, limit int) ([]storage.DeliveryEventRecord, error)
 }
 
+// GroupDeliveryTopicStore enumerates group/topic delivery-event namespaces for replay recovery.
+type GroupDeliveryTopicStore interface {
+	ListGroupDeliveryTopics() (map[string][]string, error)
+}
+
+// QueueDeliveryEventStore loads raw delivery events for a specific queue file.
+type QueueDeliveryEventStore interface {
+	LoadDeliveryEvents(group, topic string, queueID *int) ([]storage.DeliveryEventRecord, error)
+}
+
 // SubscriptionStore provides persistence for normalized group/topic subscriptions.
 type SubscriptionStore interface {
 	SaveSubscription(rec storage.SubscriptionRecord) error
@@ -1219,7 +1453,7 @@ func (b *Broker) consumeVisibleFromTopic(group, logicalTopic, storageTopic strin
 			qid := queueID
 			off := msg.Offset
 			next := msg.Offset + 1
-			b.recordExpired(cancelledEntry{
+			if err := b.recordExpired(cancelledEntry{
 				Topic:         logicalTopic,
 				StorageTopic:  storageTopic,
 				QueueID:       &qid,
@@ -1232,7 +1466,9 @@ func (b *Broker) consumeVisibleFromTopic(group, logicalTopic, storageTopic strin
 				Retry:         msg.Retry,
 				Timestamp:     msg.Timestamp,
 				CancelledAt:   now(),
-			})
+			}); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		out = append(out, msg)
@@ -1258,30 +1494,33 @@ func (b *Broker) ConsumeVisibleWithRetry(group, topic string, queueID int, tag s
 }
 
 // BeginProcessing records a message as processing for a group/queue/offset.
-func (b *Broker) BeginProcessing(group, topic, storageTopic string, queueID int, offset, nextOffset int64, msg queue.Message) {
+func (b *Broker) BeginProcessing(group, topic, storageTopic string, queueID int, offset, nextOffset int64, msg queue.Message) error {
 	_ = nextOffset
-	b.BeginProcessingBatch(group, topic, storageTopic, queueID, offset, []queue.Message{msg})
+	return b.BeginProcessingBatch(group, topic, storageTopic, queueID, offset, []queue.Message{msg})
 }
 
 // BeginProcessingBatch records multiple messages as processing in a single lock.
-func (b *Broker) BeginProcessingBatch(group, topic, storageTopic string, queueID int, startOffset int64, msgs []queue.Message) {
+func (b *Broker) BeginProcessingBatch(group, topic, storageTopic string, queueID int, startOffset int64, msgs []queue.Message) error {
 	if len(msgs) == 0 {
-		return
+		return nil
 	}
 	if storageTopic == "" {
 		storageTopic = topic
 	}
 	consumedAt := now()
+	normalized := append([]queue.Message(nil), msgs...)
+	entries := make([]processingEntry, 0, len(normalized))
 	b.lock.Lock()
 	gs := b.stats[group]
 	if gs == nil {
 		gs = &groupStats{}
 		b.stats[group] = gs
 	}
-	for i, msg := range msgs {
+	for i, msg := range normalized {
 		// apply retry count if tracked
 		if rc := b.retryCounts[msg.ID]; rc > msg.Retry {
 			msg.Retry = rc
+			normalized[i] = msg
 		}
 		offset := startOffset + int64(i)
 		nextOffset := offset + 1
@@ -1302,16 +1541,17 @@ func (b *Broker) BeginProcessingBatch(group, topic, storageTopic string, queueID
 			State:         stateProcessing,
 			UpdatedAt:     consumedAt,
 		}
+		entries = append(entries, entry)
 		b.processing[processingKey(group, topic, msg.ID)] = entry
 	}
 	gs.Processing += int64(len(msgs))
 	b.lock.Unlock()
 
 	if ps, ok := b.store.(ProcessingStore); ok {
-		for i, msg := range msgs {
+		for i, msg := range normalized {
 			offset := startOffset + int64(i)
 			nextOffset := offset + 1
-			_ = ps.SaveProcessing(storage.ProcessingRecord{
+			if err := ps.SaveProcessing(storage.ProcessingRecord{
 				Group:         group,
 				Topic:         topic,
 				StorageTopic:  storageTopic,
@@ -1325,16 +1565,32 @@ func (b *Broker) BeginProcessingBatch(group, topic, storageTopic string, queueID
 				Retry:         msg.Retry,
 				Timestamp:     msg.Timestamp,
 				UpdatedAt:     consumedAt,
-			})
+			}); err != nil {
+				return fmt.Errorf("save processing record for group=%s topic=%s message=%s: %w", group, topic, msg.ID, err)
+			}
 		}
 	}
+	for _, entry := range entries {
+		if err := b.appendDeliveryEvent(deliveryEventFromProcessingEntry(storage.DeliveryEventProcessing, entry, consumedAt)); err != nil {
+			return fmt.Errorf("append processing delivery event for group=%s topic=%s message=%s: %w", group, topic, entry.MsgID, err)
+		}
+		if ps, ok := b.store.(ProcessingStore); ok {
+			if err := ps.RemoveProcessing(entry.Group, entry.Topic, entry.QueueID, entry.MsgID); err != nil {
+				logger.Warn("Failed to remove crash-window processing fallback after processing event",
+					zap.String("group", entry.Group),
+					zap.String("topic", entry.Topic),
+					zap.String("message_id", entry.MsgID),
+					zap.Error(err))
+			}
+		}
+	}
+	return nil
 }
 
 // RetryProcessing schedules a retry to the group retry topic or DLQ.
-// RetryProcessing schedules a retry to the group retry topic or DLQ.
-func (b *Broker) RetryProcessing(msgID, group, topic string) bool {
+func (b *Broker) RetryProcessing(msgID, group, topic string) (bool, error) {
 	if group == "" || topic == "" {
-		return false
+		return false, nil
 	}
 	key := processingKey(group, topic, msgID)
 	eventAt := now()
@@ -1343,7 +1599,7 @@ func (b *Broker) RetryProcessing(msgID, group, topic string) bool {
 	entry, ok := b.processing[key]
 	if !ok || entry.State != stateProcessing {
 		b.lock.Unlock()
-		return false
+		return false, nil
 	}
 	retryCount := b.retryCounts[msgID] + 1
 	original := entry
@@ -1360,6 +1616,17 @@ func (b *Broker) RetryProcessing(msgID, group, topic string) bool {
 			b.processing[key] = original
 		}
 		b.lock.Unlock()
+	}
+	removeCrashWindowFallback := func() {
+		if ps, ok := b.store.(ProcessingStore); ok {
+			if err := ps.RemoveProcessing(original.Group, original.Topic, original.QueueID, msgID); err != nil {
+				logger.Warn("Failed to remove crash-window processing fallback after retry",
+					zap.String("group", original.Group),
+					zap.String("topic", original.Topic),
+					zap.String("message_id", original.MsgID),
+					zap.Error(err))
+			}
+		}
 	}
 	finalizeRetrySuccess := func(clearRetry bool) {
 		b.lock.Lock()
@@ -1395,10 +1662,7 @@ func (b *Broker) RetryProcessing(msgID, group, topic string) bool {
 				zap.String("topic", original.Topic),
 				zap.String("message_id", original.MsgID),
 				zap.Error(err))
-			return false
-		}
-		if ps, ok := b.store.(ProcessingStore); ok {
-			_ = ps.RemoveProcessing(original.Group, original.Topic, original.QueueID, msgID)
+			return false, fmt.Errorf("append message to DLQ for group=%s topic=%s message=%s: %w", original.Group, original.Topic, original.MsgID, err)
 		}
 		if err := b.appendDeliveryEvent(deliveryEventFromProcessingEntry(storage.DeliveryEventDLQ, entry, eventAt)); err != nil {
 			logger.Error("Failed to append DLQ delivery event",
@@ -1407,8 +1671,9 @@ func (b *Broker) RetryProcessing(msgID, group, topic string) bool {
 				zap.String("message_id", original.MsgID),
 				zap.Error(err))
 		}
+		removeCrashWindowFallback()
 		finalizeRetrySuccess(true)
-		return true
+		return true, nil
 	}
 
 	group = original.Group
@@ -1429,27 +1694,37 @@ func (b *Broker) RetryProcessing(msgID, group, topic string) bool {
 			zap.String("group", group),
 			zap.String("topic", topic),
 			zap.Error(err))
-		return false
+		return false, fmt.Errorf("ensure retry topic for group=%s topic=%s: %w", group, topic, err)
 	}
 
 	// Schedule retry to group retry topic (RocketMQ-style), no offset rollback
 	delay := b.calculateRetryBackoff(retryCount)
-	b.delayScheduler.ScheduleWithDelay(retryTopic, queueID, msg, delay)
-	if ps, ok := b.store.(ProcessingStore); ok {
-		_ = ps.RemoveProcessing(group, topic, queueID, msgID)
+	if err := b.delayScheduler.ScheduleWithDelayStrict(retryTopic, queueID, msg, delay); err != nil {
+		revertRetryReservation()
+		logger.Error("Failed to schedule retry",
+			zap.String("group", group),
+			zap.String("topic", topic),
+			zap.String("message_id", original.MsgID),
+			zap.Error(err))
+		return false, fmt.Errorf("schedule retry for group=%s topic=%s message=%s: %w", group, topic, original.MsgID, err)
 	}
 	retryEvent := deliveryEventFromProcessingEntry(storage.DeliveryEventRetry, entry, eventAt)
 	scheduledAt := eventAt.Add(delay)
 	retryEvent.ScheduledAt = &scheduledAt
 	if err := b.appendDeliveryEvent(retryEvent); err != nil {
-		logger.Error("Failed to append retry delivery event",
-			zap.String("group", original.Group),
-			zap.String("topic", original.Topic),
-			zap.String("message_id", original.MsgID),
-			zap.Error(err))
+		if rollbackErr := b.delayScheduler.RemoveScheduled(retryTopic, queueID, msgID); rollbackErr != nil {
+			logger.Error("Failed to rollback scheduled retry after event append failure",
+				zap.String("group", original.Group),
+				zap.String("topic", original.Topic),
+				zap.String("message_id", original.MsgID),
+				zap.Error(rollbackErr))
+		}
+		revertRetryReservation()
+		return false, fmt.Errorf("append retry delivery event for group=%s topic=%s message=%s: %w", original.Group, original.Topic, original.MsgID, err)
 	}
+	removeCrashWindowFallback()
 	finalizeRetrySuccess(false)
-	return true
+	return true, nil
 }
 
 // CompleteProcessing marks a message completed (offset already committed in ConsumeWithLock).
@@ -1489,6 +1764,7 @@ func (b *Broker) CompleteProcessing(msgID, group, topic string) (bool, error) {
 	completed = append(completed, completedEntry{
 		Group:         entry.Group,
 		Topic:         entry.Topic,
+		StorageTopic:  entry.StorageTopic,
 		QueueID:       entry.QueueID,
 		Offset:        entry.Offset,
 		NextOffset:    entry.NextOffset,
@@ -1536,15 +1812,34 @@ func (b *Broker) ListProcessing(group, topic string, limit int) []processingEntr
 	if limit <= 0 {
 		limit = 50
 	}
+	byMsgID := make(map[string]processingEntry)
 	b.lock.Lock()
-	entries := make([]processingEntry, 0)
 	for _, entry := range b.processing {
 		if entry.Group == group && entry.Topic == topic && entry.State == stateProcessing {
-			entries = append(entries, entry)
+			byMsgID[entry.MsgID] = entry
 		}
 	}
 	b.lock.Unlock()
 
+	if latestEvents, ok, err := b.latestGroupTopicDeliveryEvents(group, topic); ok && err == nil {
+		for msgID, rec := range latestEvents {
+			if entry, ok := processingEntryFromDeliveryEvent(rec); ok {
+				existing, exists := byMsgID[msgID]
+				if !exists || existing.ConsumedAt.Before(entry.ConsumedAt) {
+					byMsgID[msgID] = entry
+				}
+				continue
+			}
+			if isSettlingDeliveryEvent(rec.Event) {
+				delete(byMsgID, msgID)
+			}
+		}
+	}
+
+	entries := make([]processingEntry, 0, len(byMsgID))
+	for _, entry := range byMsgID {
+		entries = append(entries, entry)
+	}
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].ConsumedAt.After(entries[j].ConsumedAt)
 	})
@@ -1564,10 +1859,39 @@ func (b *Broker) ListCompleted(group, topic string, limit int) []completedEntry 
 	b.lock.Unlock()
 
 	byMsgID := make(map[string]completedEntry, len(memoryEntries))
+	baseByQueue := make(map[string]int64)
 	for _, entry := range memoryEntries {
+		storageTopic := entry.StorageTopic
+		if storageTopic == "" {
+			storageTopic = entry.Topic
+		}
+		baseKey := fmt.Sprintf("%s:%d", storageTopic, entry.QueueID)
+		base, ok := baseByQueue[baseKey]
+		if !ok {
+			base = b.ConsumeQueueBaseOffset(storageTopic, entry.QueueID)
+			baseByQueue[baseKey] = base
+		}
+		if entry.NextOffset <= base {
+			continue
+		}
 		byMsgID[entry.MsgID] = entry
 	}
-	if ds, ok := b.store.(GroupDeliveryEventStore); ok {
+	if latestEvents, ok, err := b.latestGroupTopicDeliveryEvents(group, topic); ok && err == nil {
+		for msgID, rec := range latestEvents {
+			if rec.Event != storage.DeliveryEventAck {
+				delete(byMsgID, msgID)
+				continue
+			}
+			entry, ok := completedEntryFromDeliveryEvent(rec)
+			if !ok {
+				continue
+			}
+			existing, exists := byMsgID[entry.MsgID]
+			if !exists || existing.AckedAt.Before(entry.AckedAt) {
+				byMsgID[entry.MsgID] = entry
+			}
+		}
+	} else if ds, ok := b.store.(GroupDeliveryEventStore); ok {
 		fetchLimit := limit + len(memoryEntries)
 		if fetchLimit < limit*2 {
 			fetchLimit = limit * 2
@@ -1599,13 +1923,33 @@ func (b *Broker) ListCompleted(group, topic string, limit int) []completedEntry 
 	return entries
 }
 
-// ListDeliveryEvents returns recent persisted group-scoped delivery events for a topic.
+// ListDeliveryEvents returns messages whose latest delivery event matches the requested state.
 func (b *Broker) ListDeliveryEvents(group, topic, event string, limit int) []deliveryEventEntry {
 	if strings.TrimSpace(group) == "" || topic == "" || event == "" {
 		return nil
 	}
 	if limit <= 0 {
 		limit = 50
+	}
+	if latestEvents, ok, err := b.latestGroupTopicDeliveryEvents(group, topic); ok && err == nil {
+		entries := make([]deliveryEventEntry, 0, len(latestEvents))
+		for _, rec := range latestEvents {
+			if rec.Event != event {
+				continue
+			}
+			entry, ok := deliveryEventEntryFromRecord(rec)
+			if !ok {
+				continue
+			}
+			entries = append(entries, entry)
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].EventAt.After(entries[j].EventAt)
+		})
+		if len(entries) > limit {
+			entries = entries[:limit]
+		}
+		return entries
 	}
 	ds, ok := b.store.(GroupDeliveryEventStore)
 	if !ok {
@@ -1678,6 +2022,35 @@ func (b *Broker) removeCancelledFromCache(topic, msgID string) {
 	b.lock.Unlock()
 }
 
+func deliveryEventStorageTopic(rec storage.DeliveryEventRecord) string {
+	if rec.StorageTopic == "" {
+		return rec.Topic
+	}
+	return rec.StorageTopic
+}
+
+func deliveryEventOffsetRange(rec storage.DeliveryEventRecord) (int64, int64, bool) {
+	if rec.Offset != nil {
+		if rec.NextOffset != nil {
+			return *rec.Offset, *rec.NextOffset, true
+		}
+		return *rec.Offset, *rec.Offset + 1, true
+	}
+	if rec.NextOffset != nil {
+		return *rec.NextOffset - 1, *rec.NextOffset, true
+	}
+	return 0, 0, false
+}
+
+func isSettlingDeliveryEvent(event string) bool {
+	switch event {
+	case storage.DeliveryEventAck, storage.DeliveryEventRetry, storage.DeliveryEventDLQ, storage.DeliveryEventCancelled, storage.DeliveryEventExpired:
+		return true
+	default:
+		return false
+	}
+}
+
 func terminalNextOffset(rec storage.CancelledRecord) (int64, bool) {
 	if rec.NextOffset != nil {
 		return *rec.NextOffset, true
@@ -1709,7 +2082,15 @@ func (b *Broker) canSweepCancelledRecord(rec storage.CancelledRecord) (bool, err
 		if err != nil {
 			return false, err
 		}
-		return found && offset >= nextOffset, nil
+		if !found || offset < nextOffset {
+			return false, nil
+		}
+		if settled, checked, err := b.deliveryEventSettledBefore(ownerGroup, rec.Topic, storageTopic, queueID, nextOffset, offset); err != nil {
+			return false, err
+		} else if checked && !settled {
+			return false, nil
+		}
+		return true, nil
 	}
 	if strings.EqualFold(b.newGroupStartPosition, "earliest") {
 		return false, nil
@@ -1722,12 +2103,88 @@ func (b *Broker) canSweepCancelledRecord(rec storage.CancelledRecord) (bool, err
 	if err != nil {
 		return false, err
 	}
-	for _, offset := range offsets {
+	for group, offset := range offsets {
 		if offset < nextOffset {
+			return false, nil
+		}
+		if settled, checked, err := b.deliveryEventSettledBefore(group, rec.Topic, storageTopic, queueID, nextOffset, offset); err != nil {
+			return false, err
+		} else if checked && !settled {
 			return false, nil
 		}
 	}
 	return true, nil
+}
+
+func (b *Broker) deliveryEventSettledCutoff(group, logicalTopic, storageTopic string, queueID int, upperBound int64) (int64, bool, error) {
+	if strings.TrimSpace(group) == "" || logicalTopic == "" || storageTopic == "" {
+		return 0, false, nil
+	}
+	ds, ok := b.store.(QueueDeliveryEventStore)
+	if !ok {
+		return 0, false, nil
+	}
+	base := b.ConsumeQueueBaseOffset(storageTopic, queueID)
+	if upperBound <= base {
+		return upperBound, true, nil
+	}
+	qid := queueID
+	groupRecords, err := ds.LoadDeliveryEvents(group, logicalTopic, &qid)
+	if err != nil {
+		return 0, false, err
+	}
+	topicRecords, err := ds.LoadDeliveryEvents("", logicalTopic, &qid)
+	if err != nil {
+		return 0, false, err
+	}
+
+	settled := make(map[int64]int64)
+	addRecords := func(records []storage.DeliveryEventRecord) {
+		for _, rec := range records {
+			if !isSettlingDeliveryEvent(rec.Event) {
+				continue
+			}
+			if deliveryEventStorageTopic(rec) != storageTopic {
+				continue
+			}
+			if rec.QueueID == nil || *rec.QueueID != queueID {
+				continue
+			}
+			offset, nextOffset, ok := deliveryEventOffsetRange(rec)
+			if !ok || nextOffset <= offset || offset < base || offset >= upperBound {
+				continue
+			}
+			if existing, ok := settled[offset]; !ok || existing < nextOffset {
+				settled[offset] = nextOffset
+			}
+		}
+	}
+	addRecords(groupRecords)
+	addRecords(topicRecords)
+
+	cutoff := base
+	for cutoff < upperBound {
+		nextOffset, ok := settled[cutoff]
+		if !ok || nextOffset <= cutoff {
+			break
+		}
+		cutoff = nextOffset
+	}
+	return cutoff, true, nil
+}
+
+func (b *Broker) deliveryEventSettledBefore(group, logicalTopic, storageTopic string, queueID int, nextOffset, upperBound int64) (bool, bool, error) {
+	if nextOffset <= 0 || upperBound < nextOffset {
+		return false, false, nil
+	}
+	cutoff, ok, err := b.deliveryEventSettledCutoff(group, logicalTopic, storageTopic, queueID, upperBound)
+	if err != nil {
+		return false, false, err
+	}
+	if !ok {
+		return false, false, nil
+	}
+	return cutoff >= nextOffset, true, nil
 }
 
 // SweepTerminalTombstones removes persisted terminal tombstones that are safely behind queue watermarks.
@@ -1766,13 +2223,20 @@ func (b *Broker) consumedPruneCutoff(topic string, queueID int) (int64, bool, er
 	if topic == SystemDelayTopic {
 		return 0, false, nil
 	}
-	if _, ownerGroup, isRetry := splitRetryTopicName(topic); isRetry {
+	logicalTopic := topic
+	if originalTopic, ownerGroup, isRetry := splitRetryTopicName(topic); isRetry {
+		logicalTopic = originalTopic
 		offset, ok, err := b.GetOffset(ownerGroup, topic, queueID)
 		if err != nil {
 			return 0, false, err
 		}
 		if !ok {
 			return 0, false, nil
+		}
+		if cutoff, cutoffOK, err := b.deliveryEventSettledCutoff(ownerGroup, logicalTopic, topic, queueID, offset); err != nil {
+			return 0, false, err
+		} else if cutoffOK && cutoff < offset {
+			offset = cutoff
 		}
 		return offset, true, nil
 	}
@@ -1791,7 +2255,12 @@ func (b *Broker) consumedPruneCutoff(topic string, queueID int) (int64, bool, er
 		return 0, false, nil
 	}
 	minOffset := int64(^uint64(0) >> 1)
-	for _, offset := range offsets {
+	for group, offset := range offsets {
+		if cutoff, cutoffOK, err := b.deliveryEventSettledCutoff(group, logicalTopic, topic, queueID, offset); err != nil {
+			return 0, false, err
+		} else if cutoffOK && cutoff < offset {
+			offset = cutoff
+		}
 		if offset < minOffset {
 			minOffset = offset
 		}
@@ -1880,12 +2349,12 @@ func (b *Broker) shouldExpire(ts time.Time) bool {
 	return now().Sub(ts) > time.Duration(b.messageExpiryFactor)*b.messageRetention
 }
 
-func (b *Broker) persistCancelled(entry cancelledEntry) {
+func (b *Broker) persistCancelled(entry cancelledEntry) error {
 	cs, ok := b.store.(CancelledStore)
 	if !ok {
-		return
+		return nil
 	}
-	_ = cs.SaveCancelled(storage.CancelledRecord{
+	return cs.SaveCancelled(storage.CancelledRecord{
 		Group:         entry.Group,
 		Topic:         entry.Topic,
 		StorageTopic:  entry.StorageTopic,
@@ -1939,7 +2408,7 @@ func (b *Broker) appendAckEvent(entry processingEntry, ackedAt time.Time) error 
 	return nil
 }
 
-func (b *Broker) recordCancelled(entry cancelledEntry) {
+func (b *Broker) recordCancelled(entry cancelledEntry) error {
 	if entry.CancelledAt.IsZero() {
 		entry.CancelledAt = now()
 	}
@@ -1950,29 +2419,36 @@ func (b *Broker) recordCancelled(entry cancelledEntry) {
 	if entry.State == "" {
 		entry.State = string(stateCancelled)
 	}
+	if err := b.persistCancelled(entry); err != nil {
+		return fmt.Errorf("save terminal record for topic=%s message=%s: %w", entry.Topic, entry.MsgID, err)
+	}
+	if err := b.appendDeliveryEvent(deliveryEventFromCancelledEntry(entry)); err != nil {
+		if ds, ok := b.store.(CancelledDeleteStore); ok {
+			if deleteErr := ds.DeleteCancelled(entry.Topic, entry.MsgID); deleteErr != nil {
+				logger.Error("Failed to rollback terminal record after delivery event error",
+					zap.String("event", entry.State),
+					zap.String("topic", entry.Topic),
+					zap.String("message_id", entry.MsgID),
+					zap.Error(deleteErr))
+			}
+		}
+		return fmt.Errorf("append terminal delivery event for state=%s topic=%s message=%s: %w", entry.State, entry.Topic, entry.MsgID, err)
+	}
 	b.cacheCancelled(entry)
 	b.lock.Lock()
 	b.clearRetryCount(entry.MsgID)
 	b.lock.Unlock()
-	b.persistCancelled(entry)
-	if err := b.appendDeliveryEvent(deliveryEventFromCancelledEntry(entry)); err != nil {
-		logger.Error("Failed to append delivery event",
-			zap.String("event", entry.State),
-			zap.String("topic", entry.Topic),
-			zap.String("storage_topic", entry.StorageTopic),
-			zap.String("message_id", entry.MsgID),
-			zap.Error(err))
-	}
+	return nil
 }
 
-func (b *Broker) recordExpired(entry cancelledEntry) {
+func (b *Broker) recordExpired(entry cancelledEntry) error {
 	entry.State = string(stateExpired)
-	b.recordCancelled(entry)
+	return b.recordCancelled(entry)
 }
 
-func (b *Broker) expireProcessing(msgID, group, topic string) bool {
+func (b *Broker) expireProcessing(msgID, group, topic string) (bool, error) {
 	if group == "" || topic == "" {
-		return false
+		return false, nil
 	}
 	key := processingKey(group, topic, msgID)
 	expiredAt := now()
@@ -1981,23 +2457,50 @@ func (b *Broker) expireProcessing(msgID, group, topic string) bool {
 	entry, ok := b.processing[key]
 	if !ok || entry.State != stateProcessing {
 		b.lock.Unlock()
-		return false
+		return false, nil
 	}
-	delete(b.processing, key)
-	if gs := b.stats[entry.Group]; gs != nil {
-		gs.Processing--
+	original := entry
+	entry.State = stateExpired
+	entry.UpdatedAt = expiredAt
+	b.processing[key] = entry
+	b.lock.Unlock()
+
+	revertReservation := func() {
+		b.lock.Lock()
+		current, ok := b.processing[key]
+		if ok && current.State == stateExpired {
+			b.processing[key] = original
+		}
+		b.lock.Unlock()
 	}
-	b.clearRetryCount(msgID)
+	if err := b.recordExpired(terminalEntryFromProcessingEntry(original, expiredAt)); err != nil {
+		revertReservation()
+		return false, err
+	}
+
+	b.lock.Lock()
+	current, ok := b.processing[key]
+	if ok && current.State == stateExpired {
+		delete(b.processing, key)
+		if gs := b.stats[original.Group]; gs != nil {
+			gs.Processing--
+		}
+	}
 	b.lock.Unlock()
 
 	if ps, ok := b.store.(ProcessingStore); ok {
-		_ = ps.RemoveProcessing(entry.Group, entry.Topic, entry.QueueID, msgID)
+		if err := ps.RemoveProcessing(original.Group, original.Topic, original.QueueID, msgID); err != nil {
+			logger.Warn("Failed to remove crash-window processing fallback after expiry",
+				zap.String("group", original.Group),
+				zap.String("topic", original.Topic),
+				zap.String("message_id", original.MsgID),
+				zap.Error(err))
+		}
 	}
-	b.recordExpired(terminalEntryFromProcessingEntry(entry, expiredAt))
-	return true
+	return true, nil
 }
 
-func (b *Broker) cancelProcessing(msgID, topic string) bool {
+func (b *Broker) cancelProcessing(msgID, topic string) (bool, error) {
 	cancelledAt := now()
 
 	b.lock.Lock()
@@ -2012,27 +2515,58 @@ func (b *Broker) cancelProcessing(msgID, topic string) bool {
 	}
 	if len(entries) == 0 {
 		b.lock.Unlock()
-		return false
+		return false, nil
 	}
 	cancelled := terminalEntryFromProcessingEntry(entries[0], cancelledAt)
 	cancelled.State = string(stateCancelled)
 	for i, key := range keys {
 		entry := entries[i]
-		delete(b.processing, key)
-		if gs := b.stats[entry.Group]; gs != nil {
-			gs.Processing--
+		entry.State = stateCancelled
+		entry.UpdatedAt = cancelledAt
+		b.processing[key] = entry
+	}
+	b.lock.Unlock()
+
+	revertReservation := func() {
+		b.lock.Lock()
+		for i, key := range keys {
+			current, ok := b.processing[key]
+			if ok && current.State == stateCancelled {
+				b.processing[key] = entries[i]
+			}
+		}
+		b.lock.Unlock()
+	}
+	if err := b.recordCancelled(cancelled); err != nil {
+		revertReservation()
+		return false, err
+	}
+
+	b.lock.Lock()
+	for i, key := range keys {
+		entry := entries[i]
+		current, ok := b.processing[key]
+		if ok && current.State == stateCancelled {
+			delete(b.processing, key)
+			if gs := b.stats[entry.Group]; gs != nil {
+				gs.Processing--
+			}
 		}
 	}
-	b.clearRetryCount(msgID)
 	b.lock.Unlock()
 
 	if ps, ok := b.store.(ProcessingStore); ok {
 		for _, entry := range entries {
-			_ = ps.RemoveProcessing(entry.Group, entry.Topic, entry.QueueID, msgID)
+			if err := ps.RemoveProcessing(entry.Group, entry.Topic, entry.QueueID, msgID); err != nil {
+				logger.Warn("Failed to remove crash-window processing fallback after cancel",
+					zap.String("group", entry.Group),
+					zap.String("topic", entry.Topic),
+					zap.String("message_id", entry.MsgID),
+					zap.Error(err))
+			}
 		}
 	}
-	b.recordCancelled(cancelled)
-	return true
+	return true, nil
 }
 
 func (b *Broker) findScheduledMessage(topic, msgID string) (cancelledEntry, bool) {
@@ -2187,7 +2721,7 @@ func (b *Broker) onPrunedMessage(storageTopic string, queueID int, msg storage.M
 		return nil
 	}
 	queueIDCopy := queueID
-	b.recordExpired(cancelledEntry{
+	return b.recordExpired(cancelledEntry{
 		Topic:         logicalTopic,
 		StorageTopic:  storageTopic,
 		QueueID:       &queueIDCopy,
@@ -2199,7 +2733,6 @@ func (b *Broker) onPrunedMessage(storageTopic string, queueID int, msg storage.M
 		Timestamp:     msg.Timestamp,
 		CancelledAt:   now(),
 	})
-	return nil
 }
 
 func (b *Broker) applyRetentionSettings(retention time.Duration, factor int) {
@@ -2543,7 +3076,7 @@ func (b *Broker) ListPending(group, topic string, queueID int, cursor *int64, li
 				qid := queueID
 				off := msg.Offset
 				next := msg.Offset + 1
-				b.recordExpired(cancelledEntry{
+				if err := b.recordExpired(cancelledEntry{
 					Topic:         topic,
 					StorageTopic:  topic,
 					QueueID:       &qid,
@@ -2556,7 +3089,9 @@ func (b *Broker) ListPending(group, topic string, queueID int, cursor *int64, li
 					Retry:         msg.Retry,
 					Timestamp:     msg.Timestamp,
 					CancelledAt:   now(),
-				})
+				}); err != nil {
+					return nil, 0, err
+				}
 				continue
 			}
 			out = append(out, msg)
@@ -2569,10 +3104,10 @@ func (b *Broker) ListPending(group, topic string, queueID int, cursor *int64, li
 }
 
 // ListScheduledVisible returns scheduled delayed messages after filtering cancelled ones.
-func (b *Broker) ListScheduledVisible(topic string, queueID *int, cursor int64, limit int) ([]DelayedMessage, *int64) {
+func (b *Broker) ListScheduledVisible(topic string, queueID *int, cursor int64, limit int) ([]DelayedMessage, *int64, error) {
 	ds := b.GetDelayScheduler()
 	if ds == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if limit <= 0 {
 		limit = 50
@@ -2587,7 +3122,7 @@ func (b *Broker) ListScheduledVisible(topic string, queueID *int, cursor int64, 
 		}
 		items, next := ds.ListScheduled(topic, queueID, scanCursor, batchSize)
 		if len(items) == 0 {
-			return out, next
+			return out, next, nil
 		}
 		for _, item := range items {
 			if b.IsTerminal(topic, item.Message.ID) {
@@ -2596,7 +3131,7 @@ func (b *Broker) ListScheduledVisible(topic string, queueID *int, cursor int64, 
 			if b.shouldExpire(item.Message.Timestamp) {
 				qid := item.QueueID
 				scheduledAt := item.ExecuteAt
-				b.recordExpired(cancelledEntry{
+				if err := b.recordExpired(cancelledEntry{
 					Topic:         topic,
 					StorageTopic:  topic,
 					QueueID:       &qid,
@@ -2608,7 +3143,9 @@ func (b *Broker) ListScheduledVisible(topic string, queueID *int, cursor int64, 
 					Timestamp:     item.Message.Timestamp,
 					ScheduledAt:   &scheduledAt,
 					CancelledAt:   now(),
-				})
+				}); err != nil {
+					return nil, nil, err
+				}
 				continue
 			}
 			out = append(out, item)
@@ -2617,13 +3154,13 @@ func (b *Broker) ListScheduledVisible(topic string, queueID *int, cursor int64, 
 			}
 		}
 		if next == nil {
-			return out, nil
+			return out, nil, nil
 		}
 		scanCursor = *next
 	}
 
 	n := scanCursor
-	return out, &n
+	return out, &n, nil
 }
 
 // Topic Management Methods
@@ -2659,37 +3196,49 @@ func (b *Broker) ValidateProcessing(msgID, group, topic string) bool {
 
 // TerminateMessage marks a message cancelled for a topic.
 // It is intentionally idempotent: unknown or already-terminated messages still succeed.
-func (b *Broker) TerminateMessage(msgID, topic string) bool {
+func (b *Broker) TerminateMessage(msgID, topic string) (bool, error) {
 	if topic == "" || msgID == "" {
-		return false
+		return false, nil
 	}
 	if b.IsTerminal(topic, msgID) {
-		return true
+		return true, nil
 	}
-	if b.cancelProcessing(msgID, topic) {
-		return true
+	cancelled, err := b.cancelProcessing(msgID, topic)
+	if err != nil {
+		return false, err
+	}
+	if cancelled {
+		return true, nil
 	}
 	if entry, ok := b.findScheduledMessage(topic, msgID); ok {
-		b.recordCancelled(entry)
-		return true
+		if err := b.recordCancelled(entry); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
 	if entry, ok := b.findPendingMessage(topic, msgID); ok {
-		b.recordCancelled(entry)
-		return true
+		if err := b.recordCancelled(entry); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-	return true
+	return true, nil
 }
 
 // TerminateMessages marks multiple messages cancelled for a topic.
 // Unknown or already-terminated message IDs are treated as successful.
-func (b *Broker) TerminateMessages(topic string, msgIDs []string) int {
+func (b *Broker) TerminateMessages(topic string, msgIDs []string) (int, error) {
 	terminated := 0
 	for _, msgID := range msgIDs {
-		if b.TerminateMessage(msgID, topic) {
+		ok, err := b.TerminateMessage(msgID, topic)
+		if err != nil {
+			return terminated, err
+		}
+		if ok {
 			terminated++
 		}
 	}
-	return terminated
+	return terminated, nil
 }
 
 // DeleteTopic deletes a topic
@@ -2781,12 +3330,24 @@ func (b *Broker) sweepProcessingTimeoutsAt(ts time.Time) (expiredCount, retriedC
 
 	for _, entry := range timeoutEntries {
 		if b.shouldExpire(entry.Timestamp) {
-			if b.expireProcessing(entry.MsgID, entry.Group, entry.Topic) {
+			if ok, err := b.expireProcessing(entry.MsgID, entry.Group, entry.Topic); err != nil {
+				logger.Error("Failed to expire timed-out processing entry",
+					zap.String("message_id", entry.MsgID),
+					zap.String("group", entry.Group),
+					zap.String("topic", entry.Topic),
+					zap.Error(err))
+			} else if ok {
 				expiredCount++
 			}
 			continue
 		}
-		if b.RetryProcessing(entry.MsgID, entry.Group, entry.Topic) {
+		if ok, err := b.RetryProcessing(entry.MsgID, entry.Group, entry.Topic); err != nil {
+			logger.Error("Failed to retry timed-out processing entry",
+				zap.String("message_id", entry.MsgID),
+				zap.String("group", entry.Group),
+				zap.String("topic", entry.Topic),
+				zap.Error(err))
+		} else if ok {
 			retriedCount++
 		}
 	}

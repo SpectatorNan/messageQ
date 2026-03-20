@@ -1,6 +1,7 @@
 package broker
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -9,6 +10,42 @@ import (
 	"github.com/SpectatorNan/messageQ/go/mq/storage"
 	"github.com/google/uuid"
 )
+
+type failingProcessingStore struct {
+	*storage.WALStorage
+	saveErr            error
+	processingEventErr error
+	retryEventErr      error
+	terminalEventErr   error
+	delaySnapshotErr   error
+}
+
+func (s *failingProcessingStore) SaveProcessing(rec storage.ProcessingRecord) error {
+	if s.saveErr != nil {
+		return s.saveErr
+	}
+	return s.WALStorage.SaveProcessing(rec)
+}
+
+func (s *failingProcessingStore) AppendDeliveryEvent(rec storage.DeliveryEventRecord) error {
+	if rec.Event == storage.DeliveryEventProcessing && s.processingEventErr != nil {
+		return s.processingEventErr
+	}
+	if rec.Event == storage.DeliveryEventRetry && s.retryEventErr != nil {
+		return s.retryEventErr
+	}
+	if (rec.Event == storage.DeliveryEventCancelled || rec.Event == storage.DeliveryEventExpired) && s.terminalEventErr != nil {
+		return s.terminalEventErr
+	}
+	return s.WALStorage.AppendDeliveryEvent(rec)
+}
+
+func (s *failingProcessingStore) ReplaceTopicMessages(topic string, queueID int, msgs []storage.Message) error {
+	if topic == SystemDelayTopic && s.delaySnapshotErr != nil {
+		return s.delaySnapshotErr
+	}
+	return s.WALStorage.ReplaceTopicMessages(topic, queueID, msgs)
+}
 
 func TestPrunedRetrySegmentMarksLogicalTopicExpired(t *testing.T) {
 	baseDir := t.TempDir()
@@ -212,7 +249,9 @@ func TestCompleteProcessingWritesAckLogWithStorageTopic(t *testing.T) {
 		Timestamp:     time.Now().Add(-time.Minute),
 	}
 	storageTopic := GetRetryTopicName("group-a", "orders")
-	b.BeginProcessing("group-a", "orders", storageTopic, 0, 7, 8, msg)
+	if err := b.BeginProcessing("group-a", "orders", storageTopic, 0, 7, 8, msg); err != nil {
+		t.Fatalf("begin processing: %v", err)
+	}
 
 	ok, err := b.CompleteProcessing(msg.ID, "group-a", "orders")
 	if err != nil {
@@ -263,14 +302,17 @@ func TestRetryProcessingWritesDeliveryEventWithStorageTopic(t *testing.T) {
 		Timestamp:     time.Now().Add(-time.Minute),
 	}
 	storageTopic := GetRetryTopicName("group-a", "orders")
-	b.BeginProcessing("group-a", "orders", storageTopic, 0, 3, 4, msg)
+	if err := b.BeginProcessing("group-a", "orders", storageTopic, 0, 3, 4, msg); err != nil {
+		t.Fatalf("begin processing: %v", err)
+	}
 
-	if ok := b.RetryProcessing(msg.ID, "group-a", "orders"); !ok {
+	if ok, err := b.RetryProcessing(msg.ID, "group-a", "orders"); err != nil {
+		t.Fatalf("retry processing: %v", err)
+	} else if !ok {
 		t.Fatalf("expected retry processing to succeed")
 	}
 
-	queueID := 0
-	events, err := store.LoadDeliveryEvents("group-a", "orders", &queueID)
+	events, err := store.ListGroupDeliveryEvents("group-a", "orders", storage.DeliveryEventRetry, 10)
 	if err != nil {
 		t.Fatalf("load retry delivery events: %v", err)
 	}
@@ -292,6 +334,429 @@ func TestRetryProcessingWritesDeliveryEventWithStorageTopic(t *testing.T) {
 	}
 	if got.ScheduledAt == nil {
 		t.Fatalf("expected retry event scheduled_at to be set")
+	}
+}
+
+func TestBeginProcessingReturnsErrorWhenPersistenceFails(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	walStore := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = walStore.Close()
+	}()
+
+	store := &failingProcessingStore{
+		WALStorage: walStore,
+		saveErr:    errors.New("save processing failed"),
+	}
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	msg := queue.Message{
+		ID:            uuid.NewString(),
+		Body:          "persist-me",
+		Tag:           "tag-a",
+		CorrelationID: "corr-processing-error",
+		Timestamp:     time.Now(),
+	}
+
+	err := b.BeginProcessing("group-a", "orders", "orders", 0, 11, 12, msg)
+	if err == nil {
+		t.Fatalf("expected begin processing to return an error")
+	}
+
+	entries := b.ListProcessing("group-a", "orders", 10)
+	if len(entries) != 1 || entries[0].MsgID != msg.ID {
+		t.Fatalf("expected in-memory processing entry for %s, got %+v", msg.ID, entries)
+	}
+
+	if ok, err := b.RetryProcessing(msg.ID, "group-a", "orders"); err != nil {
+		t.Fatalf("retry rollback: %v", err)
+	} else if !ok {
+		t.Fatalf("expected retry rollback to succeed")
+	}
+
+	records, err := walStore.LoadProcessing()
+	if err != nil {
+		t.Fatalf("load processing records: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected no persisted processing records after retry rollback, got %d", len(records))
+	}
+
+	events, err := walStore.ListGroupDeliveryEvents("group-a", "orders", storage.DeliveryEventRetry, 10)
+	if err != nil {
+		t.Fatalf("load retry delivery events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 retry event after rollback, got %d", len(events))
+	}
+	if events[0].Event != storage.DeliveryEventRetry {
+		t.Fatalf("expected retry delivery event, got %s", events[0].Event)
+	}
+}
+
+func TestBeginProcessingWritesProcessingDeliveryEvent(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	store := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = store.Close()
+	}()
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	msg := queue.Message{
+		ID:            uuid.NewString(),
+		Body:          "processing-me",
+		Tag:           "tag-a",
+		CorrelationID: "corr-processing",
+		Retry:         2,
+		Timestamp:     time.Now().Add(-time.Minute),
+	}
+	storageTopic := GetRetryTopicName("group-a", "orders")
+	if err := b.BeginProcessing("group-a", "orders", storageTopic, 0, 7, 8, msg); err != nil {
+		t.Fatalf("begin processing: %v", err)
+	}
+
+	queueID := 0
+	events, err := store.ListGroupDeliveryEvents("group-a", "orders", storage.DeliveryEventProcessing, 10)
+	if err != nil {
+		t.Fatalf("list processing delivery events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 processing delivery event, got %d", len(events))
+	}
+	got := events[0]
+	if got.StorageTopic != storageTopic {
+		t.Fatalf("expected processing event storage topic %s, got %s", storageTopic, got.StorageTopic)
+	}
+	if got.QueueID == nil || *got.QueueID != queueID {
+		t.Fatalf("expected processing event queue 0, got %+v", got.QueueID)
+	}
+	if got.Offset == nil || got.NextOffset == nil || *got.Offset != 7 || *got.NextOffset != 8 {
+		t.Fatalf("expected processing offsets [7,8), got offset=%v next=%v", got.Offset, got.NextOffset)
+	}
+	if got.ConsumedAt == nil || got.ConsumedAt.IsZero() {
+		t.Fatalf("expected processing event consumed_at to be set")
+	}
+	if got.EventAt.IsZero() {
+		t.Fatalf("expected processing event event_at to be set")
+	}
+	if got.MsgID != msg.ID || got.CorrelationID != msg.CorrelationID || got.Retry != msg.Retry {
+		t.Fatalf("unexpected processing event payload: %+v", got)
+	}
+
+	records, err := store.LoadProcessing()
+	if err != nil {
+		t.Fatalf("load processing records: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected processing fallback records to be removed after processing event append, got %d", len(records))
+	}
+}
+
+func TestBeginProcessingReturnsErrorWhenProcessingEventPersistenceFails(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	walStore := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = walStore.Close()
+	}()
+
+	store := &failingProcessingStore{
+		WALStorage:         walStore,
+		processingEventErr: errors.New("append processing event failed"),
+	}
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	msg := queue.Message{
+		ID:            uuid.NewString(),
+		Body:          "persist-event-me",
+		Tag:           "tag-a",
+		CorrelationID: "corr-processing-event-error",
+		Timestamp:     time.Now(),
+	}
+
+	err := b.BeginProcessing("group-a", "orders", "orders", 0, 13, 14, msg)
+	if err == nil {
+		t.Fatalf("expected begin processing to return an error")
+	}
+
+	entries := b.ListProcessing("group-a", "orders", 10)
+	if len(entries) != 1 || entries[0].MsgID != msg.ID {
+		t.Fatalf("expected in-memory processing entry for %s, got %+v", msg.ID, entries)
+	}
+
+	if ok, err := b.RetryProcessing(msg.ID, "group-a", "orders"); err != nil {
+		t.Fatalf("retry rollback: %v", err)
+	} else if !ok {
+		t.Fatalf("expected retry rollback to succeed")
+	}
+
+	records, err := walStore.LoadProcessing()
+	if err != nil {
+		t.Fatalf("load processing records: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("expected no persisted processing records after retry rollback, got %d", len(records))
+	}
+
+	events, err := walStore.ListGroupDeliveryEvents("group-a", "orders", "", 10)
+	if err != nil {
+		t.Fatalf("list delivery events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected exactly 1 delivery event after rollback, got %d", len(events))
+	}
+	if events[0].Event != storage.DeliveryEventRetry {
+		t.Fatalf("expected retry delivery event after rollback, got %s", events[0].Event)
+	}
+}
+
+func TestRetryProcessingReturnsErrorWhenRetryEventPersistenceFails(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	walStore := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = walStore.Close()
+	}()
+
+	store := &failingProcessingStore{
+		WALStorage:    walStore,
+		retryEventErr: errors.New("append retry event failed"),
+	}
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	msg := queue.Message{
+		ID:            uuid.NewString(),
+		Body:          "retry-fail-me",
+		Tag:           "tag-a",
+		CorrelationID: "corr-retry-event-error",
+		Timestamp:     time.Now(),
+	}
+	if err := b.BeginProcessing("group-a", "orders", "orders", 0, 1, 2, msg); err != nil {
+		t.Fatalf("begin processing: %v", err)
+	}
+
+	if ok, err := b.RetryProcessing(msg.ID, "group-a", "orders"); err == nil {
+		t.Fatalf("expected retry processing to return an error")
+	} else if ok {
+		t.Fatalf("expected retry processing to report failure")
+	}
+	if !b.ValidateProcessing(msg.ID, "group-a", "orders") {
+		t.Fatalf("expected message to remain processing after retry event failure")
+	}
+	if b.GetDelayScheduler().delayQueue.Len() != 0 {
+		t.Fatalf("expected scheduled retry rollback after event failure, got %d pending", b.GetDelayScheduler().delayQueue.Len())
+	}
+	events, err := walStore.ListGroupDeliveryEvents("group-a", "orders", storage.DeliveryEventRetry, 10)
+	if err != nil {
+		t.Fatalf("list retry delivery events: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("expected no retry delivery events after retry event failure, got %d", len(events))
+	}
+}
+
+func TestRetryProcessingReturnsErrorWhenRetrySchedulePersistenceFails(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	walStore := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = walStore.Close()
+	}()
+
+	store := &failingProcessingStore{
+		WALStorage:       walStore,
+		delaySnapshotErr: errors.New("persist delay snapshot failed"),
+	}
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	msg := queue.Message{
+		ID:            uuid.NewString(),
+		Body:          "retry-schedule-fail-me",
+		Tag:           "tag-a",
+		CorrelationID: "corr-retry-schedule-error",
+		Timestamp:     time.Now(),
+	}
+	if err := b.BeginProcessing("group-a", "orders", "orders", 0, 1, 2, msg); err != nil {
+		t.Fatalf("begin processing: %v", err)
+	}
+
+	if ok, err := b.RetryProcessing(msg.ID, "group-a", "orders"); err == nil {
+		t.Fatalf("expected retry scheduling to return an error")
+	} else if ok {
+		t.Fatalf("expected retry scheduling to report failure")
+	}
+	if !b.ValidateProcessing(msg.ID, "group-a", "orders") {
+		t.Fatalf("expected message to remain processing after retry scheduling failure")
+	}
+	if b.GetDelayScheduler().delayQueue.Len() != 0 {
+		t.Fatalf("expected no scheduled retry after persistence failure, got %d pending", b.GetDelayScheduler().delayQueue.Len())
+	}
+	events, err := walStore.ListGroupDeliveryEvents("group-a", "orders", storage.DeliveryEventRetry, 10)
+	if err != nil {
+		t.Fatalf("list retry delivery events: %v", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("expected no retry delivery events after retry scheduling failure, got %d", len(events))
+	}
+}
+
+func TestTerminateMessageReturnsErrorWhenTerminalEventPersistenceFails(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	walStore := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = walStore.Close()
+	}()
+
+	store := &failingProcessingStore{
+		WALStorage:       walStore,
+		terminalEventErr: errors.New("append terminal event failed"),
+	}
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	msg := queue.Message{
+		ID:            uuid.NewString(),
+		Body:          "cancel-fail-me",
+		Tag:           "tag-a",
+		CorrelationID: "corr-cancel-event-error",
+		Timestamp:     time.Now(),
+	}
+	if err := b.BeginProcessing("group-a", "orders", "orders", 0, 1, 2, msg); err != nil {
+		t.Fatalf("begin processing: %v", err)
+	}
+
+	if ok, err := b.TerminateMessage(msg.ID, "orders"); err == nil {
+		t.Fatalf("expected terminate message to return an error")
+	} else if ok {
+		t.Fatalf("expected terminate message to report failure")
+	}
+	if !b.ValidateProcessing(msg.ID, "group-a", "orders") {
+		t.Fatalf("expected message to remain processing after terminal event failure")
+	}
+	if b.IsCancelled("orders", msg.ID) {
+		t.Fatalf("expected message not to be marked cancelled after terminal event failure")
+	}
+}
+
+func TestListProcessingReplaysCurrentEntriesFromDeliveryEvents(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	store := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = store.Close()
+	}()
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	msg := queue.Message{
+		ID:            uuid.NewString(),
+		Body:          "replay-processing",
+		Tag:           "tag-a",
+		CorrelationID: "corr-replay-processing",
+		Timestamp:     time.Now(),
+	}
+	if err := b.BeginProcessing("group-a", "orders", "orders", 0, 21, 22, msg); err != nil {
+		t.Fatalf("begin processing: %v", err)
+	}
+
+	key := processingKey("group-a", "orders", msg.ID)
+	b.lock.Lock()
+	delete(b.processing, key)
+	b.lock.Unlock()
+
+	entries := b.ListProcessing("group-a", "orders", 10)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 replayed processing entry, got %d", len(entries))
+	}
+	got := entries[0]
+	if got.MsgID != msg.ID || got.CorrelationID != msg.CorrelationID {
+		t.Fatalf("unexpected replayed processing entry: %+v", got)
+	}
+	if got.Offset != 21 || got.NextOffset != 22 {
+		t.Fatalf("expected replayed offsets [21,22), got [%d,%d)", got.Offset, got.NextOffset)
+	}
+}
+
+func TestListProcessingEventViewClearsStaleMemoryAfterAck(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	store := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = store.Close()
+	}()
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	msg := queue.Message{
+		ID:            uuid.NewString(),
+		Body:          "acked-processing",
+		Tag:           "tag-a",
+		CorrelationID: "corr-acked-processing",
+		Timestamp:     time.Now(),
+	}
+	if err := b.BeginProcessing("group-a", "orders", "orders", 0, 23, 24, msg); err != nil {
+		t.Fatalf("begin processing: %v", err)
+	}
+
+	key := processingKey("group-a", "orders", msg.ID)
+	b.lock.Lock()
+	stale := b.processing[key]
+	b.lock.Unlock()
+
+	if ok, err := b.CompleteProcessing(msg.ID, "group-a", "orders"); err != nil {
+		t.Fatalf("complete processing: %v", err)
+	} else if !ok {
+		t.Fatalf("expected processing completion to succeed")
+	}
+
+	b.lock.Lock()
+	stale.State = stateProcessing
+	b.processing[key] = stale
+	b.lock.Unlock()
+
+	entries := b.ListProcessing("group-a", "orders", 10)
+	if len(entries) != 0 {
+		t.Fatalf("expected settled ack event to clear stale memory processing entry, got %+v", entries)
 	}
 }
 
@@ -320,7 +785,9 @@ func TestSweepProcessingTimeoutsExpiresStaleInFlightMessages(t *testing.T) {
 		CorrelationID: "corr-stale-processing",
 		Timestamp:     time.Now().Add(-3 * time.Second),
 	}
-	b.BeginProcessing("group-a", "orders", "orders", 0, 5, 6, msg)
+	if err := b.BeginProcessing("group-a", "orders", "orders", 0, 5, 6, msg); err != nil {
+		t.Fatalf("begin processing: %v", err)
+	}
 
 	expired, retried := b.sweepProcessingTimeoutsAt(now().Add(2 * time.Second))
 	if expired != 1 || retried != 0 {
@@ -422,6 +889,85 @@ func TestRecoverProcessingRecordsExpireStaleEntries(t *testing.T) {
 	}
 }
 
+func TestRecoverProcessingRecordsSkipsTopicSettledEvents(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	store := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = store.Close()
+	}()
+
+	offset := int64(9)
+	nextOffset := int64(10)
+	msgID := uuid.NewString()
+	ts := time.Now()
+	err := store.SaveProcessing(storage.ProcessingRecord{
+		Group:         "group-a",
+		Topic:         "orders",
+		StorageTopic:  "orders",
+		QueueID:       0,
+		Offset:        &offset,
+		NextOffset:    &nextOffset,
+		MsgID:         msgID,
+		Body:          "stale-settled-processing",
+		Tag:           "tag-a",
+		CorrelationID: "corr-stale-settled-processing",
+		Retry:         1,
+		Timestamp:     ts,
+		UpdatedAt:     ts,
+	})
+	if err != nil {
+		t.Fatalf("save processing record: %v", err)
+	}
+
+	queueID := 0
+	eventAt := ts.Add(time.Second)
+	if err := store.AppendDeliveryEvent(storage.DeliveryEventRecord{
+		Event:         storage.DeliveryEventCancelled,
+		Topic:         "orders",
+		StorageTopic:  "orders",
+		QueueID:       &queueID,
+		MsgID:         msgID,
+		Offset:        &offset,
+		NextOffset:    &nextOffset,
+		Body:          "stale-settled-processing",
+		Tag:           "tag-a",
+		CorrelationID: "corr-stale-settled-processing",
+		Retry:         1,
+		Timestamp:     ts,
+		EventAt:       eventAt,
+	}); err != nil {
+		t.Fatalf("append cancelled delivery event: %v", err)
+	}
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	if b.GetDelayScheduler().delayQueue.Len() != 0 {
+		t.Fatalf("expected no retry to be scheduled for already-settled processing")
+	}
+	if got := b.GetRetryCount(msgID); got != 0 {
+		t.Fatalf("expected retry count to remain 0 for settled processing, got %d", got)
+	}
+	processingRecords, err := store.LoadProcessing()
+	if err != nil {
+		t.Fatalf("load processing records: %v", err)
+	}
+	if len(processingRecords) != 0 {
+		t.Fatalf("expected settled processing record to be removed, got %d", len(processingRecords))
+	}
+	retryEvents, err := store.ListGroupDeliveryEvents("group-a", "orders", storage.DeliveryEventRetry, 10)
+	if err != nil {
+		t.Fatalf("list retry delivery events: %v", err)
+	}
+	if len(retryEvents) != 0 {
+		t.Fatalf("expected no retry delivery events for already-settled processing, got %d", len(retryEvents))
+	}
+}
+
 func TestRecoverProcessingRecordsWriteRetryEventAndAdvanceRetryCount(t *testing.T) {
 	baseDir := t.TempDir()
 	dataDir := filepath.Join(baseDir, "data")
@@ -492,6 +1038,234 @@ func TestRecoverProcessingRecordsWriteRetryEventAndAdvanceRetryCount(t *testing.
 	}
 }
 
+func TestRecoverProcessingRecordsPreferProcessingDeliveryEventState(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	store := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = store.Close()
+	}()
+
+	msgID := uuid.NewString()
+	ts := time.Now()
+	err := store.SaveProcessing(storage.ProcessingRecord{
+		Group:         "group-a",
+		Topic:         "orders",
+		QueueID:       0,
+		MsgID:         msgID,
+		Body:          "replay-preferred-processing",
+		Tag:           "tag-a",
+		CorrelationID: "corr-replay-preferred-processing",
+		Retry:         2,
+		Timestamp:     ts,
+		UpdatedAt:     ts,
+	})
+	if err != nil {
+		t.Fatalf("save processing record: %v", err)
+	}
+
+	retryTopic := GetRetryTopicName("group-a", "orders")
+	queueID := 0
+	offset := int64(11)
+	nextOffset := int64(12)
+	consumedAt := ts.Add(2 * time.Second)
+	if err := store.AppendDeliveryEvent(storage.DeliveryEventRecord{
+		Event:         storage.DeliveryEventProcessing,
+		Group:         "group-a",
+		Topic:         "orders",
+		StorageTopic:  retryTopic,
+		QueueID:       &queueID,
+		MsgID:         msgID,
+		Offset:        &offset,
+		NextOffset:    &nextOffset,
+		Body:          "replay-preferred-processing",
+		Tag:           "tag-a",
+		CorrelationID: "corr-replay-preferred-processing",
+		Retry:         2,
+		Timestamp:     ts,
+		ConsumedAt:    &consumedAt,
+		EventAt:       consumedAt,
+	}); err != nil {
+		t.Fatalf("append processing delivery event: %v", err)
+	}
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	if got := b.GetRetryCount(msgID); got != 3 {
+		t.Fatalf("expected retry count to advance to 3 after replay-based recovery, got %d", got)
+	}
+	if b.GetDelayScheduler().delayQueue.Len() != 1 {
+		t.Fatalf("expected one replay-based retry to be scheduled, got %d", b.GetDelayScheduler().delayQueue.Len())
+	}
+	processingRecords, err := store.LoadProcessing()
+	if err != nil {
+		t.Fatalf("load processing records: %v", err)
+	}
+	if len(processingRecords) != 0 {
+		t.Fatalf("expected replay-based recovery to remove processing record, got %d", len(processingRecords))
+	}
+	retryEvents, err := store.ListGroupDeliveryEvents("group-a", "orders", storage.DeliveryEventRetry, 10)
+	if err != nil {
+		t.Fatalf("list retry delivery events: %v", err)
+	}
+	if len(retryEvents) != 1 {
+		t.Fatalf("expected 1 retry delivery event after replay-based recovery, got %d", len(retryEvents))
+	}
+	got := retryEvents[0]
+	if got.StorageTopic != retryTopic {
+		t.Fatalf("expected replay-based retry storage topic %s, got %s", retryTopic, got.StorageTopic)
+	}
+	if got.Offset == nil || got.NextOffset == nil || *got.Offset != 11 || *got.NextOffset != 12 {
+		t.Fatalf("expected replay-based retry offsets [11,12), got offset=%v next=%v", got.Offset, got.NextOffset)
+	}
+}
+
+func TestRecoverProcessingRecordsFromProcessingDeliveryEventsWithoutPersistedRecord(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	store := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = store.Close()
+	}()
+
+	msgID := uuid.NewString()
+	ts := time.Now()
+	retryTopic := GetRetryTopicName("group-a", "orders")
+	queueID := 0
+	offset := int64(21)
+	nextOffset := int64(22)
+	consumedAt := ts.Add(2 * time.Second)
+	if err := store.AppendDeliveryEvent(storage.DeliveryEventRecord{
+		Event:         storage.DeliveryEventProcessing,
+		Group:         "group-a",
+		Topic:         "orders",
+		StorageTopic:  retryTopic,
+		QueueID:       &queueID,
+		MsgID:         msgID,
+		Offset:        &offset,
+		NextOffset:    &nextOffset,
+		Body:          "event-only-processing",
+		Tag:           "tag-a",
+		CorrelationID: "corr-event-only-processing",
+		Retry:         2,
+		Timestamp:     ts,
+		ConsumedAt:    &consumedAt,
+		EventAt:       consumedAt,
+	}); err != nil {
+		t.Fatalf("append processing delivery event: %v", err)
+	}
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	if got := b.GetRetryCount(msgID); got != 3 {
+		t.Fatalf("expected retry count to advance to 3 after event-only recovery, got %d", got)
+	}
+	if b.GetDelayScheduler().delayQueue.Len() != 1 {
+		t.Fatalf("expected one event-only retry to be scheduled, got %d", b.GetDelayScheduler().delayQueue.Len())
+	}
+	processingRecords, err := store.LoadProcessing()
+	if err != nil {
+		t.Fatalf("load processing records: %v", err)
+	}
+	if len(processingRecords) != 0 {
+		t.Fatalf("expected no persisted processing records after event-only recovery, got %d", len(processingRecords))
+	}
+	retryEvents, err := store.ListGroupDeliveryEvents("group-a", "orders", storage.DeliveryEventRetry, 10)
+	if err != nil {
+		t.Fatalf("list retry delivery events: %v", err)
+	}
+	if len(retryEvents) != 1 {
+		t.Fatalf("expected 1 retry delivery event after event-only recovery, got %d", len(retryEvents))
+	}
+	got := retryEvents[0]
+	if got.StorageTopic != retryTopic {
+		t.Fatalf("expected event-only retry storage topic %s, got %s", retryTopic, got.StorageTopic)
+	}
+	if got.Offset == nil || got.NextOffset == nil || *got.Offset != 21 || *got.NextOffset != 22 {
+		t.Fatalf("expected event-only retry offsets [21,22), got offset=%v next=%v", got.Offset, got.NextOffset)
+	}
+}
+
+func TestRecoverProcessingRecordsEventOnlySkipsTopicSettledEvents(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	store := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = store.Close()
+	}()
+
+	msgID := uuid.NewString()
+	ts := time.Now()
+	queueID := 0
+	offset := int64(31)
+	nextOffset := int64(32)
+	consumedAt := ts.Add(2 * time.Second)
+	if err := store.AppendDeliveryEvent(storage.DeliveryEventRecord{
+		Event:         storage.DeliveryEventProcessing,
+		Group:         "group-a",
+		Topic:         "orders",
+		StorageTopic:  "orders",
+		QueueID:       &queueID,
+		MsgID:         msgID,
+		Offset:        &offset,
+		NextOffset:    &nextOffset,
+		Body:          "event-only-settled-processing",
+		Tag:           "tag-a",
+		CorrelationID: "corr-event-only-settled-processing",
+		Retry:         1,
+		Timestamp:     ts,
+		ConsumedAt:    &consumedAt,
+		EventAt:       consumedAt,
+	}); err != nil {
+		t.Fatalf("append processing delivery event: %v", err)
+	}
+	if err := store.AppendDeliveryEvent(storage.DeliveryEventRecord{
+		Event:         storage.DeliveryEventCancelled,
+		Topic:         "orders",
+		StorageTopic:  "orders",
+		QueueID:       &queueID,
+		MsgID:         msgID,
+		Offset:        &offset,
+		NextOffset:    &nextOffset,
+		Body:          "event-only-settled-processing",
+		Tag:           "tag-a",
+		CorrelationID: "corr-event-only-settled-processing",
+		Retry:         1,
+		Timestamp:     ts,
+		EventAt:       consumedAt.Add(time.Second),
+	}); err != nil {
+		t.Fatalf("append cancelled delivery event: %v", err)
+	}
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	if b.GetDelayScheduler().delayQueue.Len() != 0 {
+		t.Fatalf("expected no retry to be scheduled for event-only settled processing")
+	}
+	if got := b.GetRetryCount(msgID); got != 0 {
+		t.Fatalf("expected retry count to remain 0 for event-only settled processing, got %d", got)
+	}
+	retryEvents, err := store.ListGroupDeliveryEvents("group-a", "orders", storage.DeliveryEventRetry, 10)
+	if err != nil {
+		t.Fatalf("list retry delivery events: %v", err)
+	}
+	if len(retryEvents) != 0 {
+		t.Fatalf("expected no retry delivery events for event-only settled processing, got %d", len(retryEvents))
+	}
+}
+
 func TestListCompletedUsesPersistedAckHistoryAfterRestart(t *testing.T) {
 	baseDir := t.TempDir()
 	dataDir := filepath.Join(baseDir, "data")
@@ -506,7 +1280,9 @@ func TestListCompletedUsesPersistedAckHistoryAfterRestart(t *testing.T) {
 		CorrelationID: "corr-completed",
 		Timestamp:     time.Now().Add(-time.Minute),
 	}
-	b.BeginProcessing("group-a", "orders", "orders", 0, 9, 10, msg)
+	if err := b.BeginProcessing("group-a", "orders", "orders", 0, 9, 10, msg); err != nil {
+		t.Fatalf("begin processing: %v", err)
+	}
 	ok, err := b.CompleteProcessing(msg.ID, "group-a", "orders")
 	if err != nil {
 		t.Fatalf("complete processing: %v", err)
@@ -562,7 +1338,9 @@ func TestSweepTerminalTombstonesPreservesCancelledHistory(t *testing.T) {
 	if err := store.AppendSync("orders", 0, msg); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
-	if ok := b.TerminateMessage(msg.ID, "orders"); !ok {
+	if ok, err := b.TerminateMessage(msg.ID, "orders"); err != nil {
+		t.Fatalf("terminate message: %v", err)
+	} else if !ok {
 		t.Fatalf("expected terminate to succeed")
 	}
 	if !b.IsCancelled("orders", msg.ID) {
@@ -592,6 +1370,74 @@ func TestSweepTerminalTombstonesPreservesCancelledHistory(t *testing.T) {
 	}
 }
 
+func TestSweepTerminalTombstonesWaitsForSettledWatermark(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	store := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = store.Close()
+	}()
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	first := storage.Message{ID: uuid.NewString(), Body: "first", Tag: "tag-a", Timestamp: time.Now()}
+	second := storage.Message{ID: uuid.NewString(), Body: "second", Tag: "tag-a", Timestamp: time.Now()}
+	if err := store.AppendSync("orders", 0, first); err != nil {
+		t.Fatalf("append first message: %v", err)
+	}
+	if err := store.AppendSync("orders", 0, second); err != nil {
+		t.Fatalf("append second message: %v", err)
+	}
+	if err := b.BeginProcessing("group-a", "orders", "orders", 0, 0, 1, queue.Message{
+		ID:        first.ID,
+		Body:      first.Body,
+		Tag:       first.Tag,
+		Timestamp: first.Timestamp,
+	}); err != nil {
+		t.Fatalf("begin first processing: %v", err)
+	}
+	if ok, err := b.TerminateMessage(second.ID, "orders"); err != nil {
+		t.Fatalf("terminate message: %v", err)
+	} else if !ok {
+		t.Fatalf("expected terminate to succeed")
+	}
+	if err := b.CommitOffset("group-a", "orders", 0, 2); err != nil {
+		t.Fatalf("commit offset: %v", err)
+	}
+
+	deleted, err := b.SweepTerminalTombstones()
+	if err != nil {
+		t.Fatalf("sweep tombstones before settled watermark: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("expected no tombstone sweep before settled watermark is contiguous, got %d", deleted)
+	}
+	if !b.IsCancelled("orders", second.ID) {
+		t.Fatalf("expected cancelled tombstone to remain visible")
+	}
+
+	if ok, err := b.CompleteProcessing(first.ID, "group-a", "orders"); err != nil {
+		t.Fatalf("complete first processing: %v", err)
+	} else if !ok {
+		t.Fatalf("expected first processing to complete")
+	}
+
+	deleted, err = b.SweepTerminalTombstones()
+	if err != nil {
+		t.Fatalf("sweep tombstones after settled watermark: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected 1 swept tombstone after settled watermark advanced, got %d", deleted)
+	}
+	if b.IsCancelled("orders", second.ID) {
+		t.Fatalf("expected cancelled tombstone lookup to be cleared after sweep")
+	}
+}
+
 func TestSweepRetryTombstonesWaitsForRetryOffset(t *testing.T) {
 	baseDir := t.TempDir()
 	dataDir := filepath.Join(baseDir, "data")
@@ -614,8 +1460,12 @@ func TestSweepRetryTombstonesWaitsForRetryOffset(t *testing.T) {
 		Timestamp:     time.Now(),
 	}
 	retryTopic := GetRetryTopicName("group-a", "orders")
-	b.BeginProcessing("group-a", "orders", retryTopic, 0, 5, 6, msg)
-	if ok := b.TerminateMessage(msg.ID, "orders"); !ok {
+	if err := b.BeginProcessing("group-a", "orders", retryTopic, 0, 0, 1, msg); err != nil {
+		t.Fatalf("begin processing: %v", err)
+	}
+	if ok, err := b.TerminateMessage(msg.ID, "orders"); err != nil {
+		t.Fatalf("terminate message: %v", err)
+	} else if !ok {
 		t.Fatalf("expected terminate to succeed")
 	}
 
@@ -630,7 +1480,7 @@ func TestSweepRetryTombstonesWaitsForRetryOffset(t *testing.T) {
 		t.Fatalf("expected retry tombstone to remain visible")
 	}
 
-	if err := b.CommitOffset("group-a", retryTopic, 0, 6); err != nil {
+	if err := b.CommitOffset("group-a", retryTopic, 0, 1); err != nil {
 		t.Fatalf("commit retry offset: %v", err)
 	}
 	deleted, err = b.SweepTerminalTombstones()
@@ -653,7 +1503,69 @@ func TestSweepRetryTombstonesWaitsForRetryOffset(t *testing.T) {
 	}
 }
 
-func TestSweepConsumedSegmentsUsesCommittedOffsets(t *testing.T) {
+func TestSweepRetryTombstonesWaitsForSettledWatermark(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	store := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = store.Close()
+	}()
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	retryTopic := GetRetryTopicName("group-a", "orders")
+	first := queue.Message{ID: uuid.NewString(), Body: "retry-first", Tag: "tag-a", Timestamp: time.Now()}
+	second := queue.Message{ID: uuid.NewString(), Body: "retry-second", Tag: "tag-a", Timestamp: time.Now()}
+
+	if err := b.BeginProcessing("group-a", "orders", retryTopic, 0, 0, 1, first); err != nil {
+		t.Fatalf("begin first retry processing: %v", err)
+	}
+	if err := b.BeginProcessing("group-a", "orders", retryTopic, 0, 1, 2, second); err != nil {
+		t.Fatalf("begin second retry processing: %v", err)
+	}
+	if ok, err := b.TerminateMessage(second.ID, "orders"); err != nil {
+		t.Fatalf("terminate message: %v", err)
+	} else if !ok {
+		t.Fatalf("expected retry terminate to succeed")
+	}
+	if err := b.CommitOffset("group-a", retryTopic, 0, 2); err != nil {
+		t.Fatalf("commit retry offset: %v", err)
+	}
+
+	deleted, err := b.SweepTerminalTombstones()
+	if err != nil {
+		t.Fatalf("retry tombstone sweep before settled watermark: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("expected retry tombstone to remain before settled watermark is contiguous, got %d", deleted)
+	}
+	if !b.IsCancelled("orders", second.ID) {
+		t.Fatalf("expected retry tombstone to remain visible")
+	}
+
+	if ok, err := b.CompleteProcessing(first.ID, "group-a", "orders"); err != nil {
+		t.Fatalf("complete first retry processing: %v", err)
+	} else if !ok {
+		t.Fatalf("expected first retry processing to complete")
+	}
+
+	deleted, err = b.SweepTerminalTombstones()
+	if err != nil {
+		t.Fatalf("retry tombstone sweep after settled watermark: %v", err)
+	}
+	if deleted != 1 {
+		t.Fatalf("expected retry tombstone to be swept after settled watermark advanced, got %d", deleted)
+	}
+	if b.IsCancelled("orders", second.ID) {
+		t.Fatalf("expected retry tombstone lookup to be cleared after sweep")
+	}
+}
+
+func TestSweepConsumedSegmentsUsesCommittedOffsetsAndSettledEvents(t *testing.T) {
 	baseDir := t.TempDir()
 	dataDir := filepath.Join(baseDir, "data")
 
@@ -681,23 +1593,46 @@ func TestSweepConsumedSegmentsUsesCommittedOffsets(t *testing.T) {
 		t.Fatalf("append second message: %v", err)
 	}
 
+	if err := b.BeginProcessing("group-a", "orders", "orders", 0, 0, 1, queue.Message{
+		ID:        first.ID,
+		Body:      first.Body,
+		Tag:       first.Tag,
+		Timestamp: first.Timestamp,
+	}); err != nil {
+		t.Fatalf("begin group-a processing: %v", err)
+	}
+	if ok, err := b.CompleteProcessing(first.ID, "group-a", "orders"); err != nil {
+		t.Fatalf("complete group-a processing: %v", err)
+	} else if !ok {
+		t.Fatalf("expected group-a processing to complete")
+	}
 	if err := b.CommitOffset("group-a", "orders", 0, 1); err != nil {
 		t.Fatalf("commit group-a offset: %v", err)
 	}
-	if err := b.CommitOffset("group-b", "orders", 0, 0); err != nil {
+	if err := b.CommitOffset("group-b", "orders", 0, 1); err != nil {
 		t.Fatalf("commit group-b offset: %v", err)
 	}
 
 	deleted, err := b.SweepConsumedSegments()
 	if err != nil {
-		t.Fatalf("sweep consumed segments before all groups advance: %v", err)
+		t.Fatalf("sweep consumed segments before all groups settle: %v", err)
 	}
 	if deleted != 0 {
-		t.Fatalf("expected no consumed segment prune while a group still lags, got %d", deleted)
+		t.Fatalf("expected no consumed segment prune while a group still lacks terminal event, got %d", deleted)
 	}
 
-	if err := b.CommitOffset("group-b", "orders", 0, 1); err != nil {
-		t.Fatalf("commit advanced group-b offset: %v", err)
+	if err := b.BeginProcessing("group-b", "orders", "orders", 0, 0, 1, queue.Message{
+		ID:        first.ID,
+		Body:      first.Body,
+		Tag:       first.Tag,
+		Timestamp: first.Timestamp,
+	}); err != nil {
+		t.Fatalf("begin group-b processing: %v", err)
+	}
+	if ok, err := b.CompleteProcessing(first.ID, "group-b", "orders"); err != nil {
+		t.Fatalf("complete group-b processing: %v", err)
+	} else if !ok {
+		t.Fatalf("expected group-b processing to complete")
 	}
 	deleted, err = b.SweepConsumedSegments()
 	if err != nil {
@@ -718,6 +1653,10 @@ func TestSweepConsumedSegmentsUsesCommittedOffsets(t *testing.T) {
 	}
 	if msgs[0].Offset != 1 || nextOffset != 2 {
 		t.Fatalf("expected logical offsets [1,2), got offset=%d next=%d", msgs[0].Offset, nextOffset)
+	}
+	completed := b.ListCompleted("group-a", "orders", 10)
+	if len(completed) != 0 {
+		t.Fatalf("expected pruned completed history to be removed from current view, got %+v", completed)
 	}
 }
 
@@ -763,7 +1702,7 @@ func TestSweepConsumedSegmentsSkipsNormalTopicsForEarliestStart(t *testing.T) {
 	}
 }
 
-func TestSweepConsumedSegmentsUsesRetryOwnerOffset(t *testing.T) {
+func TestSweepConsumedSegmentsUsesRetryOwnerOffsetAndSettledEvents(t *testing.T) {
 	baseDir := t.TempDir()
 	dataDir := filepath.Join(baseDir, "data")
 
@@ -781,12 +1720,14 @@ func TestSweepConsumedSegmentsUsesRetryOwnerOffset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensure retry topic: %v", err)
 	}
+	first := storage.Message{ID: uuid.NewString(), Body: "first", Tag: "tag-a", Timestamp: time.Now()}
+	second := storage.Message{ID: uuid.NewString(), Body: "second", Tag: "tag-a", Timestamp: time.Now()}
 	store.SetCompactThreshold(1)
-	if err := store.AppendSync(retryTopic, 0, storage.Message{ID: uuid.NewString(), Body: "first", Tag: "tag-a", Timestamp: time.Now()}); err != nil {
+	if err := store.AppendSync(retryTopic, 0, first); err != nil {
 		t.Fatalf("append first retry message: %v", err)
 	}
 	store.SetCompactThreshold(10 * 1024 * 1024)
-	if err := store.AppendSync(retryTopic, 0, storage.Message{ID: uuid.NewString(), Body: "second", Tag: "tag-a", Timestamp: time.Now()}); err != nil {
+	if err := store.AppendSync(retryTopic, 0, second); err != nil {
 		t.Fatalf("append second retry message: %v", err)
 	}
 
@@ -804,6 +1745,28 @@ func TestSweepConsumedSegmentsUsesRetryOwnerOffset(t *testing.T) {
 	deleted, err = b.SweepConsumedSegments()
 	if err != nil {
 		t.Fatalf("retry consumed prune: %v", err)
+	}
+	if deleted != 0 {
+		t.Fatalf("expected no retry consumed prune before retry event is settled, got %d", deleted)
+	}
+
+	if err := b.BeginProcessing("group-a", "orders", retryTopic, 0, 0, 1, queue.Message{
+		ID:        first.ID,
+		Body:      first.Body,
+		Tag:       first.Tag,
+		Timestamp: first.Timestamp,
+	}); err != nil {
+		t.Fatalf("begin retry processing: %v", err)
+	}
+	if ok, err := b.CompleteProcessing(first.ID, "group-a", "orders"); err != nil {
+		t.Fatalf("complete retry processing: %v", err)
+	} else if !ok {
+		t.Fatalf("expected retry processing to complete")
+	}
+
+	deleted, err = b.SweepConsumedSegments()
+	if err != nil {
+		t.Fatalf("retry consumed prune after settled event: %v", err)
 	}
 	if deleted != 1 {
 		t.Fatalf("expected 1 retry consumed segment prune, got %d", deleted)

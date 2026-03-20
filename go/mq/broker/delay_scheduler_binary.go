@@ -113,6 +113,23 @@ func (ds *BinaryDelayScheduler) Schedule(dm *DelayedMessage) {
 	}
 }
 
+// ScheduleStrict adds a delayed message and rolls the in-memory queue back if persistence fails.
+func (ds *BinaryDelayScheduler) ScheduleStrict(dm *DelayedMessage) error {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	heap.Push(&ds.delayQueue, dm)
+	if !ds.initialized {
+		return nil
+	}
+	if err := ds.persistToCommitLog(); err != nil {
+		if idx := ds.indexOfDelayedMessage(dm.Topic, dm.QueueID, dm.Message.ID); idx >= 0 {
+			heap.Remove(&ds.delayQueue, idx)
+		}
+		return err
+	}
+	return nil
+}
+
 // ScheduleWithDelay schedules a message with relative delay from now
 func (ds *BinaryDelayScheduler) ScheduleWithDelay(topic string, queueID int, msg storage.Message, delay time.Duration) {
 	dm := &DelayedMessage{
@@ -122,6 +139,45 @@ func (ds *BinaryDelayScheduler) ScheduleWithDelay(topic string, queueID int, msg
 		ExecuteAt: time.Now().Add(delay),
 	}
 	ds.Schedule(dm)
+}
+
+// ScheduleWithDelayStrict schedules a message with rollback on persistence failure.
+func (ds *BinaryDelayScheduler) ScheduleWithDelayStrict(topic string, queueID int, msg storage.Message, delay time.Duration) error {
+	dm := &DelayedMessage{
+		Message:   msg,
+		Topic:     topic,
+		QueueID:   queueID,
+		ExecuteAt: time.Now().Add(delay),
+	}
+	return ds.ScheduleStrict(dm)
+}
+
+func (ds *BinaryDelayScheduler) indexOfDelayedMessage(topic string, queueID int, msgID string) int {
+	for i, dm := range ds.delayQueue {
+		if dm.Topic == topic && dm.QueueID == queueID && dm.Message.ID == msgID {
+			return i
+		}
+	}
+	return -1
+}
+
+// RemoveScheduled removes a scheduled message and rolls the removal back if persistence fails.
+func (ds *BinaryDelayScheduler) RemoveScheduled(topic string, queueID int, msgID string) error {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	idx := ds.indexOfDelayedMessage(topic, queueID, msgID)
+	if idx < 0 {
+		return nil
+	}
+	removed := heap.Remove(&ds.delayQueue, idx).(*DelayedMessage)
+	if !ds.initialized {
+		return nil
+	}
+	if err := ds.persistToCommitLog(); err != nil {
+		heap.Push(&ds.delayQueue, removed)
+		return err
+	}
+	return nil
 }
 
 // Stop gracefully shuts down the scheduler

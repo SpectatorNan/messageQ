@@ -844,7 +844,21 @@ func (w *WALStorage) PruneConsumedSegments(topic string, queueID int, cutoffOffs
 				return err
 			}
 		}
-		return w.trimConsumeQueueHead(topic, queueID)
+		if err := w.trimConsumeQueueHead(topic, queueID); err != nil {
+			return err
+		}
+		w.mu.Lock()
+		newBase, err := w.getConsumeQueueBaseOffsetLocked(topic, queueID)
+		w.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		if newBase > base {
+			if _, err := w.PruneDeliveryEvents(deliveryEventLogicalTopic(topic), topic, queueID, newBase); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	return deleted, err
 }
@@ -867,6 +881,12 @@ func (w *WALStorage) PruneExpiredSegments(topic string, queueID int, cutoff time
 	}
 	return w.withTopicCompaction(topic, queueID, func() error {
 		if err := w.FlushTopic(topic, queueID); err != nil {
+			return err
+		}
+		w.mu.Lock()
+		baseBefore, err := w.getConsumeQueueBaseOffsetLocked(topic, queueID)
+		w.mu.Unlock()
+		if err != nil {
 			return err
 		}
 
@@ -924,7 +944,21 @@ func (w *WALStorage) PruneExpiredSegments(topic string, queueID int, cutoff time
 				return err
 			}
 		}
-		return w.trimConsumeQueueHead(topic, queueID)
+		if err := w.trimConsumeQueueHead(topic, queueID); err != nil {
+			return err
+		}
+		w.mu.Lock()
+		baseAfter, err := w.getConsumeQueueBaseOffsetLocked(topic, queueID)
+		w.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		if baseAfter > baseBefore {
+			if _, err := w.PruneDeliveryEvents(deliveryEventLogicalTopic(topic), topic, queueID, baseAfter); err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 }
 

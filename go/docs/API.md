@@ -158,6 +158,8 @@ curl -X POST http://localhost:8080/topics/notifications/messages/delay \
 - 新 consumer group 首次消费普通 topic 时，offset 会初始化到当前 queue tail（`latest`），不会回放历史消息
 - 同一 `group + topic` 的订阅 tag 必须一致；一旦某个 group 以某个 tag 建立订阅，后续再用不同 tag 消费会返回 `subscription_conflict`
 - `""` 与 `*` 会被视为同一个“全量订阅”标签
+- 如果 broker 无法持久化本次 `processing` 状态，消费接口会返回 `internal_error`，并把本次已取出的消息回滚为 retry，而不是静默吞掉该错误
+- 如果 broker 无法持久化本次 `retry` / `cancelled` / `expired` 状态，相关 `nack`、`terminate` 或状态查询接口也会返回 `internal_error`，而不是静默报告成功
 
 **响应：**
 ```json
@@ -360,7 +362,9 @@ curl -X POST \
 - 查询 `cancelled` 可看到 topic 上已终止消息；该视图不区分消费组，同一 topic 的任意 group 查询结果一致
 - 查询 `expired` 可看到超过保留窗口后被系统自动终止的消息；这些消息也可能在后台 retention sweep 删除旧 segment 前被补记为 `expired`
 - 对于长期未 ack 的 `processing` 消息，若其原始消息时间已经超过过期窗口，则超时检查会直接将其记为 `expired`，而不是继续无限重试
-- 查询 `retry` / `dlq` 返回该 `group+topic` 的最近投递事件视图，来源于持久化 delivery event log；`retry` 事件会返回 `eventAt`（进入重试的时间）和 `scheduledAt`（下一次计划投递时间），并且包含 broker 重启恢复时补发的 retry 事件；`dlq` 事件会返回 `eventAt`（进入死信队列的时间）
+- 查询 `retry` / `dlq` 返回该 `group+topic` 的**最新状态视图**：broker 会按每条消息的最新 delivery event 做归约，只返回当前最新事件仍为 `retry` 或 `dlq` 的消息，而不是简单回放全部历史；`retry` 事件会返回 `eventAt`（进入重试的时间）和 `scheduledAt`（下一次计划投递时间），并且包含 broker 重启恢复时补发的 retry 事件；`dlq` 事件会返回 `eventAt`（进入死信队列的时间）
+- `processing` 文件现在只作为 `processing` delivery event 写入前的 crash-window fallback；一旦 `processing` event 已成功写盘，fallback 文件会被立即删除，后续当前态查询与启动恢复都会优先使用 delivery events
+- delivery event log 中带 queue/offset 的记录会随着对应 `commitlog + consumequeue` 前缀一起裁剪：当 retention prune 或 consumed prune 推进了 queue 的 `baseOffset` 后，位于该前缀之前的 `ack/retry/dlq/cancelled/expired` 事件也会被同步删除，因此这些状态查询只对当前保留窗口内的数据提供历史
 - 被终止或过期的消息不会出现在 `pending`、`scheduled` 以及实际消费结果中
 
 **`cancelled` 响应示例：**
@@ -661,6 +665,7 @@ curl http://localhost:8080/stats
 | 错误码 | 描述 |
 |--------|------|
 | `missing_topic` | 缺少topic参数 |
+| `internal_error` | 服务端内部错误，例如无法持久化 processing / retry / cancelled / expired 等状态 |
 | `invalid_message` | 消息格式无效或body为空 |
 | `invalid_id` | 消息ID格式无效（非UUID） |
 | `not_found` | 消息未找到或已处理 |

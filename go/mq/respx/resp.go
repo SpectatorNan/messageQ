@@ -13,6 +13,8 @@ func FailGin(c *gin.Context, err error) {
 		// Determine HTTP status code based on error type
 		statusCode := http.StatusBadRequest
 		switch re.Code {
+		case errx.ErrCodeInternal:
+			statusCode = http.StatusInternalServerError
 		case errx.ErrCodeNotFound, errx.ErrCodeTopicNotFound:
 			statusCode = http.StatusNotFound
 		}

@@ -13,16 +13,18 @@ import (
 )
 
 const (
-	DeliveryEventAck       = "ack"
-	DeliveryEventRetry     = "retry"
-	DeliveryEventCancelled = "cancelled"
-	DeliveryEventExpired   = "expired"
-	DeliveryEventDLQ       = "dlq"
+	DeliveryEventProcessing = "processing"
+	DeliveryEventAck        = "ack"
+	DeliveryEventRetry      = "retry"
+	DeliveryEventCancelled  = "cancelled"
+	DeliveryEventExpired    = "expired"
+	DeliveryEventDLQ        = "dlq"
 )
 
 const deliveryLogTopicScope = "__topic__"
 const deliveryLogAllQueues = "all.jsonl"
 const deliveryLogScanBuffer = 16 * 1024 * 1024
+const deliveryLogRetryMarker = ".retry."
 
 // DeliveryEventRecord persists consumer lifecycle events for future replay and cleanup work.
 type DeliveryEventRecord struct {
@@ -184,6 +186,8 @@ func (w *WALStorage) AppendDeliveryEvent(rec DeliveryEventRecord) error {
 	if rec.StorageTopic == "" {
 		rec.StorageTopic = rec.Topic
 	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	dir := filepath.Dir(w.deliveryLogPath(rec.Group, rec.Topic, rec.QueueID))
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -207,6 +211,149 @@ func (w *WALStorage) AppendDeliveryEvent(rec DeliveryEventRecord) error {
 		return err
 	}
 	return syncDir(dir)
+}
+
+func deliveryEventRecordOffsetRange(rec DeliveryEventRecord) (int64, int64, bool) {
+	if rec.Offset != nil {
+		if rec.NextOffset != nil {
+			return *rec.Offset, *rec.NextOffset, true
+		}
+		return *rec.Offset, *rec.Offset + 1, true
+	}
+	if rec.NextOffset != nil {
+		return *rec.NextOffset - 1, *rec.NextOffset, true
+	}
+	return 0, 0, false
+}
+
+func deliveryEventLogicalTopic(storageTopic string) string {
+	idx := strings.LastIndex(storageTopic, deliveryLogRetryMarker)
+	if idx <= 0 || idx+len(deliveryLogRetryMarker) >= len(storageTopic) {
+		return storageTopic
+	}
+	return storageTopic[:idx]
+}
+
+func writeDeliveryEventsFile(path string, records []DeliveryEventRecord) error {
+	dir := filepath.Dir(path)
+	if len(records) == 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return syncDir(dir)
+	}
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	for _, rec := range records {
+		b, err := json.Marshal(rec)
+		if err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return err
+		}
+		b = append(b, '\n')
+		if _, err := f.Write(b); err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+			return err
+		}
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return syncDir(dir)
+}
+
+func (w *WALStorage) pruneDeliveryEventFile(path, storageTopic string, queueID int, cutoffOffset int64) (int, error) {
+	records, err := readDeliveryEventsFromFile(path)
+	if err != nil {
+		return 0, err
+	}
+	if len(records) == 0 {
+		return 0, nil
+	}
+	kept := make([]DeliveryEventRecord, 0, len(records))
+	deleted := 0
+	for _, rec := range records {
+		if rec.StorageTopic != storageTopic {
+			kept = append(kept, rec)
+			continue
+		}
+		if rec.QueueID == nil || *rec.QueueID != queueID {
+			kept = append(kept, rec)
+			continue
+		}
+		_, nextOffset, ok := deliveryEventRecordOffsetRange(rec)
+		if !ok || nextOffset > cutoffOffset {
+			kept = append(kept, rec)
+			continue
+		}
+		deleted++
+	}
+	if deleted == 0 {
+		return 0, nil
+	}
+	if err := writeDeliveryEventsFile(path, kept); err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
+// PruneDeliveryEvents removes offset-scoped delivery events that fall fully before a pruned queue prefix.
+func (w *WALStorage) PruneDeliveryEvents(logicalTopic, storageTopic string, queueID int, cutoffOffset int64) (int, error) {
+	if logicalTopic == "" || storageTopic == "" || cutoffOffset <= 0 {
+		return 0, nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	root := filepath.Join(w.baseDir, "acklog")
+	scopeEntries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+
+	totalDeleted := 0
+	for _, scopeEntry := range scopeEntries {
+		if !scopeEntry.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, scopeEntry.Name(), logicalTopic)
+		files, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return totalDeleted, err
+		}
+		for _, file := range files {
+			if file.IsDir() || !strings.HasSuffix(file.Name(), ".jsonl") {
+				continue
+			}
+			deleted, err := w.pruneDeliveryEventFile(filepath.Join(dir, file.Name()), storageTopic, queueID, cutoffOffset)
+			if err != nil {
+				return totalDeleted, err
+			}
+			totalDeleted += deleted
+		}
+	}
+	return totalDeleted, nil
 }
 
 // LoadDeliveryEvents loads persisted lifecycle events for a group/topic/queue.
@@ -301,6 +448,41 @@ func (w *WALStorage) ListGroupDeliveryEvents(group, topic, event string, limit i
 	})
 	if len(out) > limit {
 		out = out[:limit]
+	}
+	return out, nil
+}
+
+// ListGroupDeliveryTopics returns every group/topic namespace with group-scoped delivery logs.
+func (w *WALStorage) ListGroupDeliveryTopics() (map[string][]string, error) {
+	root := filepath.Join(w.baseDir, "acklog")
+	groupEntries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	out := make(map[string][]string)
+	for _, groupEntry := range groupEntries {
+		if !groupEntry.IsDir() || groupEntry.Name() == deliveryLogTopicScope {
+			continue
+		}
+		group := groupEntry.Name()
+		topicEntries, err := os.ReadDir(filepath.Join(root, group))
+		if err != nil {
+			return nil, err
+		}
+		topics := make([]string, 0, len(topicEntries))
+		for _, topicEntry := range topicEntries {
+			if topicEntry.IsDir() {
+				topics = append(topics, topicEntry.Name())
+			}
+		}
+		if len(topics) == 0 {
+			continue
+		}
+		sort.Strings(topics)
+		out[group] = topics
 	}
 	return out, nil
 }
