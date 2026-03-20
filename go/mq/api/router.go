@@ -58,7 +58,6 @@ func NewRouter(b *broker.Broker) *gin.Engine {
 
 				consumers.POST("/topics/:topic/messages/:id/ack", AckHandler(b))
 				consumers.POST("/topics/:topic/messages/:id/nack", NackHandler(b))
-				consumers.POST("/topics/:topic/messages/:id/terminate", TerminateHandler(b))
 			}
 
 			// Monitoring

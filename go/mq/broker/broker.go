@@ -2714,6 +2714,57 @@ func (b *Broker) findPendingMessage(topic, msgID string) (cancelledEntry, bool) 
 	return cancelledEntry{}, false
 }
 
+// findPendingInRetryTopics scans all retry topics associated with the given logical topic
+// to find a pending message that has been requeued for retry.
+func (b *Broker) findPendingInRetryTopics(logicalTopic, msgID string) (cancelledEntry, bool) {
+	for _, cfg := range b.topicManager.ListTopics() {
+		if cfg == nil {
+			continue
+		}
+		baseTopic, _, ok := splitRetryTopicName(cfg.Name)
+		if !ok || baseTopic != logicalTopic {
+			continue
+		}
+		retryTopic := cfg.Name
+		for queueID := 0; queueID < cfg.QueueCount; queueID++ {
+			cursor := int64(0)
+			for {
+				msgs, nextCursor, err := b.ReadFromConsumeQueueWithOffsets(retryTopic, queueID, cursor, 128, "")
+				if err != nil {
+					break
+				}
+				if len(msgs) == 0 {
+					break
+				}
+				for _, msg := range msgs {
+					if msg.ID != msgID {
+						continue
+					}
+					offset := msg.Offset
+					nextOffset := msg.Offset + 1
+					queueIDCopy := queueID
+					return cancelledEntry{
+						Topic:         logicalTopic,
+						StorageTopic:  retryTopic,
+						QueueID:       &queueIDCopy,
+						Offset:        &offset,
+						NextOffset:    &nextOffset,
+						MsgID:         msg.ID,
+						Body:          msg.Body,
+						Tag:           msg.Tag,
+						CorrelationID: msg.CorrelationID,
+						Retry:         msg.Retry,
+						Timestamp:     msg.Timestamp,
+						CancelledAt:   now(),
+					}, true
+				}
+				cursor = nextCursor
+			}
+		}
+	}
+	return cancelledEntry{}, false
+}
+
 func (b *Broker) listTerminalByState(topic, state string, limit int) []cancelledEntry {
 	if limit <= 0 {
 		limit = 50
@@ -3270,6 +3321,8 @@ func (b *Broker) ValidateProcessing(msgID, group, topic string) bool {
 
 // TerminateMessage marks a message cancelled for a topic.
 // It is intentionally idempotent: unknown or already-terminated messages still succeed.
+// A tombstone is always written so the consume path can filter the message regardless
+// of which queue (main or retry) it currently resides in.
 func (b *Broker) TerminateMessage(msgID, topic string) (bool, error) {
 	if topic == "" || msgID == "" {
 		return false, nil
@@ -3295,6 +3348,22 @@ func (b *Broker) TerminateMessage(msgID, topic string) (bool, error) {
 			return false, err
 		}
 		return true, nil
+	}
+	if entry, ok := b.findPendingInRetryTopics(topic, msgID); ok {
+		if err := b.recordCancelled(entry); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	// Message not found in any queue (may have already been consumed or doesn't exist).
+	// Still write a minimal tombstone so the consume path filters it if it reappears.
+	if err := b.recordCancelled(cancelledEntry{
+		Topic:       topic,
+		StorageTopic: topic,
+		MsgID:       msgID,
+		CancelledAt: now(),
+	}); err != nil {
+		return false, err
 	}
 	return true, nil
 }

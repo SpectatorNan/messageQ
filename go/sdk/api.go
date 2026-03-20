@@ -440,7 +440,7 @@ func (h *API) NackMessage(topic string, group string, id string) (*Resp[NackMess
 	return result, errResp, nil
 }
 
-func (h *API) TerminateMessage(topic string, group string, id string) (*Resp[TerminateMessageResponse], *ErrResp, error) {
+func (h *API) TerminateMessage(topic string, id string) (*Resp[TerminateMessageResponse], *ErrResp, error) {
 
 	r, err := h.authRequest()
 	if err != nil {
@@ -448,7 +448,7 @@ func (h *API) TerminateMessage(topic string, group string, id string) (*Resp[Ter
 	}
 
 	var result *Resp[TerminateMessageResponse]
-	errResp, err := h.Post(r.SetResult(&result), h.endpoint.TerminateMessage(topic, group, id))
+	errResp, err := h.Post(r.SetResult(&result), h.endpoint.TerminateMessage(topic, id))
 	if err != nil {
 		return nil, nil, err
 	}

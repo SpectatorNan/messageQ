@@ -73,8 +73,7 @@ func (e *Endpoint) AckMessage(topic, group string, id string) string {
 func (e *Endpoint) NackMessage(topic, group string, id string) string {
 	return fmt.Sprintf("%s/api/v1/consumers/%s/topics/%s/messages/%s/nack", e.baseUrl, group, topic, id)
 }
-func (e *Endpoint) TerminateMessage(topic, group string, id string) string {
-	_ = group
+func (e *Endpoint) TerminateMessage(topic, id string) string {
 	return fmt.Sprintf("%s/api/v1/topics/%s/messages/%s/terminate", e.baseUrl, topic, id)
 }
 func (e *Endpoint) TerminateBatchMessages(topic string) string {

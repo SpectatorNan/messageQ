@@ -375,14 +375,13 @@ func TestTerminateReturnsInternalErrorWhenTerminalPersistenceFails(t *testing.T)
 	api := client.NewAPI(server.URL, adminKey)
 	api.SetAccessKey(accessKey)
 
-	group := "group-" + uuid.NewString()
 	tag := "tag-a"
 	produceResp, errResp, err := api.ProduceMessage("orders", tag, "cancel-bad-message", client.WithCorrelationID("corr-"+uuid.NewString()))
 	require.NoError(t, err)
 	require.Nil(t, errResp)
 	require.NotNil(t, produceResp)
 
-	terminateResp, errResp, err := api.TerminateMessage("orders", group, produceResp.Data.ID)
+	terminateResp, errResp, err := api.TerminateMessage("orders", produceResp.Data.ID)
 	require.NoError(t, err)
 	require.Nil(t, terminateResp)
 	require.NotNil(t, errResp)
@@ -839,20 +838,20 @@ func (suite *APITestSuite) TestTerminateMessage() {
 	suite.Nil(errResp)
 	suite.NotNil(produceResp)
 
-	terminateResp, errResp, err := suite.api.TerminateMessage(topic, groupA, produceResp.Data.ID)
+	terminateResp, errResp, err := suite.api.TerminateMessage(topic, produceResp.Data.ID)
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(terminateResp)
 	suite.True(terminateResp.Data.Terminated)
 	suite.Equal("cancelled", terminateResp.Data.State)
 
-	terminateResp, errResp, err = suite.api.TerminateMessage(topic, groupA, produceResp.Data.ID)
+	terminateResp, errResp, err = suite.api.TerminateMessage(topic, produceResp.Data.ID)
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(terminateResp)
 	suite.True(terminateResp.Data.Terminated)
 
-	terminateResp, errResp, err = suite.api.TerminateMessage(topic, groupA, uuid.NewString())
+	terminateResp, errResp, err = suite.api.TerminateMessage(topic, uuid.NewString())
 	suite.NoError(err)
 	suite.Nil(errResp)
 	suite.NotNil(terminateResp)
@@ -956,6 +955,109 @@ func (suite *APITestSuite) TestTerminateBatchMessages() {
 	suite.Nil(consumeResp)
 	suite.NotNil(errResp)
 	suite.Equal("not_found", errResp.Code)
+}
+
+func (suite *APITestSuite) TestPartialTerminateStillConsumesRemainingMessages() {
+	topic := suite.newTopic("terminate-partial-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("terminate-partial-group")
+	tag := "terminate-partial-tag"
+
+	msgIDs := make([]string, 0, 5)
+	for i := 0; i < 5; i++ {
+		resp, errResp, err := suite.api.ProduceMessage(
+			topic,
+			tag,
+			fmt.Sprintf("terminate-partial-%d", i),
+			client.WithCorrelationID(fmt.Sprintf("terminate-partial-cid-%d-%s", i, uuid.NewString())),
+		)
+		suite.NoError(err)
+		suite.Nil(errResp)
+		suite.NotNil(resp)
+		msgIDs = append(msgIDs, resp.Data.ID)
+	}
+
+	for _, msgID := range []string{msgIDs[1], msgIDs[3]} {
+		terminateResp, errResp, err := suite.api.TerminateMessage(topic, msgID)
+		suite.NoError(err)
+		suite.Nil(errResp)
+		suite.NotNil(terminateResp)
+		suite.True(terminateResp.Data.Terminated)
+	}
+
+	expected := map[string]struct{}{
+		msgIDs[0]: {},
+		msgIDs[2]: {},
+		msgIDs[4]: {},
+	}
+	consumed := make(map[string]struct{}, len(expected))
+	deadline := time.Now().Add(3 * time.Second)
+
+	for len(consumed) < len(expected) {
+		consumeResp := suite.consumeUntil(topic, group, tag, deadline, client.WithQueueId(0))
+		msgID := consumeResp.Data.Message.ID
+		_, ok := expected[msgID]
+		suite.True(ok, "unexpected message consumed: %s", msgID)
+		_, seen := consumed[msgID]
+		suite.False(seen, "duplicate message consumed: %s", msgID)
+		consumed[msgID] = struct{}{}
+
+		ackResp, ackErrResp, err := suite.api.AckMessage(topic, group, msgID)
+		suite.NoError(err)
+		suite.Nil(ackErrResp)
+		suite.NotNil(ackResp)
+		suite.True(ackResp.Data.Acked)
+	}
+
+	consumeResp, errResp, err := suite.api.ConsumeMessages(topic, group, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp)
+	suite.NotNil(errResp)
+	suite.Equal("not_found", errResp.Code)
+}
+
+// TestTerminateMessageInRetryQueue verifies that a message terminated while it sits
+// in the retry queue (after nack + retry delay elapsed) cannot be consumed again.
+func (suite *APITestSuite) TestTerminateMessageInRetryQueue() {
+	topic := suite.newTopic("terminate-retry-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("terminate-retry-group")
+	tag := "terminate-retry-tag"
+	suite.primeGroup(topic, group, tag)
+
+	suite.broker.SetRetryBackoff(10*time.Millisecond, 1, 10*time.Millisecond)
+	defer suite.broker.SetRetryBackoff(1*time.Second, 2, 60*time.Second)
+
+	produceResp, errResp, err := suite.api.ProduceMessage(topic, tag, "terminate-after-retry", client.WithCorrelationID("terminate-retry-cid-"+uuid.NewString()))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(produceResp)
+
+	// Consume the message (now in processing state).
+	consumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(produceResp.Data.ID, consumeResp.Data.Message.ID)
+
+	// Nack it – message is scheduled for retry in the delay queue.
+	nackResp, errResp, err := suite.api.NackMessage(topic, group, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(nackResp)
+	suite.True(nackResp.Data.Nacked)
+
+	// Wait for the retry delay to elapse so the message lands in the retry queue.
+	time.Sleep(100 * time.Millisecond)
+
+	// Terminate the message while it is in the retry queue.
+	terminateResp, errResp, err := suite.api.TerminateMessage(topic, produceResp.Data.ID)
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(terminateResp)
+	suite.True(terminateResp.Data.Terminated)
+
+	// Consuming should now yield not_found – the message must be filtered.
+	consumeResp2, errResp2, err := suite.api.ConsumeMessages(topic, group, tag, client.WithQueueId(0))
+	suite.NoError(err)
+	suite.Nil(consumeResp2)
+	suite.NotNil(errResp2)
+	suite.Equal("not_found", errResp2.Code)
 }
 
 func (suite *APITestSuite) TestNewGroupStartsFromTopicProgressByDefault() {
