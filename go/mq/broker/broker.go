@@ -26,7 +26,7 @@ const defaultCompletedHistorySize = 1000
 const defaultMessageRetention = 7 * 24 * time.Hour
 const defaultMessageExpiryFactor = 2
 const defaultCancelledCacheLimit = 10000
-const defaultNewGroupStartPosition = "latest"
+const defaultNewGroupStartPosition = "topic_progress"
 const defaultTombstoneSweepInterval = 30 * time.Second
 const defaultConsumedPruneInterval = 30 * time.Second
 
@@ -1259,11 +1259,85 @@ func splitRetryTopicName(topic string) (string, string, bool) {
 	return topic[:idx], topic[idx+len(marker):], true
 }
 
-func (b *Broker) resolveInitialOffset(group, topic string, queueID int) (int64, error) {
-	if strings.EqualFold(b.newGroupStartPosition, "earliest") || isRetryTopicName(group, topic) {
-		return b.ConsumeQueueBaseOffset(topic, queueID), nil
+func subscriptionTagCovers(existingTag, targetTag string) bool {
+	existing := normalizeSubscriptionTag(existingTag)
+	target := normalizeSubscriptionTag(targetTag)
+	if target == "*" {
+		return existing == "*"
 	}
-	offset := b.ConsumeQueueDepth(topic, queueID)
+	return existing == "*" || existing == target
+}
+
+func (b *Broker) topicProgressInitialOffset(group, topic string, queueID int) (int64, bool, error) {
+	ols, ok := b.store.(OffsetListStore)
+	if !ok {
+		return 0, false, nil
+	}
+	offsets, err := ols.ListOffsetsByTopicQueue(topic, queueID)
+	if err != nil {
+		return 0, false, err
+	}
+	if len(offsets) == 0 {
+		return 0, false, nil
+	}
+
+	b.lock.Lock()
+	targetSub, ok := b.subscriptions[groupTopicKey(group, topic)]
+	if !ok {
+		b.lock.Unlock()
+		return 0, false, nil
+	}
+	referenceTags := make(map[string]string, len(offsets))
+	for refGroup := range offsets {
+		if refGroup == group {
+			continue
+		}
+		if refSub, ok := b.subscriptions[groupTopicKey(refGroup, topic)]; ok {
+			referenceTags[refGroup] = refSub.Tag
+		}
+	}
+	b.lock.Unlock()
+
+	minOffset := int64(math.MaxInt64)
+	found := false
+	for refGroup, offset := range offsets {
+		if refGroup == group {
+			continue
+		}
+		refTag, ok := referenceTags[refGroup]
+		if !ok || !subscriptionTagCovers(refTag, targetSub.Tag) {
+			continue
+		}
+		if offset < minOffset {
+			minOffset = offset
+			found = true
+		}
+	}
+	if !found {
+		return 0, false, nil
+	}
+	return minOffset, true, nil
+}
+
+func (b *Broker) resolveInitialOffset(group, topic string, queueID int) (int64, error) {
+	baseOffset := b.ConsumeQueueBaseOffset(topic, queueID)
+	if isRetryTopicName(group, topic) || strings.EqualFold(b.newGroupStartPosition, "earliest") {
+		return baseOffset, nil
+	}
+	if strings.EqualFold(b.newGroupStartPosition, "latest") {
+		offset := b.ConsumeQueueDepth(topic, queueID)
+		if err := b.CommitOffset(group, topic, queueID, offset); err != nil {
+			return 0, err
+		}
+		return offset, nil
+	}
+
+	offset := baseOffset
+	if inferredOffset, ok, err := b.topicProgressInitialOffset(group, topic, queueID); err != nil {
+		return 0, err
+	} else if ok {
+		offset = inferredOffset
+	}
 	if err := b.CommitOffset(group, topic, queueID, offset); err != nil {
 		return 0, err
 	}
@@ -3465,8 +3539,12 @@ func (b *Broker) SetNewGroupStartPosition(position string) {
 	switch strings.ToLower(strings.TrimSpace(position)) {
 	case "earliest":
 		b.newGroupStartPosition = "earliest"
-	default:
+	case "latest":
 		b.newGroupStartPosition = "latest"
+	case "topic-progress", "topic_progress", "progress":
+		b.newGroupStartPosition = "topic_progress"
+	default:
+		b.newGroupStartPosition = defaultNewGroupStartPosition
 	}
 }
 

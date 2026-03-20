@@ -958,7 +958,26 @@ func (suite *APITestSuite) TestTerminateBatchMessages() {
 	suite.Equal("not_found", errResp.Code)
 }
 
-func (suite *APITestSuite) TestNewGroupStartsAtLatest() {
+func (suite *APITestSuite) TestNewGroupStartsFromTopicProgressByDefault() {
+	topic := suite.newTopic("topic-progress-start-topic", broker.TopicTypeNormal)
+	group := suite.newGroup("topic-progress-start-group")
+	tag := "progress-tag"
+	historicalCorrelationID := "progress-cid-" + uuid.NewString()
+
+	historicalResp, errResp, err := suite.api.ProduceMessage(topic, tag, "historical-message", client.WithCorrelationID(historicalCorrelationID))
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(historicalResp)
+
+	consumeResp := suite.consumeUntil(topic, group, tag, time.Now().Add(3*time.Second), client.WithQueueId(0))
+	suite.Equal(historicalResp.Data.ID, consumeResp.Data.Message.ID)
+	suite.Equal(historicalCorrelationID, consumeResp.Data.Message.CorrelationID)
+}
+
+func (suite *APITestSuite) TestExplicitLatestStartSkipsHistoricalMessages() {
+	suite.broker.SetNewGroupStartPosition("latest")
+	defer suite.broker.SetNewGroupStartPosition("topic_progress")
+
 	topic := suite.newTopic("latest-start-topic", broker.TopicTypeNormal)
 	group := suite.newGroup("latest-start-group")
 	tag := "latest-tag"

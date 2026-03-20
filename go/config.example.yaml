@@ -22,7 +22,7 @@ broker:
   retry_backoff_max: 60s            # 重试退避最大延迟
   message_retention: 168h           # 消息保留窗口（默认7天）
   message_expiry_factor: 2          # 自动过期倍数：超过 retention * factor 的未终态消息会进入 expired，并可被后台清理
-  new_group_start_position: latest  # 新 group 首次消费起点：latest 或 earliest
+  new_group_start_position: topic_progress  # 新 group 首次消费起点：topic_progress（按现有 group 每 queue 最小 offset）、latest、earliest
   cancelled_cache_limit: 10000      # 内存中缓存的 terminal tombstone 数量上限
 
 # 存储配置 (WAL)

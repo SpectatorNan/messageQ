@@ -1702,6 +1702,90 @@ func TestSweepConsumedSegmentsSkipsNormalTopicsForEarliestStart(t *testing.T) {
 	}
 }
 
+func TestResolveInitialOffsetUsesCompatibleTopicProgress(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	store := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = store.Close()
+	}()
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	if err := b.CreateTopic("orders", TopicTypeNormal, 1); err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	if err := b.EnsureSubscription("group-a", "orders", "tag-a"); err != nil {
+		t.Fatalf("ensure subscription group-a: %v", err)
+	}
+	if err := b.EnsureSubscription("group-b", "orders", "*"); err != nil {
+		t.Fatalf("ensure subscription group-b: %v", err)
+	}
+	if err := b.EnsureSubscription("group-c", "orders", "tag-b"); err != nil {
+		t.Fatalf("ensure subscription group-c: %v", err)
+	}
+	if err := b.EnsureSubscription("group-new", "orders", "tag-a"); err != nil {
+		t.Fatalf("ensure subscription group-new: %v", err)
+	}
+	if err := b.CommitOffset("group-a", "orders", 0, 7); err != nil {
+		t.Fatalf("commit offset group-a: %v", err)
+	}
+	if err := b.CommitOffset("group-b", "orders", 0, 5); err != nil {
+		t.Fatalf("commit offset group-b: %v", err)
+	}
+	if err := b.CommitOffset("group-c", "orders", 0, 2); err != nil {
+		t.Fatalf("commit offset group-c: %v", err)
+	}
+
+	offset, err := b.resolveInitialOffset("group-new", "orders", 0)
+	if err != nil {
+		t.Fatalf("resolve initial offset: %v", err)
+	}
+	if offset != 5 {
+		t.Fatalf("expected compatible topic progress offset 5, got %d", offset)
+	}
+}
+
+func TestResolveInitialOffsetFallsBackToBaseOffsetForIncompatibleSubscriptions(t *testing.T) {
+	baseDir := t.TempDir()
+	dataDir := filepath.Join(baseDir, "data")
+
+	store := storage.NewWALStorage(dataDir, 10*time.Millisecond, time.Hour)
+	defer func() {
+		_ = store.Close()
+	}()
+
+	b := NewBrokerWithPersistence(store, 1, dataDir)
+	defer func() {
+		_ = b.Close()
+	}()
+
+	if err := b.CreateTopic("orders", TopicTypeNormal, 1); err != nil {
+		t.Fatalf("create topic: %v", err)
+	}
+	if err := b.EnsureSubscription("group-a", "orders", "tag-a"); err != nil {
+		t.Fatalf("ensure subscription group-a: %v", err)
+	}
+	if err := b.EnsureSubscription("group-new", "orders", "tag-b"); err != nil {
+		t.Fatalf("ensure subscription group-new: %v", err)
+	}
+	if err := b.CommitOffset("group-a", "orders", 0, 9); err != nil {
+		t.Fatalf("commit offset group-a: %v", err)
+	}
+
+	offset, err := b.resolveInitialOffset("group-new", "orders", 0)
+	if err != nil {
+		t.Fatalf("resolve initial offset: %v", err)
+	}
+	if offset != 0 {
+		t.Fatalf("expected base offset fallback 0, got %d", offset)
+	}
+}
+
 func TestSweepConsumedSegmentsUsesRetryOwnerOffsetAndSettledEvents(t *testing.T) {
 	baseDir := t.TempDir()
 	dataDir := filepath.Join(baseDir, "data")

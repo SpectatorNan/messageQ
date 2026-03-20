@@ -155,7 +155,9 @@ curl -X POST http://localhost:8080/topics/notifications/messages/delay \
 - `topic`: 同上
 
 **行为说明：**
-- 新 consumer group 首次消费普通 topic 时，offset 会初始化到当前 queue tail（`latest`），不会回放历史消息
+- 新 consumer group 首次消费普通 topic 时，默认会按该 topic 当前**兼容订阅**在每个 queue 上的最小已提交 offset 初始化；如果还没有可参考的 group 进度，则会从当前 queue 的保留起点（`baseOffset`）开始，因此不会因为“晚订阅”直接跳过历史消息
+- 兼容订阅的判定遵循 tag 语义：相同 tag 可以互相参考，`*` 可以为具体 tag 提供参考；但具体 tag 不能为 `*` 提供参考
+- 如需旧的“从当前尾部接入”行为，可显式配置 `broker.new_group_start_position: latest`；如需总是从最早保留位置开始，可配置 `earliest`
 - 同一 `group + topic` 的订阅 tag 必须一致；一旦某个 group 以某个 tag 建立订阅，后续再用不同 tag 消费会返回 `subscription_conflict`
 - `""` 与 `*` 会被视为同一个“全量订阅”标签
 - 如果 broker 无法持久化本次 `processing` 状态，消费接口会返回 `internal_error`，并把本次已取出的消息回滚为 retry，而不是静默吞掉该错误

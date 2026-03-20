@@ -86,7 +86,7 @@ func Load() (*Config, error) {
 	v.SetDefault("broker.retry_backoff_max", "60s")
 	v.SetDefault("broker.message_retention", "168h")
 	v.SetDefault("broker.message_expiry_factor", 2)
-	v.SetDefault("broker.new_group_start_position", "latest")
+	v.SetDefault("broker.new_group_start_position", "topic_progress")
 	v.SetDefault("broker.cancelled_cache_limit", 10000)
 
 	// Storage defaults
