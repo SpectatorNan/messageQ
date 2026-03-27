@@ -1,12 +1,13 @@
 package api
 
 import (
-	"github.com/SpectatorNan/messageQ/go/mq/broker"
-	"github.com/SpectatorNan/messageQ/go/mq/errx"
-	"github.com/SpectatorNan/messageQ/go/mq/respx"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/SpectatorNan/messageQ/go/mq/broker"
+	"github.com/SpectatorNan/messageQ/go/mq/errx"
+	"github.com/SpectatorNan/messageQ/go/mq/respx"
 
 	"github.com/gin-gonic/gin"
 )
@@ -82,8 +83,16 @@ func GetTopicHandler(b *broker.Broker) gin.HandlerFunc {
 func ListTopicsHandler(b *broker.Broker) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		topics := b.ListTopics()
-
-		c.JSON(http.StatusOK, respx.NewRespList(topics, len(topics)))
+		ts := make([]TopicResponse, 0, len(topics))
+		for _, t := range topics {
+			ts = append(ts, TopicResponse{
+				Name:       t.Name,
+				Type:       t.Type,
+				QueueCount: t.QueueCount,
+				CreatedAt:  t.CreatedAt,
+			})
+		}
+		c.JSON(http.StatusOK, respx.NewRespList(ts, len(topics)))
 	}
 }
 

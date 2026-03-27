@@ -4,7 +4,7 @@ admin_key: adminkey123
 
 # 服务器配置
 server:
-  port: 8081
+  port: 8082
   host: "0.0.0.0"  # 空表示监听所有地址
   shutdown_timeout: 10s
 

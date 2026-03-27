@@ -1,0 +1,27 @@
+# VCS and editor metadata
+.git
+.gitignore
+.idea/
+.DS_Store
+
+# Local runtime state and ad-hoc outputs
+data/
+*.log
+*.out
+*.tmp
+
+# Documentation and notes not needed for build
+docs/
+notes/
+README.md
+
+# Examples and local tooling not required by ./main.go
+example/
+cmd/mq-inspect/
+**/*_test.go
+
+# Local config and deployment assets not copied into the image
+config.yaml
+deploy/docker-compose.yml
+deploy/compose/
+deploy/k8s.yaml

@@ -19,7 +19,7 @@ type APIClientSuite struct {
 }
 
 func (suite *APIClientSuite) SetupSuite() {
-	suite.api = client.NewAPI("http://localhost:8081", "adminkey123")
+	suite.api = client.NewAPI("http://localhost:8082", "adminkey123")
 	suite.api.SetAccessKey("test-access-key")
 	suite.topic = "cancel1"
 }
@@ -189,6 +189,15 @@ func (suite *APIClientSuite) TestTerminate() {
 	suite.Nil(consumeResp)
 	suite.NotNil(consumeErrResp)
 	suite.Equal("not_found", consumeErrResp.Code)
+}
+
+func (suite *APIClientSuite) TestListTopics() {
+
+	resp, errResp, err := suite.api.ListTopics()
+	suite.NoError(err)
+	suite.Nil(errResp)
+	suite.NotNil(resp)
+
 }
 
 func TestRemoteAPISuite(t *testing.T) {
