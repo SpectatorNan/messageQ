@@ -3,14 +3,22 @@ IMAGE_TAG ?= local
 DOCKERFILE ?= deploy/Dockerfile
 BUILD_CONTEXT ?= .
 PLATFORM ?= linux/amd64
+PLATFORMS ?= linux/amd64,linux/arm64
+OCI_OUTPUT ?= /tmp/$(IMAGE_NAME)-$(IMAGE_TAG).oci.tar
+
+IMAGE_REF := $(IMAGE_NAME):$(IMAGE_TAG)
 
 .PHONY: build-image
 build-image:
-	docker buildx build --platform $(PLATFORM) --load -f $(DOCKERFILE) -t $(IMAGE_NAME):$(IMAGE_TAG) $(BUILD_CONTEXT)
+	docker buildx build --platform $(PLATFORM) --load -f $(DOCKERFILE) -t $(IMAGE_REF) $(BUILD_CONTEXT)
 
 .PHONY: build-image-multi
 build-image-multi:
-	docker buildx build --platform linux/amd64,linux/arm64 --push -f $(DOCKERFILE) -t $(IMAGE_NAME):$(IMAGE_TAG) $(BUILD_CONTEXT)
+	docker buildx build --platform $(PLATFORMS) --push -f $(DOCKERFILE) -t $(IMAGE_REF) $(BUILD_CONTEXT)
+
+.PHONY: build-image-multi-oci
+build-image-multi-oci:
+	docker buildx build --platform $(PLATFORMS) --output type=oci,dest=$(OCI_OUTPUT) -f $(DOCKERFILE) -t $(IMAGE_REF) $(BUILD_CONTEXT)
 
 .PHONY: compose-up
 compose-up:

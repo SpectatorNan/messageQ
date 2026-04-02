@@ -2,6 +2,8 @@ package logger
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -21,6 +23,8 @@ const (
 	InfoLevel  LogLevel = "info"
 	WarnLevel  LogLevel = "warn"
 	ErrorLevel LogLevel = "error"
+
+	defaultLogFilename = "messageq.log"
 )
 
 // Config holds logger configuration
@@ -79,13 +83,17 @@ func Init(cfg Config) error {
 	}
 
 	var writeSyncer zapcore.WriteSyncer
-	switch cfg.OutputPath {
+	switch strings.TrimSpace(cfg.OutputPath) {
 	case "stdout", "":
 		writeSyncer = zapcore.AddSync(os.Stdout)
 	case "stderr":
 		writeSyncer = zapcore.AddSync(os.Stderr)
 	default:
-		file, err := os.OpenFile(cfg.OutputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		outputPath, err := resolveOutputPath(cfg.OutputPath)
+		if err != nil {
+			return err
+		}
+		file, err := os.OpenFile(outputPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
 			return err
 		}
@@ -153,4 +161,36 @@ func With(fields ...zap.Field) *zap.Logger {
 		return Logger.With(fields...)
 	}
 	return nil
+}
+
+func resolveOutputPath(path string) (string, error) {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return "", nil
+	}
+
+	cleaned := filepath.Clean(trimmed)
+	if strings.HasSuffix(trimmed, string(os.PathSeparator)) {
+		if err := os.MkdirAll(cleaned, 0o755); err != nil {
+			return "", err
+		}
+		return filepath.Join(cleaned, defaultLogFilename), nil
+	}
+
+	if info, err := os.Stat(cleaned); err == nil {
+		if info.IsDir() {
+			return filepath.Join(cleaned, defaultLogFilename), nil
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	parent := filepath.Dir(cleaned)
+	if parent != "." && parent != "" {
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			return "", err
+		}
+	}
+
+	return cleaned, nil
 }
